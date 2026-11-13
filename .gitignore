@@ -1,0 +1,37 @@
+# Node
+node_modules/
+dist/
+coverage/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local configuration
+.env
+.env.*
+.DS_Store
+
+# Build and runtime artifacts
+*.log
+*.dump
+*.bin
+*.hex
+*.raw
+*.tmp
+*.bak
+*.orig
+
+# Research artifacts that must never be published
+sources/
+ghidra/
+resources/
+scratchpad/
+probes/
+try/
+findings/
+*.nca
+*.nso
+*.nro
+*.nsp
+*.xci
