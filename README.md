@@ -1,13 +1,12 @@
 # CivSwitchFS
 
 > [!IMPORTANT]
-> **Thanks to Slapah for the ns2jb filesystem port to CivSwitch, which laid the groundwork for this research. The original repository is no longer available.** All kudos goes to him for the Civ FS port :heart:
+> Thanks to **Slapah** for the ns2jb filesystem port to CivSwitch and **Kurumuz** for the improved fork of ns2jb from **Pepspiu**, which laid the groundwork for this research. ** All kudos goes to them for the Civ FS port :heart:
 
-This is a payload giving access to FS privileges through an elevated fsp-srv handle. It runs inside the **CivSwitch Remote JS Loader**. That elevated session is exposed as `globalThis.fspSrv` for the next payloads.
+This is payload provides **access to FS privileges** through an elevated fsp-srv handle. It runs inside the **CivSwitch Remote JS Loader**. That elevated session is exposed as `globalThis.fspSrv` for the next payloads.
 
 > [!NOTE]
-> **CivSwitchFS is semi-tethered:** like the original CivSwitch, you can persist this payload so it launches automatically when you load the game's save.
-Also **this is still a WIP**, and an early realse, there is a lot of room for improvement :3
+> CivSwitchFS is **semi-tethered**, RPC was fully removed
 
 ## Tested configuration
 
