@@ -1,3 +1,6 @@
+> [!NOTE]
+> I DID NOT HAD TIME TO REVIEW THIS YET, THIS IS STILL PURE SLOP
+
 # How the Core Sets fsp-srv Identity PIDs to 1
 
 This document follows the code from its first `fsp-srv` session through the
