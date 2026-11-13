@@ -78,8 +78,7 @@ var guardDelays = [0, 150000];
 If you use the persisted payload, you ofc need to rerun the installer so its saved image includes the new timings.
 
 > [!NOTE]
-> You can play with the delays in `src/core/config.mjs`, try some combinaisons !
-> **[WIP]** This will eventually be saved in the save partition to be retrieved, but that's for another day !
+> You can play with the delays and MORE in `src/core/config.mjs`, try some shit (but don't brick pls) !
 
 ## Example FS usage
 
