@@ -1,5 +1,5 @@
 > [!NOTE]
-> I DID NOT HAD TIME TO REVIEW THIS YET, THIS IS STILL PURE SLOP
+> I did not had the time to review this yet... it's still sloppy
 
 # How the Core Sets fsp-srv Identity PIDs to 1
 
