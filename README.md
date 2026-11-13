@@ -6,7 +6,7 @@
 This is payload provides **access to FS privileges** through an elevated fsp-srv handle. It runs inside the **CivSwitch Remote JS Loader**. That elevated session is exposed as `globalThis.fspSrv` for the next payloads.
 
 > [!NOTE]
-> CivSwitchFS is **semi-tethered**, RPC was fully removed
+> CivSwitchFS is **semi-untethered**, RPC was fully removed
 
 ## Tested configuration
 
@@ -87,14 +87,20 @@ the `globalThis.fspSrv` handle to perform filesystem operations.
 
 An example can be found in `examples/user-storage`.
 
+## Notes
+
+- The auto timing calibration is not perfect yet, some freezes can happen
+- THERE IS SO MUCH MORE to be done, I'm just releasing now so you guys can study the semi-untethered stuff
+
 ## Project structure
 
 ```text
-src/core.js       # payload entry point and flow
-src/core/         # steps, memory access, and FS communication
-examples/         # small payload usage examples
-persist/          # persistence builder inputs, save codec, writer, and installer
-tools/            # well, tools
+src/core.js          # payload entry point and flow
+src/core/            # steps, memory access, and FS communication
+src/core/config.mjs  # the whole exploit conf, tweak it if you want
+examples/            # small payload usage examples
+persist/             # persistence builder inputs, save codec, writer, and installer
+tools/               # well, tools
 ```
 
 ## License
