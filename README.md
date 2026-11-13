@@ -68,12 +68,14 @@ var guardDelays = [150000, 300000];
 ~~~
 
 The trigger's initial sleep is 1,600,000 ns. The Slapah/Kurumuz
-reference schedule used role delays
-`[0, 300000, 350000, 450000, 550000, 650000, 1700000, 2000000, 2150000, 2800000]`,
-guard delays `[0, 150000]`, and an initial trigger sleep of 2,400,000 ns.
+reference schedule used theses instead (might help if it worked for you on those)
 
-Use the values printed by your successful run in place of the example values.
-If you use the persisted payload, run the installer again so its saved image includes the new timings.
+~~~js
+var roleDelays = [0, 300000, 350000, 450000, 550000, 650000, 1700000, 2000000, 2150000, 2800000];
+var guardDelays = [0, 150000];
+~~~
+
+If you use the persisted payload, you ofc need to rerun the installer so its saved image includes the new timings.
 
 > [!NOTE]
 > You can play with the delays in `src/core/config.mjs`, try some combinaisons !
