@@ -5,8 +5,7 @@
 
 This is payload provides **access to FS privileges** through an elevated fsp-srv handle. It runs inside the **CivSwitch Remote JS Loader**. That elevated session is exposed as `globalThis.fspSrv` for the next payloads. **IT'S ALSO TARGETTING DEVS**, *I'm sorry but other people probably won't know what to do with this !*.
 
-> [!NOTE]
-> CivSwitchFS is **semi-untethered**, RPC was fully removed
+CivSwitchFS is **semi-untethered**, RPC was fully removed :tada:
 
 ## Tested configuration
 
