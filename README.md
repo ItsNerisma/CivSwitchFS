@@ -3,7 +3,7 @@
 > [!IMPORTANT]
 > Thanks to **Slapah** for the ns2jb filesystem port to CivSwitch and **Kurumuz** for the improved fork of ns2jb from **Pepspiu**, which laid the groundwork for this research. ** All kudos goes to them for the Civ FS port :heart:
 
-This is payload provides **access to FS privileges** through an elevated fsp-srv handle. It runs inside the **CivSwitch Remote JS Loader**. That elevated session is exposed as `globalThis.fspSrv` for the next payloads. **IT'S ALSO TARGETTING DEVS**, *not normies I'm sorry but you probably won't know what to do with this !*.
+This is payload provides **access to FS privileges** through an elevated fsp-srv handle. It runs inside the **CivSwitch Remote JS Loader**. That elevated session is exposed as `globalThis.fspSrv` for the next payloads. **IT'S ALSO TARGETTING DEVS**, *I'm sorry but other people probably won't know what to do with this !*.
 
 > [!NOTE]
 > CivSwitchFS is **semi-untethered**, RPC was fully removed
@@ -78,7 +78,7 @@ If you use the persisted payload, run the installer again so its saved image inc
 
 > [!NOTE]
 > You can play with the delays in `src/core/config.mjs`, try some combinaisons !
-[WIP] This will eventually be saved in the save partition to be retrieved, but that's for another day !
+> **[WIP]** This will eventually be saved in the save partition to be retrieved, but that's for another day !
 
 ## Example FS usage
 
@@ -90,6 +90,7 @@ An example can be found in `examples/user-storage`.
 ## Notes
 
 - The auto timing calibration is not perfect yet, some freezes can happen
+- Timing configuration, retries and shit will go to a persisted config file soon enough
 - THERE IS SO MUCH MORE to be done, I'm just releasing now so you guys can study the semi-untethered stuff
 
 ## Project structure
