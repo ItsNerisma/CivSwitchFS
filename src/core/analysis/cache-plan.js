@@ -61,7 +61,13 @@ var CachePlan = (function() {
             var key = [position, leftState.join(":"),
                 rightState.join(":"), carry, remainder].join(",");
             if (misses[key]) return null;
-            var first = position === 6 ? 0xC2 : position === 7 ? 0x81 : 1;
+            var first = 1;
+            if (position === 6) {
+                first = 0xC2;
+            } else if (position === 7) {
+                first = 0x81;
+            }
+
             var last = position >= 6 ? first : 0xF4;
             var mask = Math.floor(zeroBits / (2 ** (position * 8))) & 0xFF;
             for (var left = first; left <= last; left++) {

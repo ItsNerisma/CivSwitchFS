@@ -1,147 +1,107 @@
 # CivSwitchFS
 
-FS identity-promotion research payload for **Civilization VII** on Nintendo
-Switch, built on the CivSwitch Remote JS Loader.
+> [!IMPORTANT]
+> **Thanks to Slapah for the ns2jb filesystem port to CivSwitch, which laid the groundwork for this research. The original repository is no longer available.** All kudos goes to him for the Civ FS port :heart:
 
-The payload temporarily promotes the `fsp-srv` filesystem identity to PID `1`,
-opens the User content storage, lists `/`, restores the original objects, and
-cleans up. It is a proof of elevated filesystem access, not a permanent
-modification and not a NAND/BIS tool.
+This is a payload giving access to FS privileges through an elevated fsp-srv handle. It runs inside the **CivSwitch Remote JS Loader**. That elevated session is exposed as `globalThis.fspSrv` for the next payloads.
 
-> **Research and education only. Use your own hardware.**
-> This payload is **HIGH risk**: it creates temporary files, writes up to
-> 8 MiB of dirty data per wave, modifies `fsp-srv` memory, and retries up to
-> 10 times. Use a disposable save and back up anything you care about. It can
-> crash or wedge the FS service; a reboot may be required.
+> [!NOTE]
+> **CivSwitchFS is semi-tethered:** like the original CivSwitch, you can persist this payload so it launches automatically when you load the game's save.
+Also **this is still a WIP**, and an early realse, there is a lot of room for improvement :3
 
-## Status
-
-Tested configuration:
+## Tested configuration
 
 - Nintendo Switch 2, firmware **23.0.1**
-- Civilization VII **1.0.0**, physical cartridge
+- **Civilization VII 1.0.0**, physical cartridge
 - CivSwitch Remote JS Loader already running
-
-Success is **stochastic**. A qualified timing window does not guarantee a
-canary flip. In the research runs, one payload succeeded on its third campaign;
-three later full sends reached the 10-attempt cap with clean cleanup. The
-payload is intentionally bounded and stops after ten attempts.
 
 ## Requirements
 
-- A console running the CivSwitch Remote JS Loader, reachable over the network.
-- Node.js 20 or newer on the host.
-- A disposable Civilization VII save. The payload writes to `save:/hole` and
-  removes it during cleanup.
-- No additional npm runtime dependencies; `esbuild` is only used to build.
+- Node.js **20 or later** and npm
+- A Switch 2 with the CivSwitch Remote JS Loader already running and reachable
+  on the local network when installing persistence or sending a payload
 
-## Quick start
+## Usage
 
-```sh
+Install dependencies once from this repository:
+
+~~~sh
 npm install
-npm run check
-npm run build
+~~~
+
+### Persist the payload (optionnal)
+
+With the CivSwitch Remote JS Loader running, install the persistent image:
+
+~~~sh
+npm run persist:install -- <console-ip> [--minify-payload]
+~~~
+
+Future launches from that save start the exploit, loader, and
+payload automatically, without a computer or network connection. 
+
+The persisted payload removes whitespace and comments by default while keeping
+source names and syntax. Pass `--debug-payload` to preserve formatting, or
+`--minify-payload` to also shorten ESM local identifiers.
+
+The installer does not back up the old save. 
+
+### Launch the exploit
+
+If you are not going for persistence, just start the CivSwitch Remote JS Loader
+using your usual CivSwitch setup. Then send the payload 
+
+~~~sh
 npm run send -- <console-ip>
-```
+~~~
 
-`npm run send` uses port `9026` by default. To choose another port or entry:
+Wait for **`You just Civ Sevened your machine, congrats`** which obviously means success :tada: !
+Then, the loader automatically shows `Awaiting payload at <ip>:9026` and you are free to send payloads.
 
-```sh
-node tools/send.mjs <console-ip> <port> [entry]
-```
+### Booting faster next time (this will be automatised eventually)
 
-The build writes `dist/core.js` and prints its SHA256. The generated file is
-the single classic script sent to the loader; `dist/` is gitignored.
+After success, the payload prints the working `roleDelays` and `guardDelays`
+values in nanoseconds. To use them as the starting schedule next time, replace
+the arrays in [`src/core/config.mjs`](src/core/config.mjs#L44-L47):
 
-## What the payload does
+~~~js
+var roleDelays = [0, 300000, 350000, 450000, 550000, 650000, 1000000, 1200000, 1300000, 1700000];
+var guardDelays = [150000, 300000];
+~~~
 
-1. Acquires a cache alias in `fsp-srv` through the reserved-gap timing window.
-2. Discovers and verifies the current root, NCA, and save identity objects.
-3. Installs the retained two-bucket memory endpoint and verifies pointer
-   readback plus a scratch write/read/restore.
-4. Temporarily writes PID `1` to the three verified identity fields.
-5. Makes one elevated `OpenContentStorageFileSystem(User=1)` call
-   (`fsp-srv` cmd 110), lists `/`, and closes the returned handles.
-6. Restores the exact original objects in reverse order.
-7. Retires the endpoint and removes the temporary `save:/hole` tree.
+The trigger's initial sleep is 1,600,000 ns. The Slapah/Kurumuz
+reference schedule used role delays
+`[0, 300000, 350000, 450000, 550000, 650000, 1700000, 2000000, 2150000, 2800000]`,
+guard delays `[0, 150000]`, and an initial trigger sleep of 2,400,000 ns.
 
-Each campaign starts from fresh discovery. No prior-run address or PID is used
-as a lookup input. The elevated call runs only after all three PID fields read
-back as `1`. No BIS command is issued: the `User=1` selector is a storage ID,
-not the forged process PID.
+Use the values printed by your successful run in place of the example values.
+If you use the persisted payload, run the installer again so its saved image includes the new timings.
 
-## Reading the logs
+> [!NOTE]
+> You can play with the delays in `src/core/config.mjs`, try some combinaisons !
+[WIP] This will eventually be saved in the save partition to be retrieved, but that's for another day !
 
-A successful permission proof contains lines similar to:
+## Example FS usage
 
-```text
-A03/10 Permission proof: User content-storage opened and / listed successfully; PID restoration=verified.
-A03/10 SUCCESS: User content-storage root listing verified; PID restoration, endpoint retirement, save cleanup, independent /hole verification, handle closure, and tracked frees all passed.
-```
+After the main payload reports success, you can send follow-up payloads and use
+the `globalThis.fspSrv` handle to perform filesystem operations.
 
-The final `Executed successfully` line only means the script returned; it is
-not a permission proof. Treat the `SUCCESS` line and the cleanup details as the
-result.
+An example can be found in `examples/user-storage`.
 
-A bounded run can also end with:
+## Project structure
 
 ```text
-CAP: no User content-storage proof after 10 attempts; last cleanup was verified.
+src/core.js       # payload entry point and flow
+src/core/         # steps, memory access, and FS communication
+examples/         # small payload usage examples
+persist/          # persistence builder inputs, save codec, writer, and installer
+tools/            # well, tools
 ```
 
-That is a clean stop, not a crash. Do not immediately rerun a save-writing
-campaign without reviewing the save health and restarting if cleanup was not
-verified.
+## License
 
-## Recovery and safety
+The original code in this repository is distributed under the MIT license. See [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for detailed notices and credits.
 
-- Use a **disposable save**. Repeated 8 MiB scratch writes and commits can
-  degrade save-FS health.
-- If cleanup, PID restoration, or endpoint retirement is not verified, restart
-  the console before running the payload again.
-- If the console wedges, reboot it and inspect the save before another run.
-- Do not run this against a console whose data you cannot lose.
-- The payload does not access BIS, PRODINFO, keys, tickets, or NAND. Do not
-  extend it to destructive operations.
-- Only run this on hardware you own. Do not distribute Nintendo firmware, game
-  files, saves, or keys with this repository.
+For technical details, see [HOW_IT_WORKS.md](HOW_IT_WORKS.md).
 
-## Architecture
-
-```text
-src/core.js                 payload entry, retry supervisor, and logging
-src/core/config.mjs         tuning constants and role schedules
-src/core/steps.mjs          acquisition, discovery, alias, address, cleanup
-src/core/helpers.mjs        capture, scan, qualification, and wave analysis
-src/core/promotion.mjs      PID promotion, User storage call, restoration
-src/core/runtime.mjs        bridge to the injected CivSwitch core API
-src/core/*.js               classic core helpers injected by the bundler
-src/core/analysis/          byte, cache-plan, and root-layout helpers
-src/core/ipc/               HIPC, domain, filesystem, storage, wave helpers
-tools/bundle.mjs            core concatenation + esbuild + loader wrapper
-tools/build.mjs             write dist/core.js
-tools/send.mjs              build and send over TCP
-tools/check.mjs             syntax and bundle-size check
-```
-
-The core files are classic scripts because the loader evaluates one script and
-the helpers share its global scope. The payload entry and its modules are ESM
-and are bundled by `tools/bundle.mjs`. This split is intentional; the core
-layout may be reorganized later without changing the payload behavior.
-
-## How it works
-
-The full research narrative is in [HOW_IT_WORKS.md](HOW_IT_WORKS.md). It starts
-after the initial CivSwitch userland exploit and explains the path from game
-code execution to `fsp-srv`, including the reserved-gap race, cache alias,
-identity discovery, and promotion. References to numbered "Try" experiments are
-historical and point back to the research repository.
-
-## License and provenance
-
-MIT. See [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
-The payload builds on the MIT-licensed CivSwitch loader by Gezine and the
-ns2jb CivSwitch port by Slapah; no third-party source tree is vendored here.
-
-This project is not affiliated with or endorsed by Nintendo. It contains no
-Nintendo firmware, game files, keys, tickets, or save data.
+This project is not affiliated with or endorsed by Nintendo. It contains no Nintendo firmware, keys, tickets, or personal saves; `persist/save_template.bin` is the pristine trigger template used by the installer.

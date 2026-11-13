@@ -1,8 +1,7 @@
 # Third-party notices
 
-This project is a clean payload extracted from the author's CivSwitchFS
-research. It builds on techniques and prior work from the following projects.
-No third-party source tree is vendored in this repository.
+This payload was developed as part of the author's CivSwitchFS research. It
+builds on techniques and prior work from the following projects.
 
 ## CivSwitch
 
@@ -18,10 +17,24 @@ remote JavaScript transport). The core helpers in `src/core/` were written for
 this research, but their execution environment and several low-level patterns
 come from CivSwitch.
 
+The optional persistence build composes this payload with the full CivSwitch
+bootstrap and stage decoder in `persist/`. Generated images
+include both MIT license notices.
+
+## Persistent installer components
+
+The persistence codec, SDK-backed save writer, and installer in `persist/`
+are adapted from Gezine's MIT-licensed persistent installer. They replace the
+`XSTRIG.Civ7Save` trigger with the generated standalone image. The bootstrap,
+stage decoder, and pristine trigger template are included directly in
+`persist/`; the template is not a personal game save. Their fingerprints are
+checked at build time. See `persist/LICENSE` for the bootstrap's MIT notice.
+
 ## CivSwitch ns2jb port
 
 - Project: CivSwitch ns2jb → FS-acquisition port (fork of CivSwitch)
 - Author: Slapah
+- Repository: no longer available; the original repository no longer exists
 - License: MIT
 - Copyright: Copyright (c) 2026 Gezine
 
@@ -32,15 +45,14 @@ vendored here.
 
 ## ns2jb
 
-- Project: ns2jb
-- Author: Kurumuz
+- Project: [ns2jb on GitLab](https://gitlab.com/kurumuz/ns2jb)
+- Author: Kurumuz ([GitLab profile](https://gitlab.com/kurumuz))
 - License: no license file was present in the reference checkout used during
-  the research
+  the research; this describes the inspected checkout, not necessarily the
+  current state of the GitLab project
 
 Only the documented technique (reserved-gap allocator race) and publicly
-described behavior were used. No ns2jb source code is included. If you believe
-a specific implementation detail is derived from unlicensed code, open an
-issue so it can be reviewed or reimplemented.
+described behavior were used. No ns2jb source code is included.
 
 ## CivSwitch MIT license text
 

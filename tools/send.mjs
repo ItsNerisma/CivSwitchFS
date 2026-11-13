@@ -1,8 +1,9 @@
 // Build and send the payload to a running CivSwitch Remote JS Loader.
 //
 // Usage:
-//   node tools/send.mjs <console-ip> [port] [entry]
+//   node tools/send.mjs [--entry <file>] <console-ip> [port] [entry]
 //   npm run send -- <console-ip> [port]
+//   npm run example:user-storage -- <console-ip> [port]
 
 import net from "node:net";
 import path from "node:path";
@@ -69,14 +70,24 @@ function send(host, port, code) {
 }
 
 const args = process.argv.slice(2);
+let entry = DEFAULT_ENTRY;
+if (args[0] === "--entry") {
+    if (!args[1]) {
+        console.log("Usage: node tools/send.mjs [--entry <file>] " +
+            "<console-ip> [port] [entry]");
+        process.exit(1);
+    }
+    entry = path.resolve(args[1]);
+    args.splice(0, 2);
+}
 if (args.length < 1) {
-    console.log("Usage: node tools/send.mjs <console-ip> [port] [entry]");
+    console.log("Usage: node tools/send.mjs [--entry <file>] " +
+        "<console-ip> [port] [entry]");
     process.exit(1);
 }
 
 const host = args[0];
 let port = 9026;
-let entry = DEFAULT_ENTRY;
 
 if (args.length >= 2 && /^\d+$/.test(args[1])) {
     port = Number.parseInt(args[1], 10);
@@ -90,8 +101,10 @@ console.log(
     `-- sending ${path.relative(ROOT, entry)} to ${host}:${port} ` +
     `(${built.bytes} bytes) --`
 );
+if (built.identifiersMinified)
+    console.log("-- whitespace compacted; ESM locals shortened; core/API names preserved --");
 if (built.minified)
-    console.log("-- payload minified to fit the 500 KB loader limit --");
+    console.log("-- ESM syntax minified further to fit the 500 KB loader limit --");
 if (built.modules.length)
     console.log("-- bundled modules: " + built.modules.join(", ") + " --");
 

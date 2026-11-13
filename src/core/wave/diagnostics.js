@@ -1,6 +1,6 @@
 // Wave diagnostic recorder — accumulates per-wave telemetry in memory.
 // Zero async calls during recording (no timing disruption between waves).
-// Print structured report after the campaign.
+// Print structured report after the attempt.
 //
 // Depends on: format.js (ticksToUs)
 
@@ -55,7 +55,7 @@ function extractRoleTimings(spans, trigSpan) {
 //     triggerAborted:  false          // abort guard fired (optional)
 //   });
 //
-//   // after campaign:
+//   // after attempt:
 //   var lines = diag.report();
 //   for (var i = 0; i < lines.length; i++) await log(lines[i]);
 
@@ -83,22 +83,50 @@ function createWaveDiag() {
 
             for (var i = 0; i < total; i++) {
                 var r = records[i];
-                var can = r.canaryType === 0 ? "DIR" :
-                    r.canaryType === 1 ? "file" :
-                    r.canaryType >= 2 ? "err" : "?";
-                var mar = r.marginUs != null
-                    ? r.marginUs.toFixed(0) + "us" : "NA";
-                var rej = r.rejections && r.rejections.length > 0
-                    ? r.rejections.join(", ") : "-";
+                var can;
+                if (r.canaryType === 0) {
+                    can = "DIR";
+                } else if (r.canaryType === 1) {
+                    can = "file";
+                } else if (r.canaryType >= 2) {
+                    can = "err";
+                } else {
+                    can = "?";
+                }
+
+                var shape = "?";
+                if (r.shapeCount != null) {
+                    shape = r.shapeCount;
+                }
+
+                var mar = "NA";
+                if (r.marginUs != null) {
+                    mar = r.marginUs.toFixed(0) + "us";
+                }
+
+                var rej = "-";
+                if (r.rejections && r.rejections.length > 0) {
+                    rej = r.rejections.join(", ");
+                }
+
+                var windowStatus = "no";
+                if (r.windowQualified) {
+                    windowStatus = "YES";
+                }
+
+                var healthStatus = "BAD";
+                if (r.postHealthy) {
+                    healthStatus = "OK";
+                }
 
                 lines.push(
                     p2((r.waveId || 0) + 1) + "  | " +
                     pR(r.profile || "?", 19) + " | " +
-                    pR((r.shapeCount != null ? r.shapeCount : "?") + "/10", 5) + " | " +
+                    pR(shape + "/10", 5) + " | " +
                     pL(mar, 8) + " | " +
                     pR(can, 6) + " | " +
-                    pR(r.windowQualified ? "YES" : "no", 3) + " | " +
-                    pR(r.postHealthy ? "OK" : "BAD", 4) + " | " +
+                    pR(windowStatus, 3) + " | " +
+                    pR(healthStatus, 4) + " | " +
                     pR(r.verdict || "?", 16) + " | " +
                     rej
                 );
@@ -177,24 +205,69 @@ function createWaveDiag() {
                 for (var i = 0; i < total; i++) {
                     var r = records[i];
                     var rt = r.roleTimings;
-                    if (!rt) continue;
+                    if (!rt) {
+                        continue;
+                    }
+
                     var cm = rt["commit"];
                     var tr = rt["trigger"];
                     var cn = rt["canary"];
-                    var cmEnd = cm ? cm.relStartUs + cm.durationUs : null;
+                    var cmEnd = null;
+                    if (cm) {
+                        cmEnd = cm.relStartUs + cm.durationUs;
+                    }
+
                     var overlap = cmEnd != null && cmEnd > 0;
-                    var res = r.canaryRedirect ? "REDIR" :
-                        r.canaryType === 0 ? "DIR" :
-                        r.canaryType === 1 ? "file" : "err";
+                    var res;
+                    if (r.canaryRedirect) {
+                        res = "REDIR";
+                    } else if (r.canaryType === 0) {
+                        res = "DIR";
+                    } else if (r.canaryType === 1) {
+                        res = "file";
+                    } else {
+                        res = "err";
+                    }
+
+                    var overlapLabel;
+                    if (overlap) {
+                        overlapLabel = "YES";
+                    } else if (cmEnd != null) {
+                        overlapLabel = "no";
+                    } else {
+                        overlapLabel = "?";
+                    }
+
+                    var commitStart = "?";
+                    var commitDuration = "?";
+                    if (cm) {
+                        commitStart = cm.relStartUs.toFixed(0);
+                        commitDuration = cm.durationUs.toFixed(0);
+                    }
+
+                    var commitEnd = "?";
+                    if (cmEnd != null) {
+                        commitEnd = cmEnd.toFixed(0);
+                    }
+
+                    var triggerDuration = "?";
+                    if (tr) {
+                        triggerDuration = tr.durationUs.toFixed(0);
+                    }
+
+                    var canaryDuration = "?";
+                    if (cn) {
+                        canaryDuration = cn.durationUs.toFixed(0);
+                    }
 
                     lines.push(
                         p2((r.waveId || 0) + 1) + "  | " +
-                        pL(cm ? cm.relStartUs.toFixed(0) : "?", 11) + " | " +
-                        pL(cm ? cm.durationUs.toFixed(0) : "?", 10) + " | " +
-                        pL(cmEnd != null ? cmEnd.toFixed(0) : "?", 10) + " | " +
-                        pL(tr ? tr.durationUs.toFixed(0) : "?", 8) + " | " +
-                        pL(cn ? cn.durationUs.toFixed(0) : "?", 10) + " | " +
-                        pR(overlap ? "YES" : cmEnd != null ? "no" : "?", 7) + " | " +
+                        pL(commitStart, 11) + " | " +
+                        pL(commitDuration, 10) + " | " +
+                        pL(commitEnd, 10) + " | " +
+                        pL(triggerDuration, 8) + " | " +
+                        pL(canaryDuration, 10) + " | " +
+                        pR(overlapLabel, 7) + " | " +
                         res
                     );
                 }

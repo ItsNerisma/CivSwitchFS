@@ -40,9 +40,19 @@ for (const file of CORE_FILES) {
 const availableBindings = new Set([...coreBindingNames(), ...CORE_GLOBALS]);
 const payloadFiles = [
     path.join(SRC_DIR, "core.js"),
-    path.join(SRC_DIR, "core", "steps.mjs"),
-    path.join(SRC_DIR, "core", "helpers.mjs"),
-    path.join(SRC_DIR, "core", "promotion.mjs")
+    path.join(SRC_DIR, "core", "steps", "setup.mjs"),
+    path.join(SRC_DIR, "core", "steps", "campaign.mjs"),
+    path.join(SRC_DIR, "core", "steps", "alias.mjs"),
+    path.join(SRC_DIR, "core", "steps", "discovery.mjs"),
+    path.join(SRC_DIR, "core", "steps", "cleanup.mjs"),
+    path.join(SRC_DIR, "core", "helpers", "index.mjs"),
+    path.join(SRC_DIR, "core", "helpers", "util.mjs"),
+    path.join(SRC_DIR, "core", "helpers", "scan.mjs"),
+    path.join(SRC_DIR, "core", "helpers", "discovery.mjs"),
+    path.join(SRC_DIR, "core", "helpers", "cache.mjs"),
+    path.join(SRC_DIR, "core", "helpers", "wave.mjs"),
+    path.join(SRC_DIR, "core", "promotion.mjs"),
+    path.join(SRC_DIR, "core", "log-stage.mjs")
 ];
 const usedBindings = new Set();
 for (const file of payloadFiles) {
@@ -67,6 +77,7 @@ if (missingBindings.length)
 
 const sourceFiles = [
     ...walk(SRC_DIR),
+    ...walk(path.join(ROOT, "persist")),
     ...walk(path.join(ROOT, "tools"))
 ];
 for (const file of sourceFiles) {
@@ -85,5 +96,6 @@ if (built.bytes > MAX_PAYLOAD_BYTES)
 
 console.log(
     `OK: ${sourceFiles.length} source files; payload ${built.bytes} bytes` +
-    (built.minified ? " (minified)" : "")
+    (built.identifiersMinified ? " (ESM identifiers minified)" : "") +
+    (built.minified ? " (full bundle minification for loader limit)" : "")
 );

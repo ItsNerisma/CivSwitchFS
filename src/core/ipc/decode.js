@@ -10,8 +10,7 @@ function arr_read32(arr, offset) {
 // Returns a structured object - all fields are plain JS numbers.
 //
 // Usage:
-//   const buf = snapshot_buffer(tls_base, 0x100);
-//   const msg = decode_ipc_response(buf);
+//   const msg = decode_ipc_response(byteArray);
 //   if (msg.sfco) log("Result: " + msg.sfco.result);
 //
 function decode_ipc_response(buf) {
@@ -93,7 +92,13 @@ function decode_ipc_response(buf) {
     // padding (zeros). The domain header sits at the aligned offset, before
     // the SFCI/SFCO magic.
     const aligned_start = Math.ceil(raw_start / 16) * 16;
-    const cmif_offset = sfci ? sfci.offset : sfco ? sfco.offset : -1;
+    let cmif_offset = -1;
+    if (sfci) {
+        cmif_offset = sfci.offset;
+    } else if (sfco) {
+        cmif_offset = sfco.offset;
+    }
+
     if (cmif_offset > aligned_start) {
         const first_word = u32(aligned_start);
         // Domain response header: u32 num_output_objects

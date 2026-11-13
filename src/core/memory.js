@@ -1,4 +1,4 @@
-// Memory helpers - allocation and byte/string access.
+// Memory helpers — allocation, tracking, and byte/string access.
 
 var activeAllocationTracker = null;
 

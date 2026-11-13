@@ -60,6 +60,8 @@ function borrowThreadScheduling() {
     return best;
 }
 
+// ── Raw-thread frame building ───────────────────────────────────────
+
 // Build a ROP frame for a raw thread (uses SVC_ExitThread at chain end).
 // calls: array of { fn, args: [x0, x1, x2, x3] }
 // Returns: { frame, size, count }
@@ -107,6 +109,8 @@ function buildRawFrame(calls) {
 
     return { frame: frame, size: size, count: count };
 }
+
+// ── Thread lifecycle ────────────────────────────────────────────────
 
 // Create, but do not start, a raw kernel thread running a ROP frame.
 // Reusable buffers may provide { stack, handleBuf } for repeated waves.

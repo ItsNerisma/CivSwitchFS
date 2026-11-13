@@ -26,7 +26,7 @@ export const CORE_GLOBALS = [
 // Dependency order matters: constants and low-level helpers must be declared
 // before the modules that reference them.
 export const CORE_FILES = [
-    "constants.js",
+    "offsets.js",
     "memory.js",
     "format.js",
     "time.js",
@@ -41,12 +41,90 @@ export const CORE_FILES = [
     "ipc/filesystem.js",
     "ipc/storage.js",
     "rop.js",
-    "ipc/raw-threads.js",
+    "threads.js",
     "ipc/scratch.js",
-    "ipc/reservation.js",
-    "ipc/wave.js",
-    "ipc/wave-diag.js"
+    "wave/reservation.js",
+    "wave/orchestration.js",
+    "wave/diagnostics.js"
 ];
+
+export async function buildPayload({
+    entry = DEFAULT_ENTRY,
+    minify = false,
+    debug = false,
+    minifyIdentifiers = true
+} = {}) {
+    const entryPath = path.resolve(entry);
+    const build = minifyBundle => esbuild.build({
+        entryPoints: [entryPath],
+        bundle: true,
+        platform: "browser",
+        format: "iife",
+        globalName: "__CIVSWITCHFS_PAYLOAD__",
+        target: ["es2020"],
+        minifyWhitespace: !debug && minifyBundle,
+        minifyIdentifiers: !debug && minifyIdentifiers,
+        minifySyntax: !debug && minifyBundle,
+        write: false,
+        metafile: true,
+        logLevel: "silent"
+    });
+
+    const bindings = [...new Set([
+        ...coreBindingNames(),
+        ...CORE_GLOBALS
+    ])];
+    const apiEntries = bindings
+        .map(name => `${JSON.stringify(name)}: ${name}`)
+        .join(",\n");
+
+    let result = await build(minify);
+    let payload = makePayload(result.outputFiles[0].text, apiEntries);
+    if (!debug) payload = await minifyWhitespace(payload);
+    let bundleMinified = minify && !debug;
+
+    if (!debug && !bundleMinified &&
+        Buffer.byteLength(payload, "utf8") > MAX_PAYLOAD_BYTES) {
+        result = await build(true);
+        payload = await minifyWhitespace(
+            makePayload(result.outputFiles[0].text, apiEntries)
+        );
+        bundleMinified = true;
+    }
+
+    const bytes = Buffer.byteLength(payload, "utf8");
+    if (bytes > MAX_PAYLOAD_BYTES)
+        throw new Error(debug
+            ? "unminified debug payload exceeds the 500 KB loader limit"
+            : "bundled payload exceeds the 500 KB loader limit");
+
+    const modules = Object.keys(result.metafile.inputs)
+        .filter(file => !file.includes("node_modules"))
+        .map(file => path.relative(ROOT, path.resolve(file)));
+
+    return {
+        payload,
+        modules,
+        minified: bundleMinified,
+        identifiersMinified: !debug && minifyIdentifiers,
+        whitespaceMinified: !debug,
+        debugPayload: debug,
+        bytes
+    };
+}
+
+async function minifyWhitespace(source) {
+    // Compact the complete loader program without changing its syntax or
+    // identifiers. Identifier minification is confined to the ESM bundle.
+    const result = await esbuild.transform(source, {
+        loader: "js",
+        minifyWhitespace: true,
+        minifyIdentifiers: false,
+        minifySyntax: false,
+        legalComments: "inline"
+    });
+    return result.code;
+}
 
 export function loadCore() {
     return CORE_FILES
@@ -88,56 +166,4 @@ function makePayload(bundle, apiEntries) {
         `${wrapBundle(bundle, apiEntries)}\n} catch (__e) {\n` +
         `await log("PAYLOAD ERROR: " + __e.message);\n` +
         `await log(__e.stack);\n}\n})()`;
-}
-
-export async function buildPayload({
-    entry = DEFAULT_ENTRY,
-    minify = false
-} = {}) {
-    const entryPath = path.resolve(entry);
-    const build = minify => esbuild.build({
-        entryPoints: [entryPath],
-        bundle: true,
-        platform: "browser",
-        format: "iife",
-        globalName: "__CIVSWITCHFS_PAYLOAD__",
-        target: ["es2020"],
-        minify,
-        write: false,
-        metafile: true,
-        logLevel: "silent"
-    });
-
-    const bindings = [...new Set([
-        ...coreBindingNames(),
-        ...CORE_GLOBALS
-    ])];
-    const apiEntries = bindings
-        .map(name => `${JSON.stringify(name)}: ${name}`)
-        .join(",\n");
-
-    let result = await build(false);
-    let payload = makePayload(result.outputFiles[0].text, apiEntries);
-    let minified = false;
-
-    if (Buffer.byteLength(payload, "utf8") > MAX_PAYLOAD_BYTES) {
-        result = await build(true);
-        payload = makePayload(result.outputFiles[0].text, apiEntries);
-        minified = true;
-    }
-
-    const bytes = Buffer.byteLength(payload, "utf8");
-    if (bytes > MAX_PAYLOAD_BYTES)
-        throw new Error("bundled payload exceeds the 500 KB loader limit");
-
-    const modules = Object.keys(result.metafile.inputs)
-        .filter(file => !file.includes("node_modules"))
-        .map(file => path.relative(ROOT, path.resolve(file)));
-
-    return {
-        payload,
-        modules,
-        minified,
-        bytes
-    };
 }

@@ -1,14 +1,15 @@
+// Enable low-level logs and per-wave timing spans when diagnosing failed windows.
+export const VERBOSE_LOGGING = false;
+
 export function createFspIdentityConfig() {
   // -- Constants and configuration --------------------------------
 
   var SLOT_SIZE = 0x800;
   var WAVE_READ_SIZE = 0x10000;    // 64 KiB IStorage::Read per wave
   var DIRTY_FILE_SIZE = 0x800000;  // 8 MiB dirty write
-  var MAX_CONTROL_WAVES = 15;      // user-capped per launch
+  var MAX_CONTROL_WAVES = 20;      // user-capped per launch
   var MAX_COPY_ATTEMPTS = 30;      // per nulWrites step per batch
   var COPY_BATCHES = 3;
-  // Cover the observed 1–5 unique strength-3 heap targets while keeping
-  // per-run address-seed work explicitly bounded.
   var MAX_ADDRESS_CANDIDATES = 5;
   var MAX_POOL_REFINEMENT_READS = 16;
   var MAX_POOL_ANCHOR_CANDIDATES = 4;
@@ -38,9 +39,14 @@ export function createFspIdentityConfig() {
       0x01, 0x00
   ];
 
+  // CivSwitchFS original SLEEP offsets in nanoseconds; the canary loop may
+  // retune them from measured role spans, within a bounded drift.
+  // Slapah/Kurumuz reference: [0, 300000, 350000, 450000, 550000, 650000,
+  //                           1700000, 2000000, 2150000, 2800000].
   var roleDelays = [0, 300000, 350000, 450000, 550000, 650000,
                     1000000, 1200000, 1300000, 1700000];
-  // Guard waits after groupReleased; preserve the established 150/300 us.
+  // Guard delays after groupReleased, in nanoseconds.
+  // Slapah/Kurumuz reference: [0, 150000].
   var guardDelays = [150000, 300000];
   var roleLabels = ["commit", "bottleneck", "frag0", "frag1", "frag2", "frag3",
       "canary", "filler0", "filler1", "release", "guard0", "guard1", "trigger"];

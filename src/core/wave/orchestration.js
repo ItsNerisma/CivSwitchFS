@@ -262,7 +262,7 @@ function getSpan(spans, name) {
 // heldRoles: must start before trigger.start AND end after trigger.start
 //
 // Returns { shapeCount, shapeMissing[], pendingDuring[], receiveMarginUs }
-function qualifyOverlap(spans, trigSpan, overlapRoles, throughRoles, heldRoles, roleShort) {
+function qualifyOverlap(spans, trigSpan, overlapRoles, throughRoles, heldRoles) {
     if (!trigSpan) return { shapeCount: 0, shapeMissing: [], pendingDuring: [],
         receiveMarginUs: null };
 
@@ -272,13 +272,6 @@ function qualifyOverlap(spans, trigSpan, overlapRoles, throughRoles, heldRoles, 
         if (s.name !== "trigger" && s.start <= trigSpan.start && s.end >= trigSpan.end)
             pendingDuring.push(s.name);
     }
-
-    var shortRole = function(name) {
-        if (!roleShort) return name;
-        var labels = overlapRoles.concat(["bottleneck", "release", "trigger"]);
-        var idx = labels.indexOf(name);
-        return idx >= 0 && roleShort[idx] ? roleShort[idx] : name;
-    };
 
     var shapeMissing = overlapRoles.filter(function(name) {
         var span = getSpan(spans, name);
