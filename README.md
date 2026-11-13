@@ -91,6 +91,7 @@ An example can be found in `examples/user-storage`.
 - The auto timing calibration is not perfect yet, some freezes can happen
 - Timing configuration, retries and shit will go to a persisted config file soon enough
 - THERE IS SO MUCH MORE to be done, I'm just releasing now so you guys can study the semi-untethered stuff
+- You can learn about how the exploit works [there](https://github.com/ItsNerisma/CivSwitchFS/blob/main/HOW_IT_WORKS.md)
 
 ## Project structure
 

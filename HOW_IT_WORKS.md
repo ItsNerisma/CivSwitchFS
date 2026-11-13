@@ -157,96 +157,26 @@ changes.
 
 ## Glossary
 
-### fsp-srv
-
-Horizon OS's filesystem service. Civilization VII sends it filesystem requests.
-
-### IPC
-
-Inter-process communication: the messages the game sends to a system service
-such as fsp-srv.
-
-### IStorage
-
-An interface for reading and writing storage data.
-
-### PID
-
-Process ID: the number fsp-srv uses to identify the requesting process for
-permission checks.
-
-### Cache alias
-
-A state where a cache entry for one storage offset makes its cached bytes
-available at another offset.
-
-### Cache entry
-
-A record used by the storage cache to track cached data and its metadata.
-
-### Cache label
-
-The storage offset recorded in a cache entry.
-
-### Dirty data
-
-Save data the payload modifies before each wave so the save Commit request
-has work to do during the race.
-
-### Dirty flag
-
-A cache-entry bit that marks data as modified.
-
-### NUL byte
-
-A zero byte used to end a string or byte sequence.
-
-### Canary
-
-A temporary file whose entry type is checked before and after the race to
-detect the expected filesystem effect.
-
-### Reservation object
-
-An object opened through the reservation interface. A group of these objects
-helps shape allocation lifetimes during a wave.
-
-### Worker
-
-A thread that sends one of the overlapping IPC requests in a wave.
-
-### Backing memory
-
-The memory region that stores a cache entry's data.
-
-### Domain-object table
-
-A table in fsp-srv that maps domain IDs to in-memory service objects.
-
-### Domain ID
-
-The identifier used by a domain session to select one of its service objects.
-
-### NCA
-
-Nintendo Content Archive: the game's content backend referenced by the root
-filesystem object.
-
-### Reference count
-
-A count of the active references to an object. Cloning an object increases
-it; closing a clone decreases it.
-
-### Memory endpoint
-
-The retained two-bucket IStorage arrangement that reads and writes selected
-fsp-srv memory addresses.
-
-### Cache loop
-
-The cache owner's background update cycle. The payload disables it before retaining the memory endpoint.
-
-### User content storage
-
-The User-type content filesystem opened after PID promotion; the payload
-verifies it by listing its root directory.
+| Term | Definition |
+|---|---|
+| <a id="fsp-srv"></a>**fsp-srv** | Horizon OS's filesystem service. Civilization VII sends it filesystem requests. |
+| <a id="ipc"></a>**IPC** | Inter-process communication: the messages the game sends to a system service such as fsp-srv. |
+| <a id="istorage"></a>**IStorage** | An interface for reading and writing storage data. |
+| <a id="pid"></a>**PID** | Process ID: the number fsp-srv uses to identify the requesting process for permission checks. |
+| <a id="cache-alias"></a>**Cache alias** | A state where a cache entry for one storage offset makes its cached bytes available at another offset. |
+| <a id="cache-entry"></a>**Cache entry** | A record used by the storage cache to track cached data and its metadata. |
+| <a id="cache-label"></a>**Cache label** | The storage offset recorded in a cache entry. |
+| <a id="dirty-data"></a>**Dirty data** | Save data the payload modifies before each wave so the save Commit request has work to do during the race. |
+| <a id="dirty-flag"></a>**Dirty flag** | A cache-entry bit that marks data as modified. |
+| <a id="nul-byte"></a>**NUL byte** | A zero byte used to end a string or byte sequence. |
+| <a id="canary"></a>**Canary** | A temporary file whose entry type is checked before and after the race to detect the expected filesystem effect. |
+| <a id="reservation-object"></a>**Reservation object** | An object opened through the reservation interface. A group of these objects helps shape allocation lifetimes during a wave. |
+| <a id="worker"></a>**Worker** | A thread that sends one of the overlapping IPC requests in a wave. |
+| <a id="backing-memory"></a>**Backing memory** | The memory region that stores a cache entry's data. |
+| <a id="domain-object-table"></a>**Domain-object table** | A table in fsp-srv that maps domain IDs to in-memory service objects. |
+| <a id="domain-id"></a>**Domain ID** | The identifier used by a domain session to select one of its service objects. |
+| <a id="nca"></a>**NCA** | Nintendo Content Archive: the game's content backend referenced by the root filesystem object. |
+| <a id="reference-count"></a>**Reference count** | A count of the active references to an object. Cloning an object increases it; closing a clone decreases it. |
+| <a id="memory-endpoint"></a>**Memory endpoint** | The retained two-bucket IStorage arrangement that reads and writes selected fsp-srv memory addresses. |
+| <a id="cache-loop"></a>**Cache loop** | The cache owner's background update cycle. The payload disables it before retaining the memory endpoint. |
+| <a id="user-content-storage"></a>**User content storage** | The User-type content filesystem opened after PID promotion; the payload verifies it by listing its root directory. |
