@@ -7,6 +7,8 @@ This is payload provides **access to FS privileges** through an elevated fsp-srv
 
 CivSwitchFS is **semi-untethered**, RPC was fully removed :tada:
 
+Smol demo https://streamable.com/bhgobg
+
 ## Tested configuration
 
 - Nintendo Switch 2, firmware **23.0.1**
@@ -37,10 +39,6 @@ npm run persist:install -- <console-ip> [--minify-payload]
 
 Future launches from that save start the exploit, loader, and
 payload automatically, without a computer or network connection. 
-
-The persisted payload removes whitespace and comments by default while keeping
-source names and syntax. Pass `--debug-payload` to preserve formatting, or
-`--minify-payload` to also shorten ESM local identifiers.
 
 The installer does not back up the old save. 
 
@@ -108,7 +106,3 @@ tools/               # well, tools
 ## License
 
 The original code in this repository is distributed under the MIT license. See [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for detailed notices and credits.
-
-For technical details, see [HOW_IT_WORKS.md](HOW_IT_WORKS.md).
-
-This project is not affiliated with or endorsed by Nintendo. It contains no Nintendo firmware, keys, tickets, or personal saves; `persist/save_template.bin` is the pristine trigger template used by the installer.
