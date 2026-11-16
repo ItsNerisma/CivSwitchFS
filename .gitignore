@@ -8,3 +8,6 @@ npm-debug.log*
 
 # Logs
 logs/
+
+# Tests
+test-payloads/

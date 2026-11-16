@@ -92,7 +92,7 @@ const {
 
 const BASE_ATTEMPTS = 10;
 const MAX_TOTAL_ATTEMPTS = 30;
-const RETRY_PAUSE_MS = 250;
+const RETRY_PAUSE_MS = 100;
 const SCRATCH_DIR = "/hole";
 const NOT_FOUND = 0x202;
 const TIMING_SAVE_DIR = "/civswitchfs";
@@ -968,7 +968,6 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
     const stopAndCleanup = async options => {
         cleanupAttempted = true;
         await beginCleanupLog(attemptState);
-        await emitVerboseStage("Stopping reason: " + options.reason);
         // Cleanup may itself launch cache-retirement waves. If that throws,
         // keep the allocation scope alive because a worker may still use it.
         attemptState.workersQuiesced = false;

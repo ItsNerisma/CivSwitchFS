@@ -24,6 +24,11 @@ function installVisualLogPatchFor(api) {
 
     const existingLogger = globalThis[LOGGER_KEY];
     if (typeof existingLogger === "function") {
+        const existingOutput = globalThis[LOGGER_STATE_KEY]?.output;
+        if (existingOutput?.style) {
+            existingOutput.style.overflowY = "auto";
+            existingOutput.scrollTop = existingOutput.scrollHeight;
+        }
         api.log = existingLogger;
         globalThis.log = existingLogger;
         return;
@@ -320,7 +325,7 @@ function applyConsoleStyle(output, document) {
         boxSizing: "border-box",
         margin: "0",
         padding: "10px 0 22px",
-        overflowY: "hidden",
+        overflowY: "auto",
         overflowX: "hidden",
         fontFamily: "Consolas, 'Liberation Mono', monospace",
         fontSize: compact ? "15px" : "18px",
