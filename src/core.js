@@ -175,6 +175,7 @@ export async function run() {
         let positiveAttemptsTotal = 0;
         let positiveWindowsTotal = 0;
 
+        await emitStage("CivSwitchFS (no RPC) by Nerisma - Thanks to Slapah for the original FS exploit");
         await emitStage(isVerboseLogging()
             ? "Verbose logging is on (controller Y toggles the mode)."
             : "Normal logging is on (controller Y enables verbose summaries).");
