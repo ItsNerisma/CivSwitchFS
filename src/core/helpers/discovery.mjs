@@ -1,8 +1,8 @@
 import coreRuntime from "../runtime.mjs";
 import {
-  buffersEqual,
+  buffersEqualFast,
   checkAddressHeaderEncoding,
-  hasByteDifferent,
+  hasByteDifferentFast,
   readFsAddressBytes,
   readHexBytes
 } from "./util.mjs";
@@ -29,6 +29,38 @@ export async function reportMetadataProgress(input, message) {
         await input.reportProgress(message);
     else
         await log(message);
+}
+
+async function readExternalLinkWindow(input) {
+    var result = await readFsAddressBytes({...input,
+        materializeBytes: false});
+    // A candidate in the final cycle bytes needs a second cache-chunk read.
+    // Keep the existing materialized path for that boundary case.
+    if (!result.ok && result.error ===
+        "buffer-only reads require one aligned cache chunk")
+        result = await readFsAddressBytes(input);
+    return result;
+}
+
+function extractExternalLinkFields(result, offset) {
+    if (result.bytes) {
+        return {
+            next: AnalysisBytes.readU64LE(result.bytes, offset),
+            previous: AnalysisBytes.readU64LE(result.bytes, offset + 8),
+            extent: AnalysisBytes.readU64LE(result.bytes, offset + 16)
+        };
+    }
+    var base = result.buffer + BigInt((result.bufferOffset || 0) + offset);
+    return {next: read64(base), previous: read64(base + 8n),
+        extent: read64(base + 16n)};
+}
+
+function externalLinkFieldsBytes(fields) {
+    var bytes = new Array(24);
+    AnalysisBytes.writeU64LE(bytes, 0, fields.next);
+    AnalysisBytes.writeU64LE(bytes, 8, fields.previous);
+    AnalysisBytes.writeU64LE(bytes, 16, fields.extent);
+    return bytes;
 }
 
 export async function resolvePoolCandidates(seed, sourceLinks, outputBuf, label, input) {
@@ -218,7 +250,7 @@ export async function discoverMetadataAnchors(seedPlan, label, input) {
             ": checking external-link candidate " + (poolIndex + 1) + "/" +
             poolResult.candidates.length + " (check " + externalLinkChecks +
             "/" + config.MAX_METADATA_ANCHOR_CHECKS + ")");
-        var linkReadA = await readFsAddressBytes({config, addressPlan,
+        var linkReadA = await readExternalLinkWindow({config, addressPlan,
             candidateHandle, address: alignedStart, length: anchorLength,
             outputBuf: captureBuf, allowedWindow: anchorWindow});
         if (!linkReadA.ok) {
@@ -237,7 +269,8 @@ export async function discoverMetadataAnchors(seedPlan, label, input) {
             }
             continue;
         }
-        var linkReadB = await readFsAddressBytes({config, addressPlan,
+        var linkFieldsA = extractExternalLinkFields(linkReadA, anchorOffset);
+        var linkReadB = await readExternalLinkWindow({config, addressPlan,
             candidateHandle, address: alignedStart, length: anchorLength,
             outputBuf: captureBuf, allowedWindow: anchorWindow});
         if (!linkReadB.ok) {
@@ -256,16 +289,13 @@ export async function discoverMetadataAnchors(seedPlan, label, input) {
             }
             continue;
         }
-        var nextA = AnalysisBytes.readU64LE(linkReadA.bytes, anchorOffset);
-        var previousA = AnalysisBytes.readU64LE(linkReadA.bytes,
-            anchorOffset + 8);
-        var extentA = AnalysisBytes.readU64LE(linkReadA.bytes,
-            anchorOffset + 16);
-        var nextB = AnalysisBytes.readU64LE(linkReadB.bytes, anchorOffset);
-        var previousB = AnalysisBytes.readU64LE(linkReadB.bytes,
-            anchorOffset + 8);
-        var extentB = AnalysisBytes.readU64LE(linkReadB.bytes,
-            anchorOffset + 16);
+        var linkFieldsB = extractExternalLinkFields(linkReadB, anchorOffset);
+        var nextA = linkFieldsA.next;
+        var previousA = linkFieldsA.previous;
+        var extentA = linkFieldsA.extent;
+        var nextB = linkFieldsB.next;
+        var previousB = linkFieldsB.previous;
+        var extentB = linkFieldsB.extent;
         var stableNext = nextA === nextB;
         var stablePrevious = previousA === previousB;
         var stableExtent = extentA === extentB;
@@ -280,8 +310,8 @@ export async function discoverMetadataAnchors(seedPlan, label, input) {
         var extentShapeOk = extentA >= 0x10000n &&
             extentA <= 0x10000000n && extentA % 0x1000n === 0n;
         var externalLink = stableLink
-            ? RootLayout.parseExternalLink(linkReadA.bytes, anchorOffset,
-                anchorAddress)
+            ? RootLayout.parseExternalLink(
+                externalLinkFieldsBytes(linkFieldsA), 0, anchorAddress)
             : null;
         if (!externalLink) {
             var rejectionReasons = [];
@@ -386,7 +416,7 @@ export async function qualifyMetadataPage(anchor, label, pointerTargets, input) 
     if (ordinaryRead.error !== 0) return withStepData({ok: false,
         continueScan: false, error: "ordinary metadata control=" +
             hex32(ordinaryRead.error)});
-    if (!hasByteDifferent(ordinaryBuf, window.length, 0xA5))
+    if (!hasByteDifferentFast(ordinaryBuf, window.length, 0xA5))
         return withStepData({ok: false, continueScan: false,
             error: "ordinary metadata control remained poison"});
 
@@ -483,11 +513,11 @@ export async function verifyAddressCandidate(plan, label, index, input) {
     var readB = ipcStorageRead(candidateHandle, plan.readOffset,
         config.CONTROL_SIZE, addressBufB);
     var stable = readA.error === 0 && readB.error === 0 &&
-        buffersEqual(addressBufA, addressBufB, config.CONTROL_SIZE);
+        buffersEqualFast(addressBufA, addressBufB, config.CONTROL_SIZE);
     var differsFromControl = readA.error === 0 &&
-        !buffersEqual(addressBufA, ordinaryBuf, config.CONTROL_SIZE);
+        !buffersEqualFast(addressBufA, ordinaryBuf, config.CONTROL_SIZE);
     var changedFromPoison = readA.error === 0 &&
-        hasByteDifferent(addressBufA, config.CONTROL_SIZE, 0xA5);
+        hasByteDifferentFast(addressBufA, config.CONTROL_SIZE, 0xA5);
     var linkHead = readA.error === 0 ? read64(addressBufA) : 0n;
     var linkHeadShape = linkHead === 0n ||
         (linkHead >= 0x100000000n && linkHead < 0x8000000000n &&

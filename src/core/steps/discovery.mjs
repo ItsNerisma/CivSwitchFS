@@ -11,7 +11,6 @@ const {
   ipcStorageRead,
   log,
   openContentStorage,
-  read32,
   read64
 } = coreRuntime;
 
@@ -226,26 +225,32 @@ export async function releaseNeighborsAndFindPointers({
                 }
                 if (tailMatch) clCount++;
 
-                var cLo = Number(read32(bufCur + BigInt(off))) >>> 0;
-                var cHi = Number(read32(bufCur + BigInt(off + 4))) >>> 0;
-                var cBig = BigInt(cLo) | (BigInt(cHi) << 32n);
-                var cVal = cLo + cHi * 0x100000000;
-                var isPtr = cVal >= 0x100000000 && cBig < (1n << 39n);
-                var isAligned = cVal % 0x4000 === 0;
-                var low24ok = (cVal & 0xFFFFFF) !== 0;
+                // curHead is already the complete little-endian 64-bit word.
+                // The old split read32 pair reconstructed the same value.
+                var cBig = curHead;
+                var isPtr = cBig >= 0x100000000n && cBig < (1n << 39n);
+                var isAligned = isPtr && cBig % 0x4000n === 0n;
+                var low24ok = isPtr && (cBig & 0xFFFFFFn) !== 0n;
 
-                var zeroTail = true;
-                for (var zt = 8; zt < 64; zt += 8) {
-                    if (read64(bufCur + BigInt(off + zt)) !== 0n) {
-                        zeroTail = false;
-                        break;
+                // These queue scans can only affect a candidate after all
+                // three cheap head-shape checks pass. Keep their values
+                // unchanged for every candidate that can be emitted.
+                var zeroTail = false;
+                var zeroAfter32 = false;
+                if (isPtr && isAligned && low24ok) {
+                    zeroTail = true;
+                    for (var zt = 8; zt < 64; zt += 8) {
+                        if (read64(bufCur + BigInt(off + zt)) !== 0n) {
+                            zeroTail = false;
+                            break;
+                        }
                     }
-                }
-                var zeroAfter32 = true;
-                for (var za = 32; za < config.CONTROL_SIZE; za += 8) {
-                    if (read64(bufCur + BigInt(off + za)) !== 0n) {
-                        zeroAfter32 = false;
-                        break;
+                    zeroAfter32 = true;
+                    for (var za = 32; za < config.CONTROL_SIZE; za += 8) {
+                        if (read64(bufCur + BigInt(off + za)) !== 0n) {
+                            zeroAfter32 = false;
+                            break;
+                        }
                     }
                 }
 

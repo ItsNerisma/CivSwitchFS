@@ -7,7 +7,7 @@ export function createFspIdentityConfig() {
   var SLOT_SIZE = 0x800;
   var WAVE_READ_SIZE = 0x10000;    // 64 KiB IStorage::Read per wave
   var DIRTY_FILE_SIZE = 0x800000;  // 8 MiB dirty write
-  var MAX_CONTROL_WAVES = 20;      // user-capped per launch
+  var MAX_CONTROL_WAVES = 13;      // user-capped per launch
   var MAX_COPY_ATTEMPTS = 30;      // per nulWrites step per batch
   var COPY_BATCHES = 3;
   var MAX_ADDRESS_CANDIDATES = 5;

@@ -98,9 +98,8 @@ export function readFsAddressBytes(input) {
                         ? "none" : hex32(reply.cmifError)) +
                     " offset=0x" + requestOffset.toString(16) +
                     " size=0x" + requestSize.toString(16)};
-        var nonPoison = copyBytes
-            ? hasByteDifferent(outputBuf + BigInt(prefix), take, 0xA5)
-            : hasByteDifferentFast(outputBuf + BigInt(prefix), take, 0xA5);
+        var nonPoison = hasByteDifferentFast(
+            outputBuf + BigInt(prefix), take, 0xA5);
         if (!nonPoison)
             return {ok: false, fatal: true,
                 error: "read window remained poison"};
@@ -337,6 +336,30 @@ export function buffersEqual(a, b, length) {
     return true;
 }
 
+export function buffersEqualFast(a, b, length) {
+    // Whole-word comparison is safe when both addresses have the same
+    // alignment. Retain the general bytewise path for unequal alignments.
+    if ((a & 7n) !== (b & 7n)) return buffersEqual(a, b, length);
+
+    var alignment = Number(a & 7n);
+    var prefix = alignment === 0 ? 0 : 8 - alignment;
+    var offset = 0;
+    var prefixEnd = Math.min(prefix, length);
+    for (; offset < prefixEnd; offset++) {
+        if (Number(read8(a + BigInt(offset))) !==
+            Number(read8(b + BigInt(offset)))) return false;
+    }
+    for (; offset + 8 <= length; offset += 8) {
+        if (read64(a + BigInt(offset)) !==
+            read64(b + BigInt(offset))) return false;
+    }
+    for (; offset < length; offset++) {
+        if (Number(read8(a + BigInt(offset))) !==
+            Number(read8(b + BigInt(offset)))) return false;
+    }
+    return true;
+}
+
 export function hasByteDifferent(addr, length, value) {
     for (var i = 0; i < length; i++)
         if (Number(read8(addr + BigInt(i))) !== value) return true;
@@ -346,6 +369,11 @@ export function hasByteDifferent(addr, length, value) {
 export function hasByteDifferentFast(addr, length, value) {
     var repeatedWord = BigInt(value) * 0x0101010101010101n;
     var offset = 0;
+    var alignment = Number(addr & 7n);
+    var prefix = alignment === 0 ? 0 : 8 - alignment;
+    var prefixEnd = Math.min(prefix, length);
+    for (; offset < prefixEnd; offset++)
+        if (Number(read8(addr + BigInt(offset))) !== value) return true;
     for (; offset + 8 <= length; offset += 8) {
         if (read64(addr + BigInt(offset)) !== repeatedWord) return true;
     }
