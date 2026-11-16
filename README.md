@@ -73,7 +73,7 @@ var guardDelays = [150000, 300000];
 
 ### Controls
 
-- **X**: restore the original timings (starting next attempt)
+- **X**: restore the original timings (starting next attempt, will also delete the config file at the end)
 - **B**: stops after the current wave clean up
 - **Y**: toggle between normal and verbose summaries
 
