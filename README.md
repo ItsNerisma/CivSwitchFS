@@ -7,6 +7,8 @@ This is payload provides **access to FS privileges** through an elevated fsp-srv
 
 ## A bit of a preface
 
+Smol demo (updated) https://streamable.com/wtcdnk
+
 CivSwitchFS is **semi-untethered**, RPC was fully removed :tada: ! It should also be more consistent for any hardware.
 
 **It's intended for devs**, as all I give is a god `fsp-srv` handle (full FS) for you to play with. The rest is for you to figure out.
