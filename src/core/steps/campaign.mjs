@@ -146,7 +146,7 @@ export async function runControlWaveLoop({
             break;
         }
 
-        var renameInputBefore = renamePathBuffers
+        var renameInputBefore = renamePathBuffers && isVerboseLogging()
             ? helpers.captureRenameInputState(REQ, renamePathBuffers) : null;
 
         var group = openReservationGroup(rootSession, pktBuf, 59);

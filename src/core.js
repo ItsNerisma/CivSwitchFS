@@ -1424,7 +1424,8 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
     let baseline = null;
     let release = {
         ok: true, extraStorages: releaseSetup.extraStorages,
-        pointerCandidates: [], releaseRounds: 0, totalChangedLinks: 0,
+        pointerCandidates: [], releaseRounds: 0, monitoringRounds: 0,
+        totalChangedLinks: 0,
         stopReason: releaseSetup.eligible ? "baseline-not-run" : "scan-ineligible"
     };
 
@@ -1463,11 +1464,16 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
             await emitStage("Memory candidates found.");
             await emitVerboseStage(release.pointerCandidates.length +
                 " candidates found across " + release.releaseRounds +
-                " rounds (changed links=" + release.totalChangedLinks +").");
+                " rounds" + (release.monitoringRounds
+                    ? " + " + release.monitoringRounds + " monitor" : "") +
+                " (changed links=" + release.totalChangedLinks +").");
         } else {
             await emitStage("No memory candidates were found.");
             await emitVerboseStage("Memory search details: rounds=" +
-                release.releaseRounds + "; changed links=" +
+                release.releaseRounds +
+                (release.monitoringRounds
+                    ? " + " + release.monitoringRounds + " monitor" : "") +
+                "; changed links=" +
                 release.totalChangedLinks + "; stopped=" +
                 (release.stopReason || "no") + "; read error=" +
                 (release.readError == null ? "none" : formatCode(release.readError)) + ".");

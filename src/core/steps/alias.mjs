@@ -334,7 +334,7 @@ export async function installCacheAlias({
                         allStepsOk = false; break;
                     }
 
-                    var renameInputBefore = renamePathBuffers
+                    var renameInputBefore = renamePathBuffers && isVerboseLogging()
                         ? helpers.captureRenameInputState(REQ,
                             renamePathBuffers) : null;
 

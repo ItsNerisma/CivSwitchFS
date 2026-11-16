@@ -27,6 +27,7 @@ export function createFspIdentityConfig() {
   // Extra reference guard applied uniformly to every field copy.
   var FIELD_MINIMUM_CACHE_HELD = 0x2810;
   // Normal alias waves rewrite save:/hole/commit_data (8 MiB) and overlap Commit.
+  var MONITORING_ROUNDS = 4;        // extra snapshot re-reads after release
   var CACHE_READ_SIZE = 0x200000;  // 2 MiB widened read
   var CONTROL_SIZE = 0x4000;       // 16 KiB — one cache block
   var ROOT_CAPTURE_SIZE = 0x4D8000;
@@ -75,6 +76,7 @@ export function createFspIdentityConfig() {
     MARKER_OFFSET,
     WINDOW_MINIMUM_CACHE_HELD,
     FIELD_MINIMUM_CACHE_HELD,
+    MONITORING_ROUNDS,
     CACHE_READ_SIZE,
     CONTROL_SIZE,
     ROOT_CAPTURE_SIZE,
