@@ -22,6 +22,60 @@ const {
   writeDirtyData
 } = coreRuntime;
 
+function formatHexValue(value) {
+    return value == null || !Number.isFinite(Number(value))
+        ? "na" : "0x" + Number(value).toString(16);
+}
+
+function formatResultCode(value) {
+    if (value == null) return "na";
+    var raw = Number(value) >>> 0;
+    var canonical = raw === 0xFFFFFFFF ? raw : raw & 0x3FFFFF;
+    return raw === canonical
+        ? "0x" + raw.toString(16)
+        : "0x" + raw.toString(16) + "/0x" + canonical.toString(16);
+}
+
+function formatRenameInputDiagnostics(diagnostics) {
+    if (!diagnostics) return "unavailable";
+    var labels = [
+        ["src", "fillerSource"], ["dst", "fillerDestination"],
+        ["guard0", "guardSource"], ["guard1", "guardDestination"]
+    ];
+    var summaries = [];
+    for (var i = 0; i < labels.length; i++) {
+        var label = labels[i][0];
+        var name = labels[i][1];
+        var before = diagnostics.before?.[name];
+        var after = diagnostics.after?.[name];
+        if (!before?.available || !after?.available) {
+            summaries.push(label + "=unavailable");
+            continue;
+        }
+        var beforeStatus = before.matchesExpected ? "ok" : "diff@" +
+            (before.firstDiff ? before.firstDiff.offset : "?");
+        var afterStatus = after.matchesExpected ? "ok" : "diff@" +
+            (after.firstDiff ? after.firstDiff.offset : "?");
+        var status = beforeStatus + ">" + afterStatus +
+            (before.hash !== after.hash ? "/mutated" : "");
+        summaries.push(label + "/" + before.size + "=0x" +
+            before.hash.toString(16) + ">0x" + after.hash.toString(16) +
+            "/" + status);
+    }
+    var descriptorStatus = diagnostics.descriptorsOk ? "ok" : "bad";
+    if (!diagnostics.descriptorsOk && diagnostics.descriptors?.roles) {
+        var badRoles = diagnostics.descriptors.roles.filter(role =>
+            role.descriptors.some(desc => !desc.matchesExpected));
+        descriptorStatus += ":" + badRoles.map(role => "W" + role.role + "[" +
+            role.descriptors.map((desc, index) => index + ":" +
+                desc.index + "/" + desc.size + "@0x" +
+                desc.address.toString(16) + "/0x" +
+                desc.word0.toString(16) + "/0x" +
+                desc.word1.toString(16)).join(",") + "]").join(";");
+    }
+    return summaries.join(",") + ";xdesc=" + descriptorStatus;
+}
+
 function formatCopyWaveDiagnostics(gateFailures, shapeMissing, minMarginUs,
     maxMarginUs, minLowCacheUsed, maxLowCacheUsed, pathReplyFailures) {
     const parts = [];
@@ -179,6 +233,7 @@ export async function installCacheAlias({
   workerStateSafe,
   fragmentBufs,
   triggerBuf,
+  renamePathBuffers = null,
   clearPkt,
   clearSendIndex,
   pinFirstWaveQualified,
@@ -279,6 +334,10 @@ export async function installCacheAlias({
                         allStepsOk = false; break;
                     }
 
+                    var renameInputBefore = renamePathBuffers
+                        ? helpers.captureRenameInputState(REQ,
+                            renamePathBuffers) : null;
+
                     var group = openReservationGroup(rootSession, pktBuf, 59);
                     if (!group.ok) {
                         stepHardFailure = "reservation-failed";
@@ -332,7 +391,8 @@ export async function installCacheAlias({
                             rootSession, sendIndices,
                             abortControlCanonical: abortControlCanonical,
                             canaryPath: canaryPath, savedHandle,
-                            setupPath: setupPath, setupPkt: setupPkt
+                            setupPath: setupPath, setupPkt: setupPkt,
+                            renamePathBuffers, renameInputBefore
                         });
 
                     var releaseWasSent = roleSendCode(waveData.frames, 9,

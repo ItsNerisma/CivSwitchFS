@@ -476,12 +476,26 @@ export async function checkPathPair({
         auxiliaryStorageHandle
     });
     // S8: Path-pair control.
-    var fillerControlOk = await helpers.checkPathPairQuiet(
-        fillerSrc, 16, fillerDst, 0x7F0, {savedHandle});
-    var guardControlOk = fillerControlOk
+    var fillerControl = await helpers.checkPathPairQuiet(
+        fillerSrc, 16, fillerDst, 0x7F0,
+        {savedHandle, returnDiagnostics: true});
+    var fillerControlOk = fillerControl.ok;
+    var guardControl = fillerControlOk
         ? await helpers.checkPathPairQuiet(
-            guardPath, 0x301, guardPathC, 0x301, {savedHandle})
+            guardPath, 0x301, guardPathC, 0x301,
+            {savedHandle, returnDiagnostics: true})
         : null;
+    var guardControlOk = guardControl ? guardControl.ok : null;
+    var formatControlCode = function(value) {
+        return value == null ? "skipped" :
+            "0x" + (Number(value) >>> 0).toString(16);
+    };
+    await log("RenameFile quiet controls: filler transport=" +
+        formatControlCode(fillerControl.transport) + ", result=" +
+        formatControlCode(fillerControl.result) + "; guards transport=" +
+        (guardControl ? formatControlCode(guardControl.transport) : "skipped") +
+        ", result=" + (guardControl
+            ? formatControlCode(guardControl.result) : "skipped") + ".");
     var controlOk = Boolean(fillerControlOk && guardControlOk);
     if (!controlOk) {
         await log("FAIL: path-pair control");

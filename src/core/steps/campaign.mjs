@@ -58,6 +58,7 @@ export async function runControlWaveLoop({
   segments,
   selectedDir,
   triggerBuf,
+  renamePathBuffers = null,
   clearPkt,
   clearSendIndex,
   pinSendIndex,
@@ -145,6 +146,9 @@ export async function runControlWaveLoop({
             break;
         }
 
+        var renameInputBefore = renamePathBuffers
+            ? helpers.captureRenameInputState(REQ, renamePathBuffers) : null;
+
         var group = openReservationGroup(rootSession, pktBuf, 59);
         if (!group.ok) {
             workflowStopReason = "reservation-failed-at-wave-" + (attempt + 1);
@@ -197,7 +201,8 @@ export async function runControlWaveLoop({
                 preSendIndex: preSendIndex, rootSession, sendIndices,
                 abortControlCanonical: abortControlCanonical,
                 canaryPath: canaryPath, savedHandle, setupPath: setupPath,
-                setupPkt: setupPkt
+                setupPkt: setupPkt, renamePathBuffers,
+                renameInputBefore
             });
         pinHandle = wResult.pinHandle;
         pinFirstWaveQualified = wResult.pinFirstWaveQualified;

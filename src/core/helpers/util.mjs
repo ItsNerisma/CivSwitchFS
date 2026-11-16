@@ -220,6 +220,57 @@ function waveRejectionSummary(result, config, profile, verdict) {
     return reasons.join(", ");
 }
 
+function formatPathReplyCode(value) {
+    if (value == null) return "na";
+    var raw = Number(value) >>> 0;
+    if (raw === 0xFFFFFFFF) return "send-failed";
+    var canonical = raw & 0x3FFFFF;
+    return raw === canonical
+        ? "0x" + raw.toString(16)
+        : "0x" + raw.toString(16) + "/0x" + canonical.toString(16);
+}
+
+function formatRenameInputDiagnostics(diagnostics) {
+    if (!diagnostics) return "path-inputs=unavailable";
+    var labels = [
+        ["src", "fillerSource"], ["dst", "fillerDestination"],
+        ["guard0", "guardSource"], ["guard1", "guardDestination"]
+    ];
+    var summaries = [];
+    for (var i = 0; i < labels.length; i++) {
+        var label = labels[i][0];
+        var name = labels[i][1];
+        var before = diagnostics.before?.[name];
+        var after = diagnostics.after?.[name];
+        if (!before?.available || !after?.available) {
+            summaries.push(label + "=unavailable");
+            continue;
+        }
+        var beforeStatus = before.matchesExpected ? "ok" : "diff@" +
+            (before.firstDiff ? before.firstDiff.offset : "?");
+        var afterStatus = after.matchesExpected ? "ok" : "diff@" +
+            (after.firstDiff ? after.firstDiff.offset : "?");
+        var status = beforeStatus + ">" + afterStatus +
+            (before.hash !== after.hash ? "/mutated" : "");
+        summaries.push(label + "/" + before.size + "=0x" +
+            before.hash.toString(16) + ">0x" + after.hash.toString(16) +
+            "/" + status);
+    }
+    var descriptorStatus = diagnostics.descriptorsOk ? "ok" : "bad";
+    if (!diagnostics.descriptorsOk && diagnostics.descriptors?.roles) {
+        var badRoles = diagnostics.descriptors.roles.filter(role =>
+            role.descriptors.some(desc => !desc.matchesExpected));
+        descriptorStatus += ":" + badRoles.map(role => "W" + role.role + "[" +
+            role.descriptors.map((desc, index) => index + ":" +
+                desc.index + "/" + desc.size + "@0x" +
+                desc.address.toString(16) + "/0x" +
+                desc.word0.toString(16) + "/0x" +
+                desc.word1.toString(16)).join(",") + "]").join(";");
+    }
+    return "path-inputs=" + summaries.join(",") + ";xdesc=" +
+        descriptorStatus;
+}
+
 export function formatWaveSummaryLine(id, profile, result, verdict, input) {
     const config = input.config;
     const status = waveStatus(profile, result, verdict);
@@ -256,6 +307,17 @@ export function formatWaveSummaryLine(id, profile, result, verdict, input) {
         line += " · cache=" + held + "/0x" +
             Number(config.FIELD_MINIMUM_CACHE_HELD).toString(16);
     }
+
+    if (result.pathReplyResults) {
+        const paths = result.pathReplyResults;
+        line += " · RenameFile=f0:" + formatPathReplyCode(paths.filler0) +
+            ",f1:" + formatPathReplyCode(paths.filler1) +
+            ",g0:" + formatPathReplyCode(paths.guard0) +
+            ",g1:" + formatPathReplyCode(paths.guard1);
+    }
+    if (result.renameInputDiagnostics)
+        line += " · " + formatRenameInputDiagnostics(
+            result.renameInputDiagnostics);
 
     if (status === "REJECTED" || status === "FLIP OUTSIDE WINDOW") {
         const reasons = waveRejectionSummary(result, config, profile, verdict);

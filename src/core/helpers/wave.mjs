@@ -187,8 +187,122 @@ export function checkPathPairQuiet(path0, size0, path1, size1, input) {
     writeXDesc(controlPkt, 8, p0, size0, 0);
     writeXDesc(controlPkt, 16, p1, size1, 1);
     var transport = Number(sendIPC(savedHandle, controlPkt)) >>> 0;
-    if (transport !== 0) return false;
-    return cmifReply(controlPkt).result === 0x202;
+    var result = transport === 0
+        ? Number(cmifReply(controlPkt).result) >>> 0 : 0xFFFFFFFF;
+    var ok = transport === 0 && result === 0x202;
+    if (input.returnDiagnostics === true)
+        return {ok: ok, transport: transport, result: result};
+    return ok;
+}
+
+function snapshotRenamePathBuffers(pathBuffers) {
+    if (!pathBuffers) return null;
+    var names = ["fillerSource", "fillerDestination",
+        "guardSource", "guardDestination"];
+    var snapshots = Object.create(null);
+    for (var ni = 0; ni < names.length; ni++) {
+        var name = names[ni];
+        var spec = pathBuffers[name];
+        if (!spec || spec.address == null || !Number.isFinite(spec.size)) {
+            snapshots[name] = {available: false};
+            continue;
+        }
+        var hash = 0x811C9DC5;
+        var firstNul = -1;
+        var firstDiff = null;
+        for (var offset = 0; offset < spec.size; offset += 4) {
+            var word = Number(read32(spec.address + BigInt(offset))) >>> 0;
+            for (var byteIndex = 0; byteIndex < 4 &&
+                offset + byteIndex < spec.size; byteIndex++) {
+                var byte = (word >>> (byteIndex * 8)) & 0xFF;
+                var absoluteIndex = offset + byteIndex;
+                hash = Math.imul(hash ^ byte, 0x01000193) >>> 0;
+                if (byte === 0 && firstNul < 0) firstNul = absoluteIndex;
+                var expectedByte = null;
+                if (typeof spec.expected === "string") {
+                    if (absoluteIndex < spec.expected.length)
+                        expectedByte = spec.expected.charCodeAt(absoluteIndex);
+                    else if (absoluteIndex === spec.expected.length &&
+                        spec.expected.length < spec.size)
+                        expectedByte = 0;
+                }
+                if (expectedByte !== null && byte !== expectedByte &&
+                    firstDiff === null) {
+                    firstDiff = {offset: absoluteIndex,
+                        expected: expectedByte, actual: byte};
+                }
+            }
+        }
+        snapshots[name] = {
+            available: true,
+            hash: hash >>> 0,
+            size: spec.size,
+            firstNul: firstNul,
+            matchesExpected: firstDiff === null,
+            firstDiff: firstDiff
+        };
+    }
+    return snapshots;
+}
+
+function snapshotRenameDescriptors(REQ, pathBuffers) {
+    if (!REQ || !pathBuffers) return null;
+    var roles = [
+        {role: 7, first: "fillerSource", second: "fillerDestination"},
+        {role: 8, first: "fillerSource", second: "fillerDestination"},
+        {role: 10, first: "guardSource", second: "guardDestination"},
+        {role: 11, first: "guardSource", second: "guardDestination"}
+    ];
+    var output = [];
+    var allMatch = true;
+    for (var ri = 0; ri < roles.length; ri++) {
+        var role = roles[ri];
+        var record = {role: role.role, descriptors: []};
+        var names = [role.first, role.second];
+        for (var di = 0; di < 2; di++) {
+            var offset = 8 + di * 8;
+            var word0 = Number(read32(REQ[role.role] + BigInt(offset))) >>> 0;
+            var word1 = Number(read32(REQ[role.role] + BigInt(offset + 4))) >>> 0;
+            var spec = pathBuffers[names[di]];
+            var address = BigInt(word1) |
+                (BigInt((word0 >>> 12) & 0xF) << 32n) |
+                (BigInt((word0 >>> 6) & 0x7) << 36n);
+            var expectedAddress = spec ? BigInt(spec.address) : null;
+            var expectedWord0 = spec
+                ? (((spec.size << 16) |
+                    (Number((expectedAddress >> 36n) & 0x7n) << 6) |
+                    (Number((expectedAddress >> 32n) & 0xFn) << 12) |
+                    di) >>> 0)
+                : null;
+            var expectedWord1 = spec
+                ? Number(expectedAddress & 0xFFFFFFFFn) >>> 0 : null;
+            var descriptor = {
+                word0: word0,
+                word1: word1,
+                index: word0 & 0x3F,
+                size: word0 >>> 16,
+                address: address,
+                expectedIndex: di,
+                expectedSize: spec ? spec.size : null,
+                expectedAddress: expectedAddress,
+                expectedWord0: expectedWord0,
+                expectedWord1: expectedWord1
+            };
+            descriptor.matchesExpected = Boolean(spec &&
+                word0 === expectedWord0 && word1 === expectedWord1);
+            if (!descriptor.matchesExpected) allMatch = false;
+            record.descriptors.push(descriptor);
+        }
+        output.push(record);
+    }
+    return {allMatch: allMatch, roles: output};
+}
+
+export function captureRenameInputState(REQ, pathBuffers) {
+    return {
+        buffers: snapshotRenamePathBuffers(pathBuffers),
+        descriptors: snapshotRenameDescriptors(REQ, pathBuffers)
+    };
 }
 
 export function queryCanaryHealth(input) {
@@ -249,6 +363,43 @@ export function analyzeWave(profile, wave, waveData, group, createPinThisWave, i
     let savedHandle = input.savedHandle;
     let setupPath = input.setupPath;
     let setupPkt = input.setupPkt;
+    var renameInputDiagnostics = null;
+    if (input.renamePathBuffers && input.renameInputBefore) {
+        var renameBufferAfter = snapshotRenamePathBuffers(
+            input.renamePathBuffers);
+        var renameBufferNames = ["fillerSource", "fillerDestination",
+            "guardSource", "guardDestination"];
+        var changedRenameBuffers = [];
+        var unexpectedRenameBuffers = [];
+        for (var rbi = 0; rbi < renameBufferNames.length; rbi++) {
+            var bufferName = renameBufferNames[rbi];
+            var beforeBuffer = input.renameInputBefore.buffers?.[bufferName];
+            var afterBuffer = renameBufferAfter?.[bufferName];
+            if (!beforeBuffer?.available || !afterBuffer?.available) {
+                unexpectedRenameBuffers.push(bufferName + ":unavailable");
+                continue;
+            }
+            if (beforeBuffer.hash !== afterBuffer.hash)
+                changedRenameBuffers.push(bufferName);
+            if (!beforeBuffer.matchesExpected || !afterBuffer.matchesExpected) {
+                var mismatch = !afterBuffer.matchesExpected
+                    ? afterBuffer.firstDiff : beforeBuffer.firstDiff;
+                unexpectedRenameBuffers.push(bufferName + "@" +
+                    (mismatch ? mismatch.offset : "unknown"));
+            }
+        }
+        var descriptorSnapshot = input.renameInputBefore.descriptors;
+        renameInputDiagnostics = {
+            before: input.renameInputBefore.buffers,
+            after: renameBufferAfter,
+            changedBuffers: changedRenameBuffers,
+            unexpectedBuffers: unexpectedRenameBuffers,
+            descriptors: descriptorSnapshot,
+            descriptorsOk: Boolean(descriptorSnapshot?.allMatch),
+            buffersUnchanged: changedRenameBuffers.length === 0,
+            buffersMatchExpected: unexpectedRenameBuffers.length === 0
+        };
+    }
     var canonicalResultCode = function(result) {
         var raw = Number(result) >>> 0;
         return raw === 0xFFFFFFFF ? raw : raw & 0x3FFFFF;
@@ -313,6 +464,20 @@ export function analyzeWave(profile, wave, waveData, group, createPinThisWave, i
     var afterStats = readAllocationCounters(rootSession, pktBuf);
     var preReleaseUsed = group.held && preStats
         ? group.held[5] - preStats[5] : null;
+    var preProbeStart = preSendIndex > 0
+        ? readFrameResult(waveData.frames[9].frame, preSendIndex - 1)
+        : FRAME_SENTINEL;
+    var preProbeEnd = preSendIndex >= 0
+        ? readFrameResult(waveData.frames[9].frame, preSendIndex + 1)
+        : FRAME_SENTINEL;
+    var preProbeTimingMeasured = preProbeStart !== FRAME_SENTINEL &&
+        preProbeEnd !== FRAME_SENTINEL;
+    var preProbeTiming = {
+        startOffsetUs: preProbeTimingMeasured && trigSpan
+            ? ticksToUs(preProbeStart - trigSpan.start) : null,
+        durationUs: preProbeTimingMeasured
+            ? ticksToUs(preProbeEnd - preProbeStart) : null
+    };
     var pinPersistentBytes = createPinThisWave && afterStats && group.before
         ? group.before[5] - afterStats[5] : null;
     var pinCostOk = !createPinThisWave ||
@@ -453,7 +618,16 @@ export function analyzeWave(profile, wave, waveData, group, createPinThisWave, i
         window: wc.ok,
         rejections: wc.rejections,
         sendCodes: sendCodes,
+        cacheCounter5: {
+            before: group.before ? group.before[5] : null,
+            held: group.held ? group.held[5] : null,
+            pre: preStats ? preStats[5] : null,
+            after: afterStats ? afterStats[5] : null
+        },
+        preProbeTiming: preProbeTiming,
+        commitResult: commitResult,
         readResult: readResult,
+        tailResults: tailResults,
         roleTimings: roleTimings,
         canaryType: canaryType,
         canaryResult: canaryResult,
@@ -477,6 +651,7 @@ export function analyzeWave(profile, wave, waveData, group, createPinThisWave, i
             guard0: guardResults[0],
             guard1: guardResults[1]
         },
+        renameInputDiagnostics: renameInputDiagnostics,
         pinDiagnostics: {
             created: createPinThisWave,
             result: pinReply.result,

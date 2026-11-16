@@ -278,6 +278,26 @@ function ipcOpenFile(handle, path, mode) {
     return (reply.result === 0 && reply.moves.length) ? reply.moves[0] : 0;
 }
 
+// IFile::OperateRange (cmd 5) with operation=2 (invalidate cache).
+// Mirrors ipcStorageInvalidate but targets an IFile handle.
+// Opens the file, invalidates [0, size), closes it. Returns the SFCO result,
+// or -1 if the file could not be opened.
+function ipcFileInvalidate(fsHandle, path, size) {
+    var fileHandle = ipcOpenFile(fsHandle, path, 1);
+    if (!fileHandle) return -1;
+    var pkt = allocPage(0x2000);
+    prepPacket(pkt, 4, 0x0C, []);
+    write32(pkt + 0x10n, 0x49434653n);
+    write32(pkt + 0x18n, 5n);                    // cmd 5 = OperateRange
+    write32(pkt + 0x20n, 2n);                    // operation = 2 (invalidate)
+    write64(pkt + 0x28n, 0n);                    // offset = 0
+    write64(pkt + 0x30n, BigInt(size));           // size
+    sendIPC(fileHandle, pkt);
+    var result = cmifReply(pkt).result;
+    closeHandle(fileHandle);
+    return result;
+}
+
 function ipcCreateDirectoryChecked(handle, path) {
     var pathBuf = allocPage(0x1000);
     var pkt = allocPage(0x2000);

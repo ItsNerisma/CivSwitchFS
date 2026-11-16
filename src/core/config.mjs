@@ -26,6 +26,7 @@ export function createFspIdentityConfig() {
   var WINDOW_MINIMUM_CACHE_HELD = 0x2600; // reference receive-window floor
   // Extra reference guard applied uniformly to every field copy.
   var FIELD_MINIMUM_CACHE_HELD = 0x2810;
+  // Normal alias waves rewrite save:/hole/commit_data (8 MiB) and overlap Commit.
   var CACHE_READ_SIZE = 0x200000;  // 2 MiB widened read
   var CONTROL_SIZE = 0x4000;       // 16 KiB — one cache block
   var ROOT_CAPTURE_SIZE = 0x4D8000;
@@ -39,10 +40,12 @@ export function createFspIdentityConfig() {
       0x01, 0x00
   ];
 
-  // Built-in SLEEP offsets in nanoseconds; the canary loop may retune them
-  // from measured role spans, within a bounded drift.
+  // My own working delays, seems to be best for the current implementation without RPC
   var roleDelays = [0, 300000, 350000, 450000, 550000, 650000, 1000000, 1200000, 1300000, 1700000];
   var guardDelays = [150000, 300000];
+  // References from Slapah / Kurumuz
+  //var roleDelays = [0, 300000, 350000, 450000, 550000, 650000, 1700000, 2000000, 2150000, 2800000];
+  //var guardDelays = [0, 150000];
   var roleLabels = ["commit", "bottleneck", "frag0", "frag1", "frag2", "frag3",
       "canary", "filler0", "filler1", "release", "guard0", "guard1", "trigger"];
   var roleShort = ["C", "B", "F0", "F1", "F2", "F3", "Y", "X0", "X1", "R",

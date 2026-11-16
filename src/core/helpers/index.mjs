@@ -43,6 +43,7 @@ import {
   configurePayload,
   writeIntoPayload,
   checkPathPairQuiet,
+  captureRenameInputState,
   queryCanaryHealth,
   nulWrites,
   analyzeWave
@@ -89,6 +90,7 @@ export function createFspIdentityHelpers(options = {}) {
     configurePayload,
     writeIntoPayload,
     checkPathPairQuiet,
+    captureRenameInputState,
     queryCanaryHealth,
     nulWrites,
     analyzeWave

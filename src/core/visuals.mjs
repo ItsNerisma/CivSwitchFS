@@ -1,13 +1,10 @@
-// Keep payload logs inside better-console when its public logger is available.
-// The fallback uses the same row layout and colors for standalone loaders.
+// Keep payload logs inside an in-page overlay with a consistent row layout.
 const LOGGER_KEY = "__CIVSWITCHFS_VISUAL_LOGGER_V2__";
 const LOGGER_STATE_KEY = "__CIVSWITCHFS_VISUAL_LOG_STATE_V2__";
-const LEGACY_LOGGER_KEY = "__CIVSWITCHFS_VISUAL_LOGGER__";
-const LEGACY_STATE_KEY = "__CIVSWITCHFS_VISUAL_LOG_STATE__";
 const INPUT_CONTROL_STATE_KEY = "__CIVSWITCHFS_INPUT_CONTROL_STATE_V1__";
 const INPUT_CONTROL_VERSION = 4;
-const BETTER_CONSOLE_FORWARDER = "__civSwitchBetterConsoleForwarder";
 const LOG_LABEL = "CivSwitchFS logs";
+const MAX_VISIBLE_LOG_LINES = 100;
 
 export function installVisualLogPatch() {
     const api = globalThis.__CIVSWITCH_CORE_API__;
@@ -25,29 +22,6 @@ function installVisualLogPatchFor(api) {
     const document = globalThis.document;
     if (!api || typeof api.log !== "function" || !document?.body) return;
 
-    const betterConsole = globalThis.civConsole;
-    if (betterConsole && typeof betterConsole.log === "function") {
-        removeLegacyOutput(document);
-        const existingLogger = globalThis[LOGGER_KEY];
-        if (typeof existingLogger === "function" &&
-            existingLogger[BETTER_CONSOLE_FORWARDER]) {
-            api.log = existingLogger;
-            globalThis.log = existingLogger;
-            return;
-        }
-
-        const consoleLog = betterConsole.log;
-        const forwardLog = function (...args) {
-            forwardPersistedLog(args);
-            return Reflect.apply(consoleLog, betterConsole, args);
-        };
-        forwardLog[BETTER_CONSOLE_FORWARDER] = true;
-        globalThis[LOGGER_KEY] = forwardLog;
-        globalThis.log = forwardLog;
-        api.log = forwardLog;
-        return;
-    }
-
     const existingLogger = globalThis[LOGGER_KEY];
     if (typeof existingLogger === "function") {
         api.log = existingLogger;
@@ -55,34 +29,8 @@ function installVisualLogPatchFor(api) {
         return;
     }
 
-    // If a payload using the former <pre> overlay already ran in this session,
-    // restyle it in place so its persistent logger does not restore the black
-    // panel on the next message.
-    const legacyLogger = globalThis[LEGACY_LOGGER_KEY];
-    if (typeof legacyLogger === "function") {
-        const legacyState = globalThis[LEGACY_STATE_KEY];
-        const legacyOutput = legacyState?.output ||
-            document.querySelector('[aria-label="' + LOG_LABEL + '"]');
-        if (legacyOutput) applyLegacyConsoleStyle(legacyOutput, document);
-        const migratedLogger = function (...args) {
-            forwardPersistedLog(args);
-            const pending = Reflect.apply(legacyLogger, this, args);
-            return Promise.resolve(pending).then(result => {
-                const output = legacyState?.output ||
-                    document.querySelector('[aria-label="' + LOG_LABEL + '"]');
-                if (output) applyLegacyConsoleStyle(output, document);
-                return result;
-            });
-        };
-        globalThis[LOGGER_KEY] = migratedLogger;
-        globalThis.log = migratedLogger;
-        api.log = migratedLogger;
-        return;
-    }
-
     const state = globalThis[LOGGER_STATE_KEY] || {
         output: null,
-        logQueue: Promise.resolve(),
         compact: false
     };
     globalThis[LOGGER_STATE_KEY] = state;
@@ -110,27 +58,26 @@ function installVisualLogPatchFor(api) {
         const timestamp = formatTimestamp(new Date());
         forwardPersistedLog(callArgs);
 
-        const task = state.logQueue.then(async () => {
-            const followTail = isNearBottom(state.output);
-            const pendingLog = Reflect.apply(originalLog, callThis, callArgs);
-            // The persisted bootstrap's first logger is lazy: its first call
-            // replaces window.log with the underlying <pre> implementation.
-            // Retain the visual wrapper after capturing that implementation.
+        let initialLogResult = null;
+        if (originalLog) {
+            // The persisted bootstrap starts with a lazy logger that installs
+            // its own <pre> renderer on the first call. Invoke it once to let
+            // that setup finish; the bounded overlay handles later display.
+            const initializeLogger = originalLog;
+            initialLogResult = Reflect.apply(initializeLogger,
+                callThis, callArgs);
+            originalLog = null;
             if (globalThis.log !== visualLog) {
-                originalLog = globalThis.log;
                 api.log = visualLog;
                 globalThis.log = visualLog;
             }
-            const logOutput = ensureOutput();
-            const result = await pendingLog;
+        }
 
-            addLogRows(logOutput, document, message, timestamp, state.compact);
-            if (followTail) logOutput.scrollTop = logOutput.scrollHeight;
-            return result;
-        });
-
-        state.logQueue = task.catch(() => {});
-        return task;
+        const followTail = isNearBottom(state.output);
+        const logOutput = ensureOutput();
+        addLogRows(logOutput, document, message, timestamp, state.compact);
+        if (followTail) logOutput.scrollTop = logOutput.scrollHeight;
+        return Promise.resolve(initialLogResult);
     };
 
     globalThis[LOGGER_KEY] = visualLog;
@@ -147,19 +94,10 @@ function forwardPersistedLog(args) {
 }
 
 export async function clearVisualLog() {
-    const betterConsole = globalThis.civConsole;
-    if (betterConsole && typeof betterConsole.clear === "function") {
-        betterConsole.clear();
-        return;
-    }
-
-    const state = globalThis[LOGGER_STATE_KEY] ||
-        globalThis[LEGACY_STATE_KEY];
+    const state = globalThis[LOGGER_STATE_KEY];
     if (!state) return;
 
-    await state.logQueue.catch(() => {});
-    const output = state.output ||
-        globalThis.document?.querySelector('[aria-label="' + LOG_LABEL + '"]');
+    const output = state.output;
     if (output) output.textContent = "";
 }
 
@@ -358,13 +296,6 @@ export function installRunInputControls({
     return controls;
 }
 
-function removeLegacyOutput(document) {
-    const state = globalThis[LEGACY_STATE_KEY];
-    const output = state?.output ||
-        document.querySelector('[aria-label="' + LOG_LABEL + '"]');
-    if (output?.parentNode) output.parentNode.removeChild(output);
-}
-
 function formatTimestamp(date) {
     const twoDigits = value => String(value).padStart(2, "0");
     const threeDigits = value => String(value).padStart(3, "0");
@@ -402,57 +333,9 @@ function applyConsoleStyle(output, document) {
     return compact;
 }
 
-function applyLegacyConsoleStyle(output, document) {
-    const viewportWidth = Number(document.documentElement?.clientWidth) ||
-        Number(globalThis.innerWidth) || 0;
-    const compact = viewportWidth > 0 && viewportWidth <= 700;
-    const fontSize = compact ? "15px" : "18px";
-    const timeFontSize = compact ? "12px" : "14px";
-    const timeMargin = compact ? "12px" : "18px";
-
-    Object.assign(output.style, {
-        position: "fixed",
-        top: "0",
-        left: "0",
-        right: "0",
-        bottom: "0",
-        zIndex: "2147483647",
-        boxSizing: "border-box",
-        margin: "0",
-        padding: "10px 14px 22px",
-        overflowY: "hidden",
-        overflowX: "hidden",
-        fontFamily: "Consolas, 'Liberation Mono', monospace",
-        fontSize,
-        lineHeight: "1.5",
-        background: "#282c34",
-        color: "#e8ece8",
-        whiteSpace: "pre-wrap",
-        overflowWrap: "break-word",
-        wordBreak: "break-word",
-        overscrollBehavior: "contain"
-    });
-
-    const children = output.children || [];
-    for (let index = 0; index < children.length; index++) {
-        const child = children[index];
-        if (child.tagName !== "SPAN") continue;
-        Object.assign(child.style, {
-            display: "inline-block",
-            width: "13ch",
-            marginRight: timeMargin,
-            verticalAlign: "top",
-            color: "#9bcaff",
-            whiteSpace: "nowrap",
-            fontSize: timeFontSize,
-            lineHeight: "1.5",
-            userSelect: "none"
-        });
-    }
-}
-
 function addLogRows(output, document, message, timestamp, compact) {
-    const lines = message.replace(/\r\n?/g, "\n").split("\n");
+    const lines = message.replace(/\r\n?/g, "\n").split("\n")
+        .slice(-MAX_VISIBLE_LOG_LINES);
     for (const line of lines) {
         const row = document.createElement("div");
         Object.assign(row.style, {
@@ -489,7 +372,13 @@ function addLogRows(output, document, message, timestamp, compact) {
         row.appendChild(stamp);
         row.appendChild(content);
         output.appendChild(row);
+        trimLogRows(output);
     }
+}
+
+function trimLogRows(output) {
+    while (output?.childElementCount > MAX_VISIBLE_LOG_LINES)
+        output.removeChild(output.firstElementChild);
 }
 
 function isNearBottom(output) {
