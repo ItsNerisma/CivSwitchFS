@@ -239,15 +239,6 @@ export async function cleanupScratchAndHandles({
             domainSession = null;
         }
         closeForCleanup(rootSession, "fsp-session");
-
-        var cleanupDeleteTxText = cleanupDeleteTransport === null
-            ? "THREW" : hex32(cleanupDeleteTransport);
-        var cleanupDeleteText = cleanupRemoveResult === null
-            ? "NA" : hex32(cleanupRemoveResult);
-        var cleanupCommitTxText = cleanupCommitTransport === null
-            ? "THREW" : hex32(cleanupCommitTransport);
-        var cleanupCommitText = cleanupCommitResult === null
-            ? "NA" : hex32(cleanupCommitResult);
     }
 
     var cleanupOk = cleanupAttempted && cleanupDeleteTransport === 0 &&

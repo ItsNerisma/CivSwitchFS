@@ -1,4 +1,4 @@
-// Memory helpers — allocation, tracking, and byte/string access.
+// Memory helpers — allocation tracking and IPC buffer access.
 
 var activeAllocationTracker = null;
 
@@ -54,36 +54,8 @@ function writeStr(buf, str) {
     write8(buf + BigInt(str.length), 0n);
 }
 
-function read_bytes(addr, len) {
-    const out = [];
-    for (let i = 0; i < len; i++) {
-        out.push(Number(read8(addr + BigInt(i))));
-    }
-    return out;
-}
-
-function read_string(addr, maxLen) {
-    maxLen = maxLen || 256;
-    let s = "";
-    for (let i = 0; i < maxLen; i++) {
-        const c = Number(read8(addr + BigInt(i)));
-        if (c === 0) break;
-        s += String.fromCharCode(c);
-    }
-    return s;
-}
-
 function write_bytes(addr, bytes) {
     for (let i = 0; i < bytes.length; i++) {
         write8(addr + BigInt(i), BigInt(bytes[i]));
     }
-}
-
-// Copy a memory region into a JS array (no log calls, no IPC side-effects)
-function snapshot_buffer(addr, len) {
-    const out = [];
-    for (let i = 0; i < len; i++) {
-        out.push(Number(read8(addr + BigInt(i))));
-    }
-    return out;
 }

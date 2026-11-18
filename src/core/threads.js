@@ -157,21 +157,6 @@ function startRawWorker(worker) {
     return 0;
 }
 
-// Create and start a raw kernel thread running a ROP frame.
-// scheduling: { priority, core, mask } from borrowThreadScheduling()
-// frameAddr: address of the ROP frame built by buildRawFrame()
-// reusable: optional { stack, handleBuf } to avoid per-wave mallocs
-// Returns { handle, rc, stack, stackTop, handleBuf, started }
-function launchRawWorker(frameAddr, scheduling, reusable) {
-    var worker = createRawWorker(frameAddr, scheduling, reusable);
-    if (worker.rc !== 0) return worker;
-    if (startRawWorker(worker) !== 0) {
-        call_rop(F_CloseHandle, BigInt(worker.handle));
-        worker.handle = 0;
-    }
-    return worker;
-}
-
 // Wait for a raw thread to finish using svcWaitSynchronization.
 // Returns true if the thread exited, false on timeout.
 function waitRawThread(handle, timeoutNs, reusableWaitBuf) {

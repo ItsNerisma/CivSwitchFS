@@ -21,20 +21,6 @@ const {
   writeDirtyData
 } = coreRuntime;
 
-function formatHexValue(value) {
-    return value == null || !Number.isFinite(Number(value))
-        ? "na" : "0x" + Number(value).toString(16);
-}
-
-function formatResultCode(value) {
-    if (value == null) return "na";
-    var raw = Number(value) >>> 0;
-    var canonical = raw === 0xFFFFFFFF ? raw : raw & 0x3FFFFF;
-    return raw === canonical
-        ? "0x" + raw.toString(16)
-        : "0x" + raw.toString(16) + "/0x" + canonical.toString(16);
-}
-
 function formatRenameInputDiagnostics(diagnostics) {
     if (!diagnostics) return "unavailable";
     var labels = [

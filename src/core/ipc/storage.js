@@ -1,4 +1,4 @@
-// IStorage helpers - open content storage, read, get size, invalidate cache.
+// IStorage helpers - open content storage, read, and get its size.
 
 // Open a content storage via cmd 200 on a root fsp-srv session.
 // Returns the IStorage handle (u32), or 0 on failure.
@@ -91,21 +91,6 @@ function ipcStorageWrite(storageHandle, offset, inputBuf, size) {
     return { error: reply.result,
         canonicalError: reply.result & 0x3FFFFF,
         transport: transport };
-}
-
-// IStorage::OperateRange (cmd 5) with operation=2 (invalidate cache).
-// Invalidates the cache for the given [offset, offset+size) range.
-// Returns the SFCO result code.
-function ipcStorageInvalidate(storageHandle, offset, size) {
-    var pkt = allocPage(0x2000);
-    prepPacket(pkt, 4, 0x0C, []);
-    write32(pkt + 0x10n, 0x49434653n);
-    write32(pkt + 0x18n, 5n);                    // cmd 5 = OperateRange
-    write32(pkt + 0x20n, 2n);                    // operation = 2 (invalidate)
-    write64(pkt + 0x28n, BigInt(offset));         // offset
-    write64(pkt + 0x30n, BigInt(size));           // size
-    sendIPC(storageHandle, pkt);
-    return cmifReply(pkt).result;
 }
 
 // Clone a domain session (Control cmd 2 = CloneCurrentObject).

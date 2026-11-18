@@ -294,15 +294,6 @@ function qualifyOverlap(spans, trigSpan, overlapRoles, throughRoles, heldRoles) 
     };
 }
 
-// Format a span's timing relative to the trigger span.
-function relativeSpan(spans, name, trigSpan, roleShort) {
-    var span = getSpan(spans, name);
-    var short = roleShort || name;
-    if (!span || !trigSpan) return short + "=NA";
-    return short + "=" + fmtUs(span.start - trigSpan.start) + ".." +
-        fmtUs(span.end - trigSpan.start) + "us";
-}
-
 // Find the index of the last SEND step in a plan.
 function findLastSendIndex(plan) {
     var last = -1;

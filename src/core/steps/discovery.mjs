@@ -236,7 +236,7 @@ export async function releaseNeighborsAndFindPointers({
 
         for (var ri = 0; ri < neighbors.length && snapshotOk; ri++) {
             var nb = neighbors[ri];
-            var releaseCloseResult = Number(closeHandle(nb.handle)) >>> 0;
+            closeHandle(nb.handle);
             if (nb.name.indexOf("extra") === 0) {
                 var idx = parseInt(nb.name.slice(5));
                 extraStorages[idx] = 0;
@@ -651,10 +651,6 @@ export async function qualifyAddressPlan({
                                 continue;
                             }
                             if (tryNextSeed && ai + 1 < candidatePlans.length) {
-                                var poolHypotheses =
-                                    metadataDiscovery.poolCandidates || 0;
-                                var externalChecks =
-                                    metadataDiscovery.externalLinkChecks || 0;
                                 continue;
                             }
                             if (!stopSeedScan && metadataDiscovery.anchors.length > 0 &&

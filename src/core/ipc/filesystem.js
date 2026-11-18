@@ -192,45 +192,6 @@ function ipcListDirectory(handle, path, mode, onDirectoryClose) {
     }
 }
 
-// Generic IPC command (no X buffer, no inline data).
-// For simple commands or probing unknown command IDs.
-function ipcSimpleCmd(handle, cmdId) {
-    const buf = allocPage(0x2000);
-    prepPacket(buf, 4, 8, [
-        [16, 0x49434653],
-        [24, cmdId]
-    ]);
-    sendIPC(handle, buf);
-    return cmifReply(buf);
-}
-
-// Generic IPC command with path (X buffer).
-// Returns the full cmifReply + raw buffer for custom parsing.
-function ipcPathCmd(handle, cmdId, path) {
-    const pathBuf = allocPage(0x1000);
-    writeStr(pathBuf, path);
-    const buf = allocPage(0x2000);
-    prepPacket(buf, (4 | (1 << 16)) >>> 0, 0x0C, []);
-    writeXDesc(buf, 8, pathBuf, 0x300);
-    write32(buf + 0x10n, 0x49434653n);
-    write32(buf + 0x18n, BigInt(cmdId));
-    sendIPC(handle, buf);
-    const reply = cmifReply(buf);
-    reply.buf = buf;
-    return reply;
-}
-
-// Arm a GetEntryType IPC packet for a given path buffer.
-// pkt must be from allocPage(0x1000). pathBuf holds the null-terminated path.
-function armGetEntryType(pkt, pathBuf, pathSize) {
-    pathSize = pathSize || 0x300;
-    prepPacket(pkt, (4 | (1 << 16)) >>> 0, 8, [
-        [0x10, 0x49434653],
-        [0x18, 7]
-    ]);
-    writeXDesc(pkt, 8, pathBuf, pathSize);
-}
-
 // -- IFileSystem commands used by scratch tree and wave setup -----------
 
 // CreateDirectory (cmd 2).
@@ -279,7 +240,6 @@ function ipcOpenFile(handle, path, mode) {
 }
 
 // IFile::OperateRange (cmd 5) with operation=2 (invalidate cache).
-// Mirrors ipcStorageInvalidate but targets an IFile handle.
 // Opens the file, invalidates [0, size), closes it. Returns the SFCO result,
 // or -1 if the file could not be opened.
 function ipcFileInvalidate(fsHandle, path, size) {

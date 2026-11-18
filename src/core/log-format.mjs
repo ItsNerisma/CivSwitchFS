@@ -55,13 +55,6 @@ function humanRoleName(role) {
     return ROLE_NAMES[role] || role;
 }
 
-export function formatCanaryType(type) {
-    if (type === 0) return "DIR";
-    if (type === 1) return "FILE";
-    if (type === null || type === undefined) return "NA";
-    return "ERR" + Number(type);
-}
-
 function humanStopReason(control) {
     const reason = control.workflowStopReason;
     if (!reason) {

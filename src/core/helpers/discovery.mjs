@@ -470,9 +470,6 @@ export async function verifyAddressCandidate(plan, label, index, input) {
             linkHead % 0x4000n === 0n);
     var verified = stable && differsFromControl && changedFromPoison &&
         linkHeadShape;
-    var first16 = readA.error === 0
-        ? readHexBytes(addressBufA, 16) : "unread";
-
     return withStepData({verified: verified,
         continueScan: readA.error === 0 && readB.error === 0});
 }

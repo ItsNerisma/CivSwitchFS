@@ -463,10 +463,6 @@ export async function checkPathPair({
             {savedHandle, returnDiagnostics: true})
         : null;
     var guardControlOk = guardControl ? guardControl.ok : null;
-    var formatControlCode = function(value) {
-        return value == null ? "skipped" :
-            "0x" + (Number(value) >>> 0).toString(16);
-    };
     var controlOk = Boolean(fillerControlOk && guardControlOk);
     if (!controlOk) {
         removeScratchTree(savedHandle, SCRATCH_DIR); cleanupHandles();

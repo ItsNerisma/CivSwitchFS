@@ -341,9 +341,6 @@ export async function inspectFspIdentityTargetsReadOnly(input) {
         var tableMatches = [];
         for (var gi = 0; gi < groups.length; gi++) {
             var group = groups[gi];
-            var groupDomainSample = group.domains.slice(0, 8).map(
-                function(item) { return "0x" + item.address.toString(16); }
-            ).join(",");
             if (!RootLayout.rangeContains(captureStart, config.ROOT_CAPTURE_SIZE,
                     group.manager, 0x20)) {
                 continue;
@@ -391,11 +388,6 @@ export async function inspectFspIdentityTargetsReadOnly(input) {
             }
             var entryDomain = AnalysisBytes.readU64LE(entryRead.bytes, 0x18);
             var objectAddress = AnalysisBytes.readU64LE(entryRead.bytes, 0x20);
-            var entryVptr = AnalysisBytes.readU64LE(entryRead.bytes, 0x28);
-            var entryVptrDelta = entryVptr - BigInt(group.rootVptr);
-            var entryVptrDeltaText = entryVptrDelta < 0n
-                ? "-0x" + (-entryVptrDelta).toString(16)
-                : "+0x" + entryVptrDelta.toString(16);
             var domainCandidate = null;
             for (var di = 0; di < group.domains.length; di++) {
                 if (BigInt(group.domains[di].address) === entryDomain) {
@@ -494,7 +486,6 @@ export async function inspectFspIdentityTargetsReadOnly(input) {
                 }
             }
         } finally {
-            var challengedClones = cloneHandles.length;
             var failedCloneCloses = [];
             var stillOpenClones = [];
             for (var closeIndex = cloneHandles.length - 1;
@@ -599,7 +590,7 @@ export async function inspectFspIdentityTargetsReadOnly(input) {
             cloneHandles = [];
         }
         if (domainSession && !verified) {
-            var domainClose = Number(closeHandle(domainSession.handle)) >>> 0;
+            closeHandle(domainSession.handle);
             domainSession = null;
         }
     }

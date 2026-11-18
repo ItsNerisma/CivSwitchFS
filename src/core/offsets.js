@@ -16,7 +16,6 @@ const SM_Finalize = sdk_base + 0x14c990n; // FinalizeHipcServiceResolution
 const F_CloseHandle = sdk_base + 0x168be4n; // svc #0x16 wrapper
 
 // -- Threading (nn::os::*) - offsets confirmed by the reference on same SDK -
-const F_ExitThread = sdk_base + 0x142410n; // nn::os::ExitCurrentThread
 const F_Sleep = sdk_base + 0x137100n; // nn::os::SleepThread(nanoseconds)
 const F_Tick = sdk_base + 0x137240n; // nn::os::GetSystemTick -> returns u64 counter
 const SYSTEM_TICK_FREQUENCY_HZ = 31250000; // native counter; legacy SDK frequency reports 19.2 MHz

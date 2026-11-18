@@ -899,17 +899,8 @@ export async function runPromotionAndUserStorageProbe(input) {
                         addressCopy.workerStateSafe !== false) {
                         try {
                             await installPlan(addressPlan,
-                                "cache-retained-failure-inspection-window");
-                        } catch (planError) {
-                        }
-                    }
-                    if (activePlan === addressPlan) {
-                        for (var pi = 0; pi < fields.length; pi++) {
-                            try {
-                                var partialRead = await readObject(fields[pi],
-                                    "retained setup failure inspection", addressPlan);
-                            } catch (partialError) {
-                            }
+                                "cache-retained-failure-restore");
+                        } catch {
                         }
                     }
                     addressCopy = {...addressCopy,
