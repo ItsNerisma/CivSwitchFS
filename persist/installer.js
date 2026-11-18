@@ -3,6 +3,8 @@
 window.__cfsCreateInstaller = function (options) {
     var codec = window.__cfsSaveCodec;
     var sourcePath = 'save:/saves/Single/XSTRIG.Civ7Save';
+    var appOptionsPath = 'save:/saves/AppOptions.txt';
+    var appOptionsMaxSize = 0x10000;
     var PROFILE = 'civ7-sdk-19f22ec5';
     // Pristine template distributed with this persistence payload.
     var TEMPLATE_BYTES = 1159730;
@@ -101,6 +103,87 @@ window.__cfsCreateInstaller = function (options) {
         if (busy) throw new Error('Installer busy');
         template = { id: null, chunks: [] };
     }
+    function findIntroOptionPatch(bytes) {
+        if (!(bytes instanceof Uint8Array)) return null;
+        var section = '';
+        var optionPattern = new RegExp(
+            '^([ \\t]*)(;[ \\t]*)?(ShowIntroSequences)([ \\t]+)' +
+                '([^\\s;]+)([ \\t]*(?:;.*)?)$',
+            'i'
+        );
+        function inspectLine(start, end) {
+            var parts = [];
+            for (var index = start; index < end; index += 4096)
+                parts.push(
+                    String.fromCharCode.apply(
+                        null,
+                        bytes.subarray(index, Math.min(end, index + 4096))
+                    )
+                );
+            var line = parts.join('');
+            var sectionMatch = line.trim().match(/^\[([^\]]+)\]$/);
+            if (sectionMatch) {
+                section = sectionMatch[1].toLowerCase();
+                return null;
+            }
+            if (section !== 'shell') return null;
+            var optionMatch = optionPattern.exec(line);
+            if (!optionMatch) return null;
+            var activePrefix = optionMatch[2]
+                ? optionMatch[2].slice(1)
+                : '';
+            var extraPadding = optionMatch[2] ? 1 : 0;
+            var value =
+                '0' + ' '.repeat(optionMatch[5].length - 1 + extraPadding);
+            var updatedLine =
+                optionMatch[1] +
+                activePrefix +
+                optionMatch[3] +
+                optionMatch[4] +
+                value +
+                optionMatch[6];
+            if (updatedLine.length !== line.length) return null;
+            var updatedBytes = new Uint8Array(updatedLine.length);
+            for (
+                var byteIndex = 0;
+                byteIndex < updatedLine.length;
+                byteIndex++
+            ) {
+                var character = updatedLine.charCodeAt(byteIndex);
+                if (character > 0xff) return null;
+                updatedBytes[byteIndex] = character;
+            }
+            return { offset: start, bytes: updatedBytes };
+        }
+        var lineStart = 0;
+        for (var index = 0; index < bytes.length; index++) {
+            if (bytes[index] !== 10 && bytes[index] !== 13) continue;
+            var patch = inspectLine(lineStart, index);
+            if (patch !== null) return patch;
+            if (bytes[index] === 13 && bytes[index + 1] === 10) index++;
+            lineStart = index + 1;
+        }
+        return inspectLine(lineStart, bytes.length);
+    }
+    async function disableIntroCinematics(fs) {
+        try {
+            var bytes = await fs.read(appOptionsPath);
+            if (bytes.length < 1 || bytes.length > appOptionsMaxSize)
+                return { ok: false, error: 'Invalid AppOptions size' };
+            var patch = findIntroOptionPatch(bytes);
+            if (patch === null)
+                return {
+                    ok: false,
+                    error: 'ShowIntroSequences not found in [Shell]'
+                };
+            return await fs.writeAt(appOptionsPath, patch.offset, patch.bytes);
+        } catch (error) {
+            return {
+                ok: false,
+                error: String(error && error.message ? error.message : error)
+            };
+        }
+    }
     function decodeBase64(chunk, out, at) {
         var stop = chunk.length;
         while (stop && chunk[stop - 1] === '=') stop--;
@@ -180,6 +263,7 @@ window.__cfsCreateInstaller = function (options) {
     async function operate(publish, staged) {
         if (busy || disposed) throw new Error('Installer busy or closed');
         busy = true;
+        var introStatus = null;
         state(publish ? 'Installing…' : 'Preparing save…');
         try {
             return await options.exclusive(async function () {
@@ -199,16 +283,40 @@ window.__cfsCreateInstaller = function (options) {
                     if (!publish) return report;
                     if (fs.exists(sourcePath)) fs.delete(sourcePath);
                     await fs.writeNew(sourcePath, candidate);
-                    fs.commit();
+                    var appOptionsResult = await disableIntroCinematics(fs);
+                    var commitResult;
+                    try {
+                        commitResult = fs.commit();
+                    } catch (error) {
+                        commitResult = {
+                            ok: false,
+                            error: String(
+                                error && error.message ? error.message : error
+                            )
+                        };
+                    }
+                    var commitSucceeded =
+                        !!commitResult && commitResult.ok === true;
+                    var introCinematicsDisabled =
+                        appOptionsResult.ok === true && commitSucceeded;
+                    introStatus = introCinematicsDisabled
+                        ? "Introduction's cinematics disabled"
+                        : "Could not disable introduction's cinematics";
+                    state(introStatus);
+                    if (!commitSucceeded)
+                        throw new Error(
+                            commitResult && commitResult.error
+                                ? commitResult.error
+                                : 'Commit failed'
+                        );
                     installed = true;
-                    state('Installed. Restart the game, then Load a game.');
                     return report;
                 } finally {
                     fs.dispose();
                 }
             });
         } catch (error) {
-            state('Failure: ' + error.message);
+            if (introStatus === null) state('Failure: ' + error.message);
             throw error;
         } finally {
             busy = false;
