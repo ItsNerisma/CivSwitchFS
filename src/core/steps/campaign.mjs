@@ -1,8 +1,8 @@
 import coreRuntime, {waitMs} from "../runtime.mjs";
 import {
-    emitFastStage,
+    verboseLog,
     isVerboseLogging
-} from "../log-stage.mjs";
+} from "../logger.mjs";
 
 const {
   GADGET_MEMSET,
@@ -12,7 +12,6 @@ const {
   closeReservationGroup,
   executeWave,
   frameArgSlot,
-  log,
   openReservationGroup,
   prepPacket,
   resetWaveState,
@@ -129,7 +128,6 @@ export async function runControlWaveLoop({
         if (!writeDirtyData(savedHandle, dirtyFilePath, config.DIRTY_FILE_SIZE,
                 dirtyWriteBuf, dirtyWritePkt)) {
             workflowStopReason = "dirty-write-failed-at-wave-" + (attempt + 1);
-            await log("FAIL: W" + helpers.pad2(attempt + 1) + " dirty write");
             break;
         }
 
@@ -152,7 +150,6 @@ export async function runControlWaveLoop({
         var group = openReservationGroup(rootSession, pktBuf, 59);
         if (!group.ok) {
             workflowStopReason = "reservation-failed-at-wave-" + (attempt + 1);
-            await log("FAIL: W" + helpers.pad2(attempt + 1) + " reservation");
             break;
         }
 
@@ -180,15 +177,11 @@ export async function runControlWaveLoop({
             var relCode = roleSendCode(waveData.frames, 9, sendIndices[9]);
             closeReservationGroup(group, wave.created < 13 || relCode !== 0, pktBuf);
             workerStateSafe = wave.workerStateSafe === true;
-            await log("FAIL: W" + helpers.pad2(attempt + 1) + " workers=" +
-                wave.created + "/" + wave.started + " joined=" + wave.joined +
-                " cleanupSafe=" + workerStateSafe);
             break;
         }
         if (wave.joined < 13) {
             workflowStopReason = "worker-join-failed-at-wave-" + (attempt + 1);
             workerStateSafe = false;
-            await log("FAIL: W" + helpers.pad2(attempt + 1) + " join=" + wave.joined + "/13");
             break;
         }
         wavesJoined++;
@@ -309,7 +302,9 @@ export async function runControlWaveLoop({
     }
 
     // Emit wave output after the loop so logging cannot perturb wave timing.
-    for (const line of verboseWaveLines) await emitFastStage(line);
+    if (verboseWaveLines.length) {
+        await verboseLog(verboseWaveLines.join("\n"));
+    }
 
     const positiveAttempts = profileCounts.positive || 0;
     let timingRecords = null;

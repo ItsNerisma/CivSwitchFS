@@ -40,7 +40,7 @@ npm install
 With the CivSwitch Remote JS Loader running, install the persistent image:
 
 ~~~sh
-npm run persist:install -- <console-ip> [--minify-payload]
+npm run persist -- <console-ip> [--minify-payload]
 ~~~
 
 Future launches from that save start the exploit, loader, and

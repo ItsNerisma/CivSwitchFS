@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/** Install the built CivSwitchFS image into the Civ VII trigger save. */
+/** Build and install the CivSwitchFS image into the Civ VII trigger save. */
 
 import {createHash, randomUUID} from "node:crypto";
 import {readFile} from "node:fs/promises";
@@ -21,15 +21,21 @@ function sha256(bytes) {
 }
 
 function send(host, port, code, timeoutMs = 60_000) {
-    const payload = Buffer.isBuffer(code) ? code : Buffer.from(code, "ascii");
+    let payload;
+    if (Buffer.isBuffer(code)) {
+        payload = code;
+    } else {
+        payload = Buffer.from(code, "ascii");
+    }
     if (!payload.length || payload.length >= MAX_LOADER_BYTES)
-        return Promise.reject(new Error("Payload vide ou supérieur à 500 000 octets"));
+        return Promise.reject(
+            new Error("Payload is empty or exceeds 500,000 bytes"));
     return new Promise((resolve, reject) => {
         const chunks = [];
         let settled = false;
         const socket = net.createConnection({host, port});
         const timeout = setTimeout(() => {
-            finish(new Error("Le loader n'a pas terminé le payload à temps"));
+            finish(new Error("The loader did not finish the payload in time"));
             socket.destroy();
         }, timeoutMs);
         function finish(error, value) {
@@ -44,7 +50,8 @@ function send(host, port, code, timeoutMs = 60_000) {
         socket.once("end", () => finish(null));
         socket.once("error", error => finish(error));
         socket.once("close", hadError => {
-            if (!settled && hadError) finish(new Error("Connexion au loader interrompue"));
+            if (!settled && hadError)
+                finish(new Error("Connection to the loader was interrupted"));
         });
     });
 }
@@ -55,13 +62,19 @@ function requireMarker(output, markers) {
             throw new Error(line.slice("Installation failed: ".length));
         if (markers.includes(line)) return line;
     }
-    throw new Error("Le loader n'a pas confirmé l'opération: " + output.slice(-240));
+    throw new Error(
+        "The loader did not confirm the operation: " + output.slice(-240));
 }
 
-async function runTask(host, port, expression, completion, markers, cleanup = false) {
-    const dispose = cleanup
-        ? "finally{window.__cfsPersistInstaller.dispose();delete window.__cfsPersistInstaller;}"
-        : "";
+async function runTask(
+    host, port, expression, completion, markers, cleanup = false
+) {
+    let dispose = "";
+    if (cleanup) {
+        dispose = "finally{" +
+            "window.__cfsPersistInstaller.dispose();" +
+            "delete window.__cfsPersistInstaller;}";
+    }
     const code = "(async function(){try{await " + expression +
         ";await log(" + JSON.stringify(completion) + ");}" +
         "catch(error){await log('Installation failed: '+error.message);}" +
@@ -76,20 +89,28 @@ async function install(host, port, bootstrapPath, templatePath) {
     ]);
     if (!bootstrap.length || bootstrap.length >= MAX_LOADER_BYTES ||
         bootstrap.some(byte => byte > 0x7f))
-        throw new Error("Bootstrap invalide; relancez npm run persist:build");
+        throw new Error("Invalid bootstrap; rerun npm run persist");
     if (sha256(template) !== TEMPLATE_SHA256)
-        throw new Error("Empreinte du template Civ VII invalide");
+        throw new Error("Civ VII template fingerprint mismatch");
 
     const base64 = template.toString("base64");
     const token = randomUUID().replaceAll("-", "");
-    console.log("Préparation de l'image persistante…");
+    console.log("Preparing persistent image...");
     requireMarker(
-        await send(host, port, bootstrap.toString("ascii") + '\nlog("Installer ready.");'),
+        await send(
+            host,
+            port,
+            bootstrap.toString("ascii") + '\nlog("Installer ready.");'
+        ),
         ["Installer ready."]
     );
 
     const count = Math.ceil(base64.length / CHUNK_BYTES);
-    for (let offset = 0, index = 1; offset < base64.length; offset += CHUNK_BYTES, index++) {
+    for (
+        let offset = 0, index = 1;
+        offset < base64.length;
+        offset += CHUNK_BYTES, index++
+    ) {
         const part = base64.slice(offset, offset + CHUNK_BYTES);
         const marker = `Template ${index}/${count} received.`;
         const code = "window.__cfsPersistInstaller.stageChunk(" +
@@ -105,8 +126,10 @@ async function install(host, port, bootstrapPath, templatePath) {
                 if (attempt === 2) throw error;
             }
         }
-        if (!acknowledged) throw new Error("Chunk template non confirmé; installation annulée");
-        console.log(`Template ${index}/${count} reçu.`);
+        if (!acknowledged)
+            throw new Error(
+                "Template chunk was not acknowledged; installation aborted");
+        console.log(`Template ${index}/${count} received.`);
     }
 
     const installed = "Installed. Restart the game, then Load a game.";
@@ -150,40 +173,52 @@ function parseArgs(args) {
         }
         if (arg === "--port" || arg === "--bootstrap" || arg === "--template") {
             const value = args[++index];
-            if (!value) throw new Error(`Valeur manquante pour ${arg}`);
+            if (!value) throw new Error(`Missing value for ${arg}`);
             const key = arg.slice(2);
-            options[key] = key === "port" ? Number(value) : path.resolve(value);
+            if (key === "port") {
+                options[key] = Number(value);
+            } else {
+                options[key] = path.resolve(value);
+            }
         } else if (arg.startsWith("--")) {
-            throw new Error(`Option inconnue: ${arg}`);
+            throw new Error(`Unknown option: ${arg}`);
         } else positional.push(arg);
     }
     if (positional.length !== 1) {
-        throw new Error("Usage: npm run persist:install -- <IP_SWITCH> " +
+        throw new Error("Usage: npm run persist -- <SWITCH_IP> " +
             "[--port 9026] [--no-build] [--minify-payload | --debug-payload] " +
             "[--bootstrap path] [--template path]");
     }
-    if (!Number.isInteger(options.port) || options.port < 1 || options.port > 65535)
-        throw new Error("Port invalide");
+    if (!Number.isInteger(options.port) || options.port < 1 ||
+        options.port > 65535)
+        throw new Error("Invalid port");
     if (options.debugPayload && options.minifyPayload)
-        throw new Error("Choisissez soit --debug-payload, soit --minify-payload");
+        throw new Error("Choose either --debug-payload or --minify-payload");
     if (options.payloadModeSpecified && !options.rebuild)
-        throw new Error("Le mode de payload exige la reconstruction; retirez --no-build");
+        throw new Error(
+            "Payload mode options require a rebuild; remove --no-build");
     return {host: positional[0], ...options};
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (process.argv[1] &&
+    path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
     try {
         const options = parseArgs(process.argv.slice(2));
         if (options.rebuild) {
-            console.log("Reconstruction de l'image persistante…");
+            console.log("Building persistent image...");
             await buildPersistentImage({
                 debugPayload: options.debugPayload,
                 minifyPayload: options.minifyPayload
             });
         }
-        await install(options.host, options.port, options.bootstrap, options.template);
+        await install(
+            options.host,
+            options.port,
+            options.bootstrap,
+            options.template
+        );
     } catch (error) {
-        console.error("Installation échouée: " + error.message);
+        console.error("Persistence failed: " + error.message);
         process.exitCode = 1;
     }
 }

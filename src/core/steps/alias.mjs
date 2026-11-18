@@ -1,5 +1,5 @@
 import coreRuntime, {waitMs} from "../runtime.mjs";
-import {emitVerboseStage, isVerboseLogging} from "../log-stage.mjs";
+import {verboseLog, isVerboseLogging} from "../logger.mjs";
 
 const {
   GADGET_MEMSET,
@@ -9,7 +9,6 @@ const {
   executeWave,
   frameArgSlot,
   ipcStorageRead,
-  log,
   openContentStorage,
   openReservationGroup,
   prepPacket,
@@ -161,7 +160,6 @@ export async function preparePostCanaryCandidate({
             failureReason = (!controlHex || !aliasControlHex)
                 ? "baseline-control-read-failed"
                 : "baseline-offsets-not-distinct";
-            await log("BASELINE: FAIL offsets not distinct");
             canaryQualified = false;
         }
     }
@@ -173,7 +171,6 @@ export async function preparePostCanaryCandidate({
         candidateHandle = openContentStorage(rootSession);
         if (!candidateHandle) {
             failureReason = "candidate-storage-open-failed";
-            await log("BASELINE: FAIL candidateHandle");
         } else {
             var countersAfter = readAllocationCounters(rootSession, pktBuf);
             var afterHeap = countersAfter ? countersAfter[5] : null;
@@ -188,9 +185,6 @@ export async function preparePostCanaryCandidate({
             if (!primeHex) failureReason = "candidate-prime-read-failed";
             else if (!primeMatchesControl) failureReason = "candidate-prime-mismatch";
 
-            await log("BASELINE: " + (primeMatchesControl ? "OK" : "FAIL") +
-                " alloc=" + (allocCost !== null ? allocCost + "B" : "N/A") +
-                (primeMatchesControl ? "" : " PRIME-MISMATCH"));
         }
     }
 
@@ -282,7 +276,6 @@ export async function installCacheAlias({
         if (steps.length !== 7) {
             copyFailureReason = "invalid-copy-plan";
             noteCopyFailure("invalid-copy-plan");
-            await log("ALIAS: FAIL nulWrites=" + steps.length + " (expect 7)");
         } else {
             var allStepsOk = true;
             // Treat the cache entry as modified from the first attempted field
@@ -320,7 +313,6 @@ export async function installCacheAlias({
                             dirtyWriteBuf, dirtyWritePkt)) {
                         stepHardFailure = "dirty-write-failed";
                         noteCopyFailure(stepHardFailure);
-                        await log("FAIL: step " + stepIdx + " dirty write");
                         allStepsOk = false; break;
                     }
 
@@ -342,7 +334,6 @@ export async function installCacheAlias({
                     if (!group.ok) {
                         stepHardFailure = "reservation-failed";
                         noteCopyFailure(stepHardFailure);
-                        await log("FAIL: step " + stepIdx + " reservation");
                         allStepsOk = false; break;
                     }
 
@@ -367,8 +358,6 @@ export async function installCacheAlias({
                         closeReservationGroup(group, wave.created < 13 || relCode !== 0, pktBuf);
                         stepHardFailure = "worker-start-failed";
                         noteCopyFailure(stepHardFailure);
-                        await log("FAIL: step " + stepIdx + " workers=" +
-                            wave.created + "/" + wave.started);
                         workerStateSafe = wave.workerStateSafe === true;
                         allStepsOk = false; break;
                     }
@@ -490,7 +479,7 @@ export async function installCacheAlias({
                             " is still searching after " + stepAttempts + "/" +
                             (config.MAX_COPY_ATTEMPTS * config.COPY_BATCHES) +
                             " waves.");
-                        await emitVerboseStage("Memory alias diagnostics: copy step " +
+                        await verboseLog("Memory alias diagnostics: copy step " +
                             (stepIdx + 1) + "/" + steps.length + " after " +
                             stepAttempts + " waves" + formatCopyWaveDiagnostics(
                                 stepGateFailures, stepShapeMissing,
@@ -521,7 +510,7 @@ export async function installCacheAlias({
 
                 if (stoppedByUser && !stepConfirmed) {
                     allStepsOk = false;
-                    await emitVerboseStage("Memory alias stopped during step " +
+                    await verboseLog("Memory alias stopped during step " +
                         (stepIdx + 1) + "/" + steps.length + " after " +
                         stepAttempts + " waves.");
                     break;
@@ -545,7 +534,7 @@ export async function installCacheAlias({
                         attempts: stepAttempts, windowRejects: stepWindowFail,
                         preReleaseRejects: stepPreLow, pathMismatches: stepPathMiss,
                         reason: stepFailureReason});
-                    await emitVerboseStage("Memory alias step " +
+                    await verboseLog("Memory alias step " +
                         (stepIdx + 1) + "/" + steps.length +
                         " rejected after " + stepAttempts + " waves: window=" +
                         stepWindowFail + ", cache=" + stepPreLow +
@@ -555,14 +544,11 @@ export async function installCacheAlias({
                             stepMinLowCacheUsed, stepMaxLowCacheUsed,
                             stepPathReplyFailures) +
                         ".");
-                    await log("  step " + stepIdx + " FAIL att=" + stepAttempts +
-                        " winFail=" + stepWindowFail + " preLow=" + stepPreLow +
-                        " changedPathMiss=" + stepPathMiss);
                     allStepsOk = false; break;
                 }
 
                 copyStepsCompleted++;
-                await emitVerboseStage("Memory alias step " +
+                await verboseLog("Memory alias step " +
                     (stepIdx + 1) + "/" + steps.length + " accepted after " +
                     stepAttempts + " waves" +
                     (acceptedResult?.margin != null
@@ -571,7 +557,6 @@ export async function installCacheAlias({
                         ? " · cache=0x" +
                           Number(acceptedResult.preReleaseUsed).toString(16) : "") +
                     ".");
-                await log("  step " + stepIdx + " OK (att=" + stepAttempts + ")");
                 if (stoppedByUser) {
                     allStepsOk = false;
                     break;
@@ -585,8 +570,6 @@ export async function installCacheAlias({
             aliasInstalled = allStepsOk && !stoppedByUser;
         }
 
-        await log("ALIAS: " + (aliasInstalled ? "OK" : "FAIL") +
-            " " + copyStepsCompleted + "/7 steps (" + copyWavesTotal + " waves)");
     }
 
 

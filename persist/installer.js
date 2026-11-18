@@ -30,7 +30,6 @@ window.__cfsCreateInstaller = function (options) {
         var view = {
             family: family,
             available: !!image,
-            sha256: image ? image.sha256 : null,
             installed: installed,
             ready:
                 !!image &&
@@ -45,6 +44,8 @@ window.__cfsCreateInstaller = function (options) {
         for (var name in extra) view[name] = extra[name];
         return view;
     }
+    // CivSwitchFS customization: the stage is embedded in this bootstrap, so
+    // profile and size checks are sufficient; hashing adds no separate boundary.
     function offer(value) {
         if (busy || disposed) throw new Error('Installer unavailable');
         if (
@@ -55,8 +56,7 @@ window.__cfsCreateInstaller = function (options) {
             value.version.length > 80 ||
             value.bytes !== value.stage.length ||
             value.bytes < 1 ||
-            value.bytes > 200000 ||
-            codec.sha256(codec.ascii(value.stage)) !== value.sha256
+            value.bytes > 200000
         )
             throw new Error('Invalid or incompatible image');
         image = {
@@ -65,8 +65,7 @@ window.__cfsCreateInstaller = function (options) {
             bytes: value.bytes,
             stage: value.stage,
             triggerTiming: value.triggerTiming === true,
-            hideTriggerText: value.hideTriggerText === true,
-            sha256: value.sha256
+            hideTriggerText: value.hideTriggerText === true
         };
         installed = false;
         state('Image ready: ' + image.version);
