@@ -8,6 +8,8 @@ const {
   applyCmifContext,
   borrowThreadScheduling,
   buildWaveFrames,
+  SVC_GetThreadCoreMask,
+  findSvcSetCoreMask,
   call_rop,
   cloneFsSession,
   cloneObject,
@@ -27,6 +29,7 @@ const {
   openFspSession,
   prepPacket,
   removeScratchTree,
+  read64,
   sendIPC,
   write32,
   write64,
@@ -37,12 +40,61 @@ const {
 
 // ── Setup steps (S1–S10) ────────────────────────────────────────────────────
 
-export async function borrowRawThreadScheduling() {
+export async function borrowRawThreadScheduling({config}) {
   let rawScheduling;
     // S1: Borrow raw-thread scheduling.
     rawScheduling = borrowThreadScheduling();
     if (!rawScheduling) {
         return failedStep("raw-thread-scheduling-unavailable");
+    }
+
+    // Discover svcSetThreadCoreMask and check that the priority range
+    // fits 13 workers (one per role, each at base + workerIndex).
+    var svcAddr = findSvcSetCoreMask();
+    if (svcAddr === 0n) {
+        return failedStep("svc-set-core-mask-not-found");
+    }
+
+    if (rawScheduling.priority + 12 > 63) {
+        return failedStep("priority-range-too-narrow",
+            "base=" + rawScheduling.priority + "; need=13");
+    }
+
+    // Dry-run: read back the borrowed thread's core mask, pin it
+    // to its own core, then restore the original mask.
+    var verifyBuf = allocPage(0x20);
+    write64(verifyBuf, 0n);
+    write64(verifyBuf + 8n, 0n);
+    var readRc = call_rop(SVC_GetThreadCoreMask,
+        verifyBuf, verifyBuf + 8n, BigInt(rawScheduling.handle));
+    var origMask = read64(verifyBuf + 8n);
+
+    var pinMask = 1n << BigInt(rawScheduling.core);
+    var setRc = call_rop(svcAddr,
+        BigInt(rawScheduling.handle),
+        BigInt(rawScheduling.core), pinMask);
+
+    var restoreRc = 0xFFFFFFFFn;
+    if (Number(setRc) === 0) {
+        restoreRc = call_rop(svcAddr,
+            BigInt(rawScheduling.handle),
+            BigInt(rawScheduling.core), origMask);
+    }
+
+    rawScheduling.svcSetCoreMaskAddr = svcAddr;
+    rawScheduling.svcDryRun = {
+        readRc: Number(readRc) >>> 0,
+        setRc: Number(setRc) >>> 0,
+        restoreRc: Number(restoreRc) >>> 0,
+        origMask: "0x" + origMask.toString(16),
+        pinMask: "0x" + pinMask.toString(16)
+    };
+
+    if (Number(setRc) !== 0) {
+        return failedStep("svc-set-core-mask-dry-run-failed",
+            "addr=0x" + svcAddr.toString(16) +
+            "; readRc=" + hex32(Number(readRc) >>> 0) +
+            "; setRc=" + hex32(Number(setRc) >>> 0));
     }
 
   return {ok: true, rawScheduling};

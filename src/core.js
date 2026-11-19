@@ -874,13 +874,22 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
 
     await log("Preparing file-system access and save data...");
 
-    const schedulingResult = await borrowRawThreadScheduling();
+    const schedulingResult = await borrowRawThreadScheduling({config});
     if (!schedulingResult?.ok) {
         await log("Could not prepare worker scheduling.");
         await verboseLog(formatFailureSuffix(schedulingResult));
         return;
     }
     const {rawScheduling} = schedulingResult;
+
+    var dry = rawScheduling.svcDryRun;
+    await log("Wave scheduling: svc@0x" +
+        rawScheduling.svcSetCoreMaskAddr.toString(16) +
+        "; prio=" + rawScheduling.priority +
+        "→" + (rawScheduling.priority + 12) +
+        "; core=" + rawScheduling.core +
+        "; dryRun set=" + dry.setRc.toString(16) +
+        " restore=" + dry.restoreRc.toString(16));
 
     const sessionSetup = await openFspSessions({helpers});
     if (!sessionSetup?.ok) {

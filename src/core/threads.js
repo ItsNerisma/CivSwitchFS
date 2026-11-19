@@ -4,6 +4,49 @@
 
 var RAW_THREAD_STACK_SIZE = 0x10000;
 
+// ARM64 encoding: svc #0x0F = 0xD40001E1, ret = 0xD65F03C0.
+var SVC_0F_ENCODING = 0xD40001E1n;
+var RET_ENCODING = 0xD65F03C0n;
+
+// Scan SDK memory near the known SVC_GetThreadCoreMask wrapper to find
+// the svc #0x0F (SetThreadCoreMask) trampoline. Only accepts a match
+// where the very next instruction is ret — the signature of a standalone
+// SVC wrapper. This rejects svc #0x0F appearing mid-function or as data.
+// Returns the address of the svc instruction or 0n on failure.
+function findSvcSetCoreMask() {
+    if (SVC_SetThreadCoreMask !== 0n) return SVC_SetThreadCoreMask;
+
+    var base = SVC_GetThreadCoreMask;
+
+    for (var off = 0; off < 0x40; off += 4) {
+        var addr = base + BigInt(off);
+        var instr = read32(addr);
+
+        if (instr === SVC_0F_ENCODING) {
+            var next = read32(addr + 4n);
+
+            if (next === RET_ENCODING) {
+                SVC_SetThreadCoreMask = addr;
+                return addr;
+            }
+        }
+    }
+
+    return 0n;
+}
+
+// Pin a raw thread to a single core by restricting its affinity mask.
+// Must be called after createRawWorker and before startRawWorker.
+function pinWorkerToCore(handle, core) {
+    if (SVC_SetThreadCoreMask === 0n) return 0xFFFFFFFF;
+
+    var mask = 1n << BigInt(core);
+    var rc = call_rop(SVC_SetThreadCoreMask,
+        BigInt(handle), BigInt(core), mask);
+
+    return Number(rc) >>> 0;
+}
+
 // Walk the nn::os thread manager linked list to borrow a valid priority
 // and core mask from a live game thread.
 // Returns { priority, core, mask, nodes } or null on failure.

