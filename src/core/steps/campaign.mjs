@@ -150,7 +150,8 @@ export async function runControlWaveLoop({
         }
 
         var renameInputBefore = renamePathBuffers && isVerboseLogging()
-            ? helpers.captureRenameInputState(REQ, renamePathBuffers) : null;
+            ? helpers.captureRenameInputState(REQ, renamePathBuffers,
+                config.workerRoles) : null;
 
         // Between-waves snapshot. Peaks are cleared on read, so this window
         // covers everything since the previous wave's post-wave read. Our
@@ -184,11 +185,15 @@ export async function runControlWaveLoop({
         write32(pinPkt + 0x18n, BigInt(createPinThisWave ? 200 : 1009));
 
         var wave = executeWave(waveData.frames, rawScheduling, workerResources,
-            gates, sendIndices);
-        wavesStarted += wave.started === 13 ? 1 : 0;
+            gates, sendIndices, config.workerRoles);
+        wavesStarted += wave.started === config.WORKER_COUNT ? 1 : 0;
 
-        if (wave.created < 13 || wave.pinned < 13 || wave.started < 13) {
-            if (wave.created === 13 && wave.pinned < 13) {
+        if (wave.created < config.WORKER_COUNT ||
+            wave.pinned < config.WORKER_COUNT ||
+            wave.started < config.WORKER_COUNT) {
+
+            if (wave.created === config.WORKER_COUNT &&
+                wave.pinned < config.WORKER_COUNT) {
                 workflowStopReason = "worker-pinning-failed-at-wave-" +
                     (attempt + 1);
             } else {
@@ -196,11 +201,12 @@ export async function runControlWaveLoop({
                     (attempt + 1);
             }
             var relCode = roleSendCode(waveData.frames, 9, sendIndices[9]);
-            closeReservationGroup(group, wave.created < 13 || relCode !== 0, pktBuf);
+            closeReservationGroup(group,
+                wave.created < config.WORKER_COUNT || relCode !== 0, pktBuf);
             workerStateSafe = wave.workerStateSafe === true;
             break;
         }
-        if (wave.joined < 13) {
+        if (wave.joined < config.WORKER_COUNT) {
             workflowStopReason = "worker-join-failed-at-wave-" + (attempt + 1);
             workerStateSafe = false;
             break;
@@ -491,7 +497,7 @@ function formatWaveVectorLine(record, config) {
         "win=" + (result.window ? 1 : 0),
         "flip=" + (result.canaryRedirect ? 1 : 0),
         "obs=" + (result.observedCanaryRedirect ? 1 : 0),
-        "shape=" + result.shape + "/10",
+        "shape=" + result.shape + "/" + config.OVERLAP_COUNT,
         "m=" + (result.marginUsRaw === null
             ? "na" : Math.round(result.marginUsRaw)),
         "w9=" + Math.round(record.w9DelayNs / 1000) + "us",
@@ -578,13 +584,13 @@ function addTimingCorrection(corrections, key, value) {
 function collectTimingCorrection(records, config, allowMixedRejections = false) {
   const eligible = records.filter(record => {
     const rejections = record.rejections || [];
-    const hasTimingRejection = rejections.indexOf("shape-10") >= 0 ||
+    const hasTimingRejection = rejections.indexOf("shape") >= 0 ||
       rejections.indexOf("margin>=300") >= 0;
     return !record.window && hasTimingRejection &&
       (allowMixedRejections || rejections.length === 1);
   });
   const shapeRecords = eligible.filter(record =>
-    (record.rejections || []).indexOf("shape-10") >= 0);
+    (record.rejections || []).indexOf("shape") >= 0);
   const marginRecords = eligible.filter(record =>
     (record.rejections || []).indexOf("margin>=300") >= 0);
 

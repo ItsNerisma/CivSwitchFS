@@ -314,7 +314,7 @@ export async function installCacheAlias({
 
                     var renameInputBefore = renamePathBuffers && isVerboseLogging()
                         ? helpers.captureRenameInputState(REQ,
-                            renamePathBuffers) : null;
+                            renamePathBuffers, config.workerRoles) : null;
 
                     var group = openReservationGroup(rootSession, pktBuf, 59);
                     if (!group.ok) {
@@ -336,14 +336,22 @@ export async function installCacheAlias({
                     write32(pinPkt + 0x18n, 1009n);
 
                     var wave = executeWave(waveData.frames, rawScheduling,
-                        workerResources, gates, sendIndices);
-                    wavesStarted += wave.started === 13 ? 1 : 0;
+                        workerResources, gates, sendIndices,
+                        config.workerRoles);
+                    wavesStarted += wave.started === config.WORKER_COUNT
+                        ? 1 : 0;
 
-                    if (wave.created < 13 || wave.pinned < 13 ||
-                        wave.started < 13) {
+                    if (wave.created < config.WORKER_COUNT ||
+                        wave.pinned < config.WORKER_COUNT ||
+                        wave.started < config.WORKER_COUNT) {
+
                         var relCode = roleSendCode(waveData.frames, 9, sendIndices[9]);
-                        closeReservationGroup(group, wave.created < 13 || relCode !== 0, pktBuf);
-                        if (wave.created === 13 && wave.pinned < 13) {
+                        closeReservationGroup(group,
+                            wave.created < config.WORKER_COUNT ||
+                                relCode !== 0, pktBuf);
+
+                        if (wave.created === config.WORKER_COUNT &&
+                            wave.pinned < config.WORKER_COUNT) {
                             stepHardFailure = "worker-pinning-failed";
                         } else {
                             stepHardFailure = "worker-start-failed";
@@ -352,7 +360,7 @@ export async function installCacheAlias({
                         workerStateSafe = wave.workerStateSafe === true;
                         allStepsOk = false; break;
                     }
-                    if (wave.joined < 13) {
+                    if (wave.joined < config.WORKER_COUNT) {
                         workerStateSafe = false;
                         stepHardFailure = "worker-join-failed";
                         noteCopyFailure(stepHardFailure);
@@ -400,7 +408,7 @@ export async function installCacheAlias({
                             stepGateFailures[gateName] =
                                 (stepGateFailures[gateName] || 0) + 1;
                         }
-                        if (rejectedGates.indexOf("shape-10") >= 0) {
+                        if (rejectedGates.indexOf("shape") >= 0) {
                             for (var sm = 0;
                                 sm < (wResult.shapeMissing || []).length; sm++) {
                                 var missingRole = wResult.shapeMissing[sm];
@@ -414,6 +422,7 @@ export async function installCacheAlias({
                         var pathRole = ["filler0", "filler1", "guard0",
                             "guard1"][pr];
                         var pathCode = pathReplies[pathRole];
+                        if (pathCode == null) continue;
                         var pathRaw = pathCode == null
                             ? null : Number(pathCode) >>> 0;
                         var pathCanonical = pathRaw == null

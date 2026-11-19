@@ -9,7 +9,7 @@ export function createFspIdentityConfig() {
   var DIRTY_FILE_SIZE = 0x800000;  // 8 MiB dirty write
   var MAX_CONTROL_WAVES = 13;      // user-capped per launch
   // Keep runs focused on canary qualification while this flag is enabled.
-  var CANARY_BENCH_MODE = true;
+  var CANARY_BENCH_MODE = false;
   var MAX_COPY_ATTEMPTS = 30;      // per nulWrites step per batch
   var COPY_BATCHES = 3;
   var MAX_ADDRESS_CANDIDATES = 5;
@@ -57,9 +57,26 @@ export function createFspIdentityConfig() {
       "canary", "filler0", "filler1", "release", "guard0", "guard1", "trigger"];
   var roleShort = ["C", "B", "F0", "F1", "F2", "F3", "Y", "X0", "X1", "R",
       "G0", "G1", "T"];
+
+  // Active worker roles in this wave. Change this single list to add
+  // or remove roles without touching the rest of the pipeline.
+  // Slot indices are stable (roleLabels[i] is always the same role).
+  var workerRoles = [0, 1, 2, 3, 4, 5, 6, 9, 10, 11, 12];
+  var WORKER_COUNT = workerRoles.length;
+
   var throughRoles = ["commit", "frag0", "frag1", "frag2", "frag3"];
-  var heldRoles = ["canary", "filler0", "filler1", "guard0", "guard1"];
+  var heldRoles = ["canary", "filler0", "filler1", "guard0", "guard1"]
+      .filter(function(name) {
+          return workerRoles.indexOf(roleLabels.indexOf(name)) >= 0;
+      });
   var overlapRoles = throughRoles.concat(heldRoles);
+  var OVERLAP_COUNT = overlapRoles.length;
+
+  // Protected roles: all active except bottleneck (1), release (9),
+  // trigger (12) — these three have special lifecycle handling.
+  var protectedRoles = workerRoles.filter(function(role) {
+      return role !== 1 && role !== 9 && role !== 12;
+  });
   return {
     SLOT_SIZE,
     WAVE_READ_SIZE,
@@ -96,8 +113,12 @@ export function createFspIdentityConfig() {
     guardDelays,
     roleLabels,
     roleShort,
+    workerRoles,
+    WORKER_COUNT,
     throughRoles,
     heldRoles,
-    overlapRoles
+    overlapRoles,
+    OVERLAP_COUNT,
+    protectedRoles
   };
 }

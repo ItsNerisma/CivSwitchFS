@@ -51,6 +51,11 @@ export function buildPlans(input) {
     var plans = [];
 
     for (var i = 0; i < 13; i++) {
+        if (config.workerRoles.indexOf(i) < 0) {
+            plans.push([SLEEP(0)]);
+            continue;
+        }
+
         var steps = [WAIT(gates.masterGate)];
 
         // W0-W9: stagger with roleDelays for server-side overlap.
@@ -283,14 +288,19 @@ function snapshotRenamePathBuffers(pathBuffers) {
     return snapshots;
 }
 
-function snapshotRenameDescriptors(REQ, pathBuffers) {
+function snapshotRenameDescriptors(REQ, pathBuffers, workerRoles) {
     if (!REQ || !pathBuffers) return null;
-    var roles = [
+    var allRoles = [
         {role: 7, first: "fillerSource", second: "fillerDestination"},
         {role: 8, first: "fillerSource", second: "fillerDestination"},
         {role: 10, first: "guardSource", second: "guardDestination"},
         {role: 11, first: "guardSource", second: "guardDestination"}
     ];
+    var roles = workerRoles
+        ? allRoles.filter(function(r) {
+            return workerRoles.indexOf(r.role) >= 0;
+        })
+        : allRoles;
     var output = [];
     var allMatch = true;
     for (var ri = 0; ri < roles.length; ri++) {
@@ -336,10 +346,10 @@ function snapshotRenameDescriptors(REQ, pathBuffers) {
     return {allMatch: allMatch, roles: output};
 }
 
-export function captureRenameInputState(REQ, pathBuffers) {
+export function captureRenameInputState(REQ, pathBuffers, workerRoles) {
     return {
         buffers: snapshotRenamePathBuffers(pathBuffers),
-        descriptors: snapshotRenameDescriptors(REQ, pathBuffers)
+        descriptors: snapshotRenameDescriptors(REQ, pathBuffers, workerRoles)
     };
 }
 
@@ -454,8 +464,7 @@ export function analyzeWave(profile, wave, waveData, group, createPinThisWave, i
     var ssv = Number(read32(gates.spacingDecision)) >>> 0;
     var triggerAborted = scv !== 0 || sev !== 0 || ssv !== 0;
 
-    var protectedRoleIds = [0, 2, 3, 4, 5, 6, 7, 8, 10, 11];
-    var protectedDone = protectedRoleIds.filter(function(role) {
+    var protectedDone = config.protectedRoles.filter(function(role) {
         return Number(read8(gates.roleDoneFlags + BigInt(role))) !== 0;
     }).length;
 
@@ -536,7 +545,7 @@ export function analyzeWave(profile, wave, waveData, group, createPinThisWave, i
             group.before[5]) <= config.HEAP_JITTER_BYTES);
 
     var sendCodes = [];
-    for (var ci = 0; ci < 13; ci++)
+    for (var ci = 0; ci < sendIndices.length; ci++)
         sendCodes.push(roleSendCode(waveData.frames, ci, sendIndices[ci]));
     var transportOk = sendCodes.filter(function(c) { return c === 0; }).length;
     var resultAt = function(index) {
@@ -559,7 +568,10 @@ export function analyzeWave(profile, wave, waveData, group, createPinThisWave, i
     var canaryType = typeAt(6, canaryResult);
     var triggerResult = resultAt(12);
     var triggerType = typeAt(12, triggerResult);
-    var fillerResults = [7, 8].map(resultAt);
+    var fillerRoles = [7, 8].filter(function(role) {
+        return config.workerRoles.indexOf(role) >= 0;
+    });
+    var fillerResults = fillerRoles.map(resultAt);
     var guardResults = [10, 11].map(resultAt);
     var health = queryCanaryHealth({canaryPath, savedHandle, setupPath, setupPkt});
 
@@ -584,7 +596,7 @@ export function analyzeWave(profile, wave, waveData, group, createPinThisWave, i
     if (canaryResult !== 0 || canaryType !== 1) changedPaths.push("canary");
     for (var fi = 0; fi < fillerResults.length; fi++)
         if (canonicalResultCode(fillerResults[fi]) !== 0x202)
-            changedPaths.push("filler" + fi);
+            changedPaths.push(config.roleLabels[fillerRoles[fi]]);
     for (var gi = 0; gi < guardResults.length; gi++)
         if (canonicalResultCode(guardResults[gi]) !== 0x202)
             changedPaths.push("guard" + gi);
@@ -608,18 +620,22 @@ export function analyzeWave(profile, wave, waveData, group, createPinThisWave, i
         return canonicalResultCode(r) === 0x202;
     });
 
-    var window = Boolean(reservationExpected && wave.done === 13 &&
-        transportOk === 13 && wave.joined === 13 &&
-        protectedDone === 10 && releaseWasSent &&
+    var window = Boolean(reservationExpected &&
+        wave.done === config.WORKER_COUNT &&
+        transportOk === config.WORKER_COUNT &&
+        wave.joined === config.WORKER_COUNT &&
+        protectedDone === config.protectedRoles.length &&
+        releaseWasSent &&
         Number(wave.signalResult) === 0 && trigSpan &&
-        overlap.shapeCount === 10 &&
+        overlap.shapeCount === config.OVERLAP_COUNT &&
         overlap.receiveMarginUs !== null && overlap.receiveMarginUs >= 300 &&
         !triggerAborted && tailsExpected && commitResult === 0 &&
         readResult === 0 && pathsExpected &&
         pinShapeOk && clearReply.result === 0 &&
         preReply.result === 0 && restored && pinCostOk &&
         (!createPinThisWave || pinWindowOk) && pinFirstWaveQualified &&
-        preReleaseUsed !== null && preReleaseUsed >= config.WINDOW_MINIMUM_CACHE_HELD);
+        preReleaseUsed !== null &&
+        preReleaseUsed >= config.WINDOW_MINIMUM_CACHE_HELD);
 
     var postCanaryHealthy = health.transport === 0 &&
         health.result === 0 && health.type === 1;
@@ -627,14 +643,14 @@ export function analyzeWave(profile, wave, waveData, group, createPinThisWave, i
 
     var wc = checkWindow({
         reservation: reservationExpected,
-        "workers-done": wave.done === 13,
-        transport: transportOk === 13,
-        "workers-join": wave.joined === 13,
-        "protected-10": protectedDone === 10,
+        "workers-done": wave.done === config.WORKER_COUNT,
+        transport: transportOk === config.WORKER_COUNT,
+        "workers-join": wave.joined === config.WORKER_COUNT,
+        "protected": protectedDone === config.protectedRoles.length,
         "release-sent": releaseWasSent,
         signal: Number(wave.signalResult) === 0,
         "trig-span": Boolean(trigSpan),
-        "shape-10": overlap.shapeCount === 10,
+        "shape": overlap.shapeCount === config.OVERLAP_COUNT,
         "margin>=300": overlap.receiveMarginUs !== null &&
             overlap.receiveMarginUs >= 300,
         "no-abort": !triggerAborted,

@@ -121,18 +121,25 @@ export async function installAddressHeader(input) {
             write32(pinPkt + 0x18n, 1009n);
 
             var wave = executeWave(waveData.frames, rawScheduling,
-                workerResources, gates, sendIndices);
-            wavesStarted += wave.started === 13 ? 1 : 0;
-            if (wave.created < 13 || wave.pinned < 13 ||
-                wave.started < 13) {
+                workerResources, gates, sendIndices,
+                config.workerRoles);
+            wavesStarted += wave.started === config.WORKER_COUNT
+                ? 1 : 0;
+
+            if (wave.created < config.WORKER_COUNT ||
+                wave.pinned < config.WORKER_COUNT ||
+                wave.started < config.WORKER_COUNT) {
+
                 var releaseCode = roleSendCode(waveData.frames, 9,
                     sendIndices[9]);
                 closeReservationGroup(group,
-                    wave.created < 13 || releaseCode !== 0, pktBuf);
+                    wave.created < config.WORKER_COUNT ||
+                        releaseCode !== 0, pktBuf);
                 workerStateSafe = wave.workerStateSafe === true;
                 return copyResult(false);
             }
-            if (wave.joined < 13) {
+
+            if (wave.joined < config.WORKER_COUNT) {
                 workerStateSafe = false;
                 return copyResult(false);
             }

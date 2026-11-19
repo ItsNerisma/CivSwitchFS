@@ -27,7 +27,7 @@ function applyCmifContext(pkt, ctx) {
 }
 
 // ── Synchronization gate block ───────────────────────────────────
-// Allocate and name the gate block used by all 13 wave workers.
+// Allocate and name the gate block used by all wave workers.
 // Returns an object with named addresses for every gate and flag.
 function createGateBlock() {
     var block = allocPage(0x10000);
@@ -78,11 +78,11 @@ function frameArgSlot(frameAddr, count, stepIndex, argIndex) {
 
 // ── Frame backup and restore ─────────────────────────────────────
 
-// Build all 13 frames from plans, apply trigger abort-guard patches,
+// Build frames from plans, apply trigger abort-guard patches,
 // and save backups. Returns { frames, backups, pktBackups }.
 //
 // plans:    array of step arrays (from buildPlans)
-// packets:  array of 13 REQ packet addresses
+// packets:  array of REQ packet addresses
 // triggerBuf: address of the trigger's first slot buffer
 // sendIndices: array of 13 last-SEND step indices
 function buildWaveFrames(plans, packets, triggerBuf, sendIndices) {
@@ -158,23 +158,43 @@ function resetWaveState(frames, backups, packets, pktBackups, gates, extra) {
 // ── Wave execution ───────────────────────────────────────────────
 
 // Run one wave: create, start, signal, poll, join all workers.
+// workerRoles lists the active slot indices (e.g. [0,1,2,3,4,5,6,9,10,11,12]).
+// Priorities are assigned contiguously in workerRoles order so the
+// kernel scheduler fires them deterministically on a single core.
 // Returns { created, pinned, started, done, joined, workerStateSafe, workers }
-function executeWave(frames, scheduling, resources, gates, sendIndices) {
-    var pinCore = scheduling.core;
+function executeWave(frames, scheduling, resources, gates, sendIndices,
+    workerRoles) {
 
-    var workers = [];
-    for (var i = 0; i < 13; i++) {
-        workers.push(createRawWorker(frames[i].frame,
-            { priority: scheduling.priority + i, core: pinCore },
-            resources[i]));
-        if (workers[i].rc !== 0) break;
-    }
-    var created = workers.filter(function(w) { return w.rc === 0; }).length;
-    if (created < 13) {
-        for (var i = 0; i < workers.length; i++) {
-            if (workers[i].rc === 0 && workers[i].handle)
-                closeRawThread(workers[i].handle);
+    var pinCore = scheduling.core;
+    var workerCount = workerRoles.length;
+
+    var workers = new Array(13);
+    var createFailed = false;
+    for (var wi = 0; wi < workerCount; wi++) {
+        var role = workerRoles[wi];
+        workers[role] = createRawWorker(frames[role].frame,
+            { priority: scheduling.priority + wi, core: pinCore },
+            resources[role]);
+
+        if (workers[role].rc !== 0) {
+            createFailed = true;
+            break;
         }
+    }
+
+    var created = 0;
+    for (var wi = 0; wi < workerCount; wi++) {
+        if (workers[workerRoles[wi]] &&
+            workers[workerRoles[wi]].rc === 0) created++;
+    }
+
+    if (created < workerCount) {
+        for (var wi = 0; wi < workerCount; wi++) {
+            var w = workers[workerRoles[wi]];
+            if (w && w.rc === 0 && w.handle)
+                closeRawThread(w.handle);
+        }
+
         return {
             created: created, pinned: 0, started: 0, done: 0, joined: 0,
             workerStateSafe: true, workers: workers };
@@ -182,14 +202,15 @@ function executeWave(frames, scheduling, resources, gates, sendIndices) {
 
     // Set a single-core affinity mask before any worker can run.
     var pinned = 0;
-    for (var i = 0; i < 13; i++) {
-        var pinRc = pinWorkerToCore(workers[i].handle, pinCore);
+    for (var wi = 0; wi < workerCount; wi++) {
+        var pinRc = pinWorkerToCore(
+            workers[workerRoles[wi]].handle, pinCore);
         if (pinRc === 0) pinned++;
     }
 
-    if (pinned < 13) {
-        for (var i = 0; i < 13; i++) {
-            closeRawThread(workers[i].handle);
+    if (pinned < workerCount) {
+        for (var wi = 0; wi < workerCount; wi++) {
+            closeRawThread(workers[workerRoles[wi]].handle);
         }
 
         return {
@@ -200,24 +221,29 @@ function executeWave(frames, scheduling, resources, gates, sendIndices) {
     }
 
     var started = 0;
-    for (var i = 0; i < 13; i++) {
-        if (startRawWorker(workers[i]) === 0) started++;
+    for (var wi = 0; wi < workerCount; wi++) {
+        if (startRawWorker(workers[workerRoles[wi]]) === 0) started++;
     }
-    if (started < 13) {
-        write8(gates.block, 0n);  // unblock master gate with 0 (no-op)
+
+    if (started < workerCount) {
+        write8(gates.block, 0n);
         call_rop(F_SignalToAddress, gates.masterGate, 1n, 0n, 0x7FFFFFFFn);
         var safe = true;
-        for (var i = 0; i < 13; i++) {
-            if (!workers[i].handle) continue;
-            if (!workers[i].started) {
-                closeRawThread(workers[i].handle);
+        for (var wi = 0; wi < workerCount; wi++) {
+            var role = workerRoles[wi];
+            if (!workers[role].handle) continue;
+
+            if (!workers[role].started) {
+                closeRawThread(workers[role].handle);
                 continue;
             }
-            var rc = waitRawThread(workers[i].handle, 5000000000n,
-                resources[i].waitBuf);
-            if (rc === 0) closeRawThread(workers[i].handle);
+
+            var rc = waitRawThread(workers[role].handle, 5000000000n,
+                resources[role].waitBuf);
+            if (rc === 0) closeRawThread(workers[role].handle);
             else safe = false;
         }
+
         return { created: created, pinned: pinned, started: started,
             done: 0, joined: 0,
             workerStateSafe: safe, workers: workers };
@@ -230,27 +256,35 @@ function executeWave(frames, scheduling, resources, gates, sendIndices) {
         gates.masterGate, 1n, 0n, 0x7FFFFFFFn);
     var waveT0 = call_rop(F_Tick);
 
-    // Poll for all workers to finish their last SEND
+    // Poll for all active workers to finish their last SEND.
     var done = 0;
     for (var iter = 0; iter < 30000; iter++) {
         done = 0;
-        for (var i = 0; i < 13; i++) {
-            if (readFrameResult(frames[i].frame, sendIndices[i]) !== FRAME_SENTINEL)
+        for (var wi = 0; wi < workerCount; wi++) {
+            var role = workerRoles[wi];
+
+            if (sendIndices[role] < 0 ||
+                readFrameResult(frames[role].frame,
+                    sendIndices[role]) !== FRAME_SENTINEL) {
                 done++;
+            }
         }
-        if (done === 13) break;
+
+        if (done === workerCount) break;
         if (call_rop(F_Tick) - waveT0 > 480000000n) break;
         call_rop(F_Sleep, 200000n);
     }
 
-    // Join all raw threads
+    // Join all active threads.
     var joined = 0;
     var safe = true;
-    for (var i = 0; i < 13; i++) {
-        var rc = waitRawThread(workers[i].handle, 5000000000n,
-            resources[i].waitBuf);
+    for (var wi = 0; wi < workerCount; wi++) {
+        var role = workerRoles[wi];
+        var rc = waitRawThread(workers[role].handle, 5000000000n,
+            resources[role].waitBuf);
+
         if (rc === 0) {
-            closeRawThread(workers[i].handle);
+            closeRawThread(workers[role].handle);
             joined++;
         } else {
             safe = false;
@@ -271,7 +305,9 @@ function executeWave(frames, scheduling, resources, gates, sendIndices) {
 // Returns array of { name, start, end } for each role whose SEND completed.
 function collectSpans(frames, sendIndices, roleLabels) {
     var spans = [];
-    for (var i = 0; i < 13; i++) {
+    for (var i = 0; i < sendIndices.length; i++) {
+        if (sendIndices[i] < 0) continue;
+
         var pre = readFrameResult(frames[i].frame, sendIndices[i] - 1);
         var post = readFrameResult(frames[i].frame, sendIndices[i] + 1);
         if (pre === FRAME_SENTINEL || post === FRAME_SENTINEL) continue;

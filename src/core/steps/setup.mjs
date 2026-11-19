@@ -46,7 +46,7 @@ export async function borrowRawThreadScheduling() {
     }
 
     // Discover svcSetThreadCoreMask and check that the priority range
-    // fits 13 workers (one per role, each at base + workerIndex).
+    // fits all active workers (contiguous priorities from the base).
     if (findSvcSetCoreMask() === 0n) {
         return failedStep("svc-set-core-mask-not-found");
     }
@@ -448,6 +448,7 @@ export function buildIpcRequests({
 }
 
 export async function checkPathPair({
+  config,
   helpers,
   handleResources,
   SCRATCH_DIR,
@@ -464,10 +465,17 @@ export async function checkPathPair({
         auxiliaryStorageHandle
     });
     // S8: Path-pair control.
-    var fillerControl = await helpers.checkPathPairQuiet(
-        fillerSrc, 16, fillerDst, 0x7F0,
-        {savedHandle, returnDiagnostics: true});
-    var fillerControlOk = fillerControl.ok;
+    var fillersActive = config.workerRoles.indexOf(7) >= 0 ||
+        config.workerRoles.indexOf(8) >= 0;
+    var fillerControlOk = true;
+
+    if (fillersActive) {
+        var fillerControl = await helpers.checkPathPairQuiet(
+            fillerSrc, 16, fillerDst, 0x7F0,
+            {savedHandle, returnDiagnostics: true});
+        fillerControlOk = fillerControl.ok;
+    }
+
     var guardControl = fillerControlOk
         ? await helpers.checkPathPairQuiet(
             guardPath, 0x301, guardPathC, 0x301,

@@ -1120,7 +1120,7 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
     }
 
     const pathPair = await checkPathPair({
-        helpers, SCRATCH_DIR: scratch.SCRATCH_DIR,
+        config, helpers, SCRATCH_DIR: scratch.SCRATCH_DIR,
         fillerDst: buffers.fillerDst, fillerSrc: buffers.fillerSrc,
         guardPath: buffers.guardPath, guardPathC: buffers.guardPathC,
         rootSession: handles.rootSession,

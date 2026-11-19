@@ -328,7 +328,7 @@ const GATE_LABELS = {
     "workers-done": "not all workers completed",
     transport: "an IPC send failed",
     "workers-join": "not all workers joined",
-    "protected-10": "protected worker completion flags missing",
+    "protected": "protected worker completion flags missing",
     "release-sent": "release message was not sent",
     signal: "wave completion signal failed",
     tails: "fragment responses were unexpected",
@@ -348,7 +348,7 @@ function summarizeRejectedGates(control, timing) {
 
     for (const [key, count] of Object.entries(counts)) {
         // These keys are handled by the special-case blocks below.
-        if (key === "shape-10" || key === "margin>=300" ||
+        if (key === "shape" || key === "margin>=300" ||
             key === "pre-release" || key === "trig-span" ||
             key === "pin-window" || key === "pin-1st") continue;
 
@@ -387,7 +387,7 @@ function summarizeRejectedGates(control, timing) {
     }
 
     // Shape overlap pattern
-    if (counts["shape-10"] && !timing.messages.length)
+    if (counts["shape"] && !timing.messages.length)
         entries.push("required worker overlap pattern did not qualify");
 
     // Trigger span
