@@ -11,7 +11,6 @@ const PROFILE = "civ7-sdk-19f22ec5";
 const MAX_LOADER_BYTES = 500_000;
 const MAX_STAGE_BYTES = 200_000;
 const BOOTSTRAP_ANCHOR = "            let setupFails = 0;";
-const LOG_RELAY_ANCHOR = "        const _loader_old_log = window.log;";
 const PERSIST_DIR = path.join(ROOT, "persist");
 
 export async function buildPersistentImage(options = {}) {
@@ -46,8 +45,7 @@ export async function buildPersistentImage(options = {}) {
         debug: debugPayload,
         minifyIdentifiers: minifyPayload
     });
-    const assembled = injectPayload(
-        injectPersistentLogRelay(core), payload.payload);
+    const assembled = injectPayload(core, payload.payload);
     // Keep every outer lexical name visible to the direct eval in the payload.
     // Whitespace-only minification keeps the bootstrap's compatibility contract.
     const transformed = await esbuild.transform(assembled, {
@@ -202,77 +200,6 @@ function standaloneEntry(payload) {
                 finally { if (sock_fd !== null) close(sock_fd); }
             }
 `;
-}
-
-// Keep PC forwarding in front of the source logger and expose its clear API.
-function injectPersistentLogRelay(core) {
-    const relayStart = core.indexOf(LOG_RELAY_ANCHOR);
-    if (relayStart < 0 ||
-        core.indexOf(LOG_RELAY_ANCHOR, relayStart + 1) >= 0) {
-        throw new Error(
-            "CivSwitch bootstrap not recognized: " +
-            "log relay anchor is ambiguous");
-    }
-
-    const relayEndMarker = "        };\n\n        function create_socket() {";
-    const relayEnd = core.indexOf(relayEndMarker, relayStart);
-    if (relayEnd < 0)
-        throw new Error(
-            "CivSwitch bootstrap not recognized: log relay end missing");
-
-    const relay = `        globalThis.__CIVSWITCHFS_PERSIST_LOG_FORWARDER__ = function (message) {
-            if (_log_socket_fd === null) return;
-            try {
-                const bytes = text_encode(String(message) + "\\n");
-                let offset = 0;
-                while (offset < bytes.length) {
-                    const chunkEnd = Math.min(
-                        offset + LOG_RELAY_CHUNK_BYTES, bytes.length);
-                    while (offset < chunkEnd) {
-                        const remaining = bytes.subarray(
-                            offset, chunkEnd);
-                        write_buffer(line_buf, remaining);
-                        const sent = send(_log_socket_fd, line_buf,
-                            remaining.length, 0);
-                        if (sent <= 0n) return;
-                        offset += Number(sent);
-                    }
-                }
-            } catch (e) {}
-        };
-
-        const _loader_initial_log = window.log;
-        let _loader_native_log = _loader_initial_log;
-        let _loader_relay_log;
-        _loader_relay_log = async function (message) {
-            globalThis.__CIVSWITCHFS_PERSIST_LOG_FORWARDER__(message);
-
-            let result;
-            try {
-                result = _loader_native_log(message);
-            } finally {
-                const installed_log = window.log;
-                if (_loader_native_log === _loader_initial_log &&
-                    typeof installed_log === "function" &&
-                    installed_log !== _loader_relay_log) {
-                    _loader_native_log = installed_log;
-                }
-                window.log = _loader_relay_log;
-            }
-
-            return result;
-        };
-        _loader_relay_log.clear = function () {
-            const clearLog = _loader_native_log.clear;
-            if (typeof clearLog !== "function") return Promise.resolve();
-            return Reflect.apply(clearLog, _loader_native_log, []);
-        };
-        window.log = _loader_relay_log;
-
-        function create_socket() {`;
-
-    return core.slice(0, relayStart) + relay +
-        core.slice(relayEnd + relayEndMarker.length);
 }
 
 function injectPayload(core, payload) {
