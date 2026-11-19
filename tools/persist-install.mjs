@@ -7,6 +7,7 @@ import net from "node:net";
 import path from "node:path";
 import {fileURLToPath} from "node:url";
 import {buildPersistentImage} from "./persist-build.mjs";
+import {confirmBrickRisk} from "./confirm-brick-risk.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const BOOTSTRAP = path.join(ROOT, "dist/persist/persist-bootstrap.js");
@@ -171,6 +172,10 @@ function parseArgs(args) {
             options.split = true;
             continue;
         }
+        if (arg === "--yes" || arg === "-y") {
+            options.assumedYes = true;
+            continue;
+        }
         if (arg === "--port" || arg === "--bootstrap" || arg === "--template") {
             const value = args[++index];
             if (!value) throw new Error(`Missing value for ${arg}`);
@@ -183,7 +188,7 @@ function parseArgs(args) {
     if (positional.length !== 1) {
         throw new Error("Usage: npm run persist:install -- <IP_SWITCH> " +
             "[--port 9026] [--no-build] [--debug-payload] [--chain|--split] " +
-            "[--minify-payload] [--bootstrap path] [--template path]");
+            "[--minify-payload] [--bootstrap path] [--template path] [--yes]");
     }
     if (options.chain && options.split)
         throw new Error("Choose either --chain (embedded) or --split (SD-loaded)");
@@ -199,16 +204,20 @@ function parseArgs(args) {
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
     try {
         const options = parseArgs(process.argv.slice(2));
-        if (options.rebuild) {
-            console.log("Rebuilding the persistent image…");
-            await buildPersistentImage({
-                debugPayload: options.debugPayload,
-                minifyPayload: options.minifyPayload,
-                chain: options.chain,
-                split: options.split
-            });
+        if (!(await confirmBrickRisk(options.assumedYes, "persist install"))) {
+            process.exitCode = 1;
+        } else {
+            if (options.rebuild) {
+                console.log("Rebuilding the persistent image…");
+                await buildPersistentImage({
+                    debugPayload: options.debugPayload,
+                    minifyPayload: options.minifyPayload,
+                    chain: options.chain,
+                    split: options.split
+                });
+            }
+            await install(options.host, options.port, options.bootstrap, options.template);
         }
-        await install(options.host, options.port, options.bootstrap, options.template);
     } catch (error) {
         console.error("Installation failed: " + error.message);
         process.exitCode = 1;

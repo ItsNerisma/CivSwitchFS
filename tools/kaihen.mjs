@@ -15,6 +15,7 @@ import fsp from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 import crypto from "node:crypto";
+import {confirmBrickRisk} from "./confirm-brick-risk.mjs";
 import {fileURLToPath} from "node:url";
 import {buildPayload, ROOT} from "./bundle.mjs";
 
@@ -35,6 +36,9 @@ const sdPath = {
 
 function usage(code) {
     console.log(`Usage: node tools/kaihen.mjs CONSOLE-IP [options]
+  --yes, -y        confirm the brick-risk warning without prompting
+                   (every FS-acquisition method carries a small but real
+                   brick risk; the prompt defaults to NO)
   --dir DIR        kaiHEN release folder (default: ${path.relative(process.cwd(), DEFAULT_SHIP)})
   --status-only    report SD state and exit without staging or starting
   --force          restage files even when their size already matches
@@ -69,6 +73,7 @@ function parse(args) {
         else if (arg === "--dir") options.ship = path.resolve(value());
         else if (arg === "--force") options.force = true;
         else if (arg === "--status-only") options.statusOnly = true;
+        else if (arg === "--yes" || arg === "-y") options.assumedYes = true;
         else if (arg === "--skip") {
             options.skip = value().split(",")
                 .map(name => name.trim()).filter(Boolean);
@@ -223,6 +228,10 @@ function chunkPayload(base64) {
 
 async function main() {
     const options = parse(process.argv.slice(2));
+    if (!(await confirmBrickRisk(options.assumedYes, "kaiHEN tool"))) {
+        process.exitCode = 1;
+        return;
+    }
     // Same layout probe as manifestFor: shaped ships keep the chain files
     // under kaihen/bin/, official zips at the root.
     const shaped = await fsp.access(path.join(options.ship,
