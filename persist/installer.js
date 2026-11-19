@@ -282,6 +282,8 @@ window.__cfsCreateInstaller = function (options) {
                     var report = { bytes: candidate.length };
                     if (!publish) return report;
                     if (fs.exists(sourcePath)) fs.delete(sourcePath);
+                    fs.mkdir('save:/saves');
+                    fs.mkdir('save:/saves/Single');
                     await fs.writeNew(sourcePath, candidate);
                     var appOptionsResult = await disableIntroCinematics(fs);
                     var commitResult;
