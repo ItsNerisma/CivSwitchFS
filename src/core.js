@@ -186,7 +186,8 @@ export async function run() {
         await log("CivSwitchFS (no RPC) by Nerisma\n" +
             "Thanks to Slapah (civ port)\n" +
             "Thanks to Pespipu (original ns2jb)\n" +
-            "Thanks to Kurumuz (ns2jb improvements)");
+            "Thanks to Kurumuz (ns2jb improvements)\n" +
+            "Thanks to Alula (exploit stability improvements)\n");
         await log(isVerboseLogging()
             ? "Verbose logging is on (controller Y toggles the mode)."
             : "Normal logging is on (controller Y enables verbose summaries).");
@@ -303,10 +304,15 @@ export async function run() {
             inputControls?.dispose?.();
             setVerboseLogging(previousVerboseLogging);
             try {
+                let finalSummary = null;
+                if (experimentMode) {
+                    finalSummary = formatCanaryFlipSummary(
+                        qualifiedCanaryFlipsTotal, positiveAttemptsTotal);
+                }
+
                 await flushDeferredWaveLogLines(
                     timingPersistence.deferredWaveLogLines,
-                    formatCanaryFlipSummary(qualifiedCanaryFlipsTotal,
-                        positiveAttemptsTotal));
+                    finalSummary);
             } catch (error) {
                 try {
                     await log("Could not display deferred wave logs: " +

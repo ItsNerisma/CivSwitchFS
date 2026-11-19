@@ -1,7 +1,7 @@
 # CivSwitchFS
 
 > [!IMPORTANT]
-> Thanks to [**Slapah**](https://github.com/byizmysh/IZCIVSwitch/blob/main/NOTICE.md#upstream) for the ns2jb filesystem port to CivSwitch and [**Kurumuz**](https://gitlab.com/kurumuz/ns2jb) for the improved fork of ns2jb from [**pepsipu**](https://gitlab.com/pepsipu/ns2jb), which laid the groundwork for this research. All kudos goes to them for the Civ FS port :heart:
+> Thanks to [**Slapah**](https://github.com/byizmysh/IZCIVSwitch/blob/main/NOTICE.md#upstream) for the ns2jb filesystem port to CivSwitch and [**Kurumuz**](https://gitlab.com/kurumuz/ns2jb) for the improved fork of ns2jb from [**pepsipu**](https://gitlab.com/pepsipu/ns2jb), which laid the groundwork for this research. All kudos goes to them for the Civ FS port :heart:. Big thanks to Alula for giving really cool insights about making the FS acquisition more reliable, really goated !
 >
 > If you are looking for a reliable semi-untethered KaiHEN access, this fork [CivSwitchFS-kaiHEN](https://github.com/s8n/CivSwitchFS-kaiHEN) from [@Ave](https://github.com/aveao) is the way to go.
 
@@ -108,6 +108,8 @@ tools/               # well, tools
 - **[pepsipu/ns2jb](https://gitlab.com/pepsipu/ns2jb)**: og FS exploit
 - **Slapah/CivSwitch**: first true working ns2jb port for Civ. Sadly after his code beeing stole, he chose to nuke it.
 - **[Kurumuz/ns2jb](https://gitlab.com/kurumuz/ns2jb)**: improved version of ns2jb
+- **Alula**: improved FS acquisition advices
+- **Ave**: listened to all of my shit for days
 
 
 ## License
