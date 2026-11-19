@@ -123,7 +123,8 @@ export async function installAddressHeader(input) {
             var wave = executeWave(waveData.frames, rawScheduling,
                 workerResources, gates, sendIndices);
             wavesStarted += wave.started === 13 ? 1 : 0;
-            if (wave.created < 13 || wave.started < 13) {
+            if (wave.created < 13 || wave.pinned < 13 ||
+                wave.started < 13) {
                 var releaseCode = roleSendCode(waveData.frames, 9,
                     sendIndices[9]);
                 closeReservationGroup(group,

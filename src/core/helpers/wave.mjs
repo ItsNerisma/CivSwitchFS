@@ -110,7 +110,7 @@ export function buildPlans(input) {
         steps.push(SEND(REQ[i], roleHandles[i]));
         steps.push(TICK());
 
-        // Post-send signals (identical to the timed version).
+        // Post-send signals.
         if (i === 1) {
             steps.push(SETB(gates.bottleneckFinished, 1));
             steps.push(SIGNAL(gates.bottleneckDoneGate));
@@ -516,6 +516,16 @@ export function analyzeWave(profile, wave, waveData, group, createPinThisWave, i
         durationUs: preProbeTimingMeasured
             ? ticksToUs(preProbeEnd - preProbeStart) : null
     };
+    // W9 sends pin/clear/pre inside the race window; their round trips are
+    // server-load samples at the critical moment. The TICK steps around each
+    // SEND already store the timestamps, so this only reads them back.
+    var probeDurationUs = function(sendIndex) {
+        if (sendIndex < 0) return null;
+        var start = readFrameResult(waveData.frames[9].frame, sendIndex - 1);
+        var end = readFrameResult(waveData.frames[9].frame, sendIndex + 1);
+        if (start === FRAME_SENTINEL || end === FRAME_SENTINEL) return null;
+        return ticksToUs(end - start);
+    };
     var pinPersistentBytes = createPinThisWave && afterStats && group.before
         ? group.before[5] - afterStats[5] : null;
     var pinCostOk = !createPinThisWave ||
@@ -661,6 +671,22 @@ export function analyzeWave(profile, wave, waveData, group, createPinThisWave, i
             held: group.held ? group.held[5] : null,
             pre: preStats ? preStats[5] : null,
             after: afterStats ? afterStats[5] : null
+        },
+        // Full 16-field MemoryReportInfo vectors (peaks cleared on read, so
+        // each window summarizes retroactively what happened inside it).
+        // Field map: 0-2 pooled buffer (Commit pressure), 3-4+9 buffer
+        // manager (content cache), 5 exp heap, 6+10 buffer pool, 7-8 patrol
+        // read (background activity), 11 async pooled failures.
+        counterVector: {
+            before: group.before || null,
+            held: group.held || null,
+            pre: preStats,
+            after: afterStats
+        },
+        w9Probes: {
+            pinUs: probeDurationUs(pinSendIndex),
+            clearUs: probeDurationUs(clearSendIndex),
+            preUs: probeDurationUs(preSendIndex)
         },
         preProbeTiming: preProbeTiming,
         commitResult: commitResult,

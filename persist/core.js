@@ -1267,16 +1267,32 @@
         const addrlen = malloc(8);
         const enable = malloc(4);
         const payload_buf = malloc(MAXSIZE);
-        const line_buf = malloc(2048);
+        const LOG_RELAY_CHUNK_BYTES = 2048;
+        const line_buf = malloc(LOG_RELAY_CHUNK_BYTES);
 
         let _log_socket_fd = null;
         const _loader_old_log = window.log;
         window.log = async function (message) {
             if (_log_socket_fd !== null) {
                 try {
-                    const line = String(message) + "\n";
-                    write_string(line_buf, line);
-                    send(_log_socket_fd, line_buf, text_encode(line).length, 0);
+                    const bytes = text_encode(String(message) + "\n");
+                    let offset = 0;
+                    let relayFailed = false;
+                    while (offset < bytes.length && !relayFailed) {
+                        const chunkEnd = Math.min(
+                            offset + LOG_RELAY_CHUNK_BYTES, bytes.length);
+                        while (offset < chunkEnd) {
+                            const remaining = bytes.subarray(offset, chunkEnd);
+                            write_buffer(line_buf, remaining);
+                            const sent = send(_log_socket_fd, line_buf,
+                                remaining.length, 0);
+                            if (sent <= 0n) {
+                                relayFailed = true;
+                                break;
+                            }
+                            offset += Number(sent);
+                        }
+                    }
                 } catch (e) {}
             }
             return _loader_old_log(message);

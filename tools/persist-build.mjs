@@ -216,9 +216,21 @@ function injectPersistentLogRelay(core) {
     const relay = `        globalThis.__CIVSWITCHFS_PERSIST_LOG_FORWARDER__ = function (message) {
             if (_log_socket_fd === null) return;
             try {
-                const line = String(message) + "\\n";
-                write_string(line_buf, line);
-                send(_log_socket_fd, line_buf, text_encode(line).length, 0);
+                const bytes = text_encode(String(message) + "\\n");
+                let offset = 0;
+                while (offset < bytes.length) {
+                    const chunkEnd = Math.min(
+                        offset + LOG_RELAY_CHUNK_BYTES, bytes.length);
+                    while (offset < chunkEnd) {
+                        const remaining = bytes.subarray(
+                            offset, chunkEnd);
+                        write_buffer(line_buf, remaining);
+                        const sent = send(_log_socket_fd, line_buf,
+                            remaining.length, 0);
+                        if (sent <= 0n) return;
+                        offset += Number(sent);
+                    }
+                }
             } catch (e) {}
         };
 

@@ -49,7 +49,7 @@ function pinWorkerToCore(handle, core) {
 
 // Walk the nn::os thread manager linked list to borrow a valid priority
 // and core mask from a live game thread.
-// Returns { priority, core, mask, nodes } or null on failure.
+// Returns { priority, core, handle, nodes } or null on failure.
 function borrowThreadScheduling() {
     var manager = read64(THREAD_MANAGER_PTR);
     if (!manager || manager === 0n) return null;
@@ -89,7 +89,11 @@ function borrowThreadScheduling() {
                             }
                         }
                         if (!best || prio < best.priority) {
-                            best = { priority: prio, core: useCore, mask: mask, handle: handle };
+                            best = {
+                                priority: prio,
+                                core: useCore,
+                                handle: handle
+                            };
                         }
                     }
                 }

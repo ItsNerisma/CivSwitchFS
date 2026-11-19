@@ -14,6 +14,7 @@ const {
   frameArgSlot,
   openReservationGroup,
   prepPacket,
+  readAllocationCounters,
   resetWaveState,
   roleSendCode,
   write32,
@@ -69,7 +70,9 @@ export async function runControlWaveLoop({
   setupPkt,
   timingBaseline = null,
   allowTimingAdjustments = true,
-  shouldStop = null
+  shouldStop = null,
+  deferredVerboseLines = null,
+  attemptNumber = null
 }) {
   let canaryQualified;
   let dirtyWriteBuf;
@@ -124,7 +127,6 @@ export async function runControlWaveLoop({
         }
         if (canaryQualified) break;
         var profile = nextProfile;
-
         if (!writeDirtyData(savedHandle, dirtyFilePath, config.DIRTY_FILE_SIZE,
                 dirtyWriteBuf, dirtyWritePkt)) {
             workflowStopReason = "dirty-write-failed-at-wave-" + (attempt + 1);
@@ -133,6 +135,9 @@ export async function runControlWaveLoop({
 
         resetWaveState(waveData.frames, waveData.backups, REQ, waveData.pktBackups,
             gates, waveExtra);
+
+        const waveW9DelayNs = config.roleDelays[9];
+
         if (profile === "abort-control") write32(gates.completedFlag, 1n);
         if (profile === "abort-hole-control") write32(gates.bottleneckFinished, 1n);
         var profileSetup = helpers.configureProfile(profile, {config, REQ,
@@ -146,6 +151,16 @@ export async function runControlWaveLoop({
 
         var renameInputBefore = renamePathBuffers && isVerboseLogging()
             ? helpers.captureRenameInputState(REQ, renamePathBuffers) : null;
+
+        // Between-waves snapshot. Peaks are cleared on read, so this window
+        // covers everything since the previous wave's post-wave read. Our
+        // own inter-wave actions are known; any extra delta is external
+        // fsp-srv activity (game autosave, patrol read). Placed before the
+        // group open so it never splits the held→pre window the cache-hold
+        // gate measures.
+        var betweenStats = isVerboseLogging()
+            ? readAllocationCounters(rootSession, pktBuf)
+            : null;
 
         var group = openReservationGroup(rootSession, pktBuf, 59);
         if (!group.ok) {
@@ -172,8 +187,14 @@ export async function runControlWaveLoop({
             gates, sendIndices);
         wavesStarted += wave.started === 13 ? 1 : 0;
 
-        if (wave.created < 13 || wave.started < 13) {
-            workflowStopReason = "worker-start-failed-at-wave-" + (attempt + 1);
+        if (wave.created < 13 || wave.pinned < 13 || wave.started < 13) {
+            if (wave.created === 13 && wave.pinned < 13) {
+                workflowStopReason = "worker-pinning-failed-at-wave-" +
+                    (attempt + 1);
+            } else {
+                workflowStopReason = "worker-start-failed-at-wave-" +
+                    (attempt + 1);
+            }
             var relCode = roleSendCode(waveData.frames, 9, sendIndices[9]);
             closeReservationGroup(group, wave.created < 13 || relCode !== 0, pktBuf);
             workerStateSafe = wave.workerStateSafe === true;
@@ -206,13 +227,17 @@ export async function runControlWaveLoop({
         const timingRecord = {
             wave: attempt + 1,
             profile,
+            w9DelayNs: waveW9DelayNs,
             window: wResult.window,
             shape: wResult.shape,
             shapeMissing: wResult.shapeMissing.slice(),
             marginUs: wResult.marginUsRaw,
             marginSlackUs: wResult.marginSlackUs,
             rejections: wResult.rejections.slice(),
-            roleTimings: wResult.roleTimings
+            roleTimings: wResult.roleTimings,
+            betweenCounters: betweenStats,
+            counterVector: wResult.counterVector,
+            w9Probes: wResult.w9Probes
         };
         waveTimingRecords.push(timingRecord);
         if (profile === "positive") {
@@ -240,7 +265,9 @@ export async function runControlWaveLoop({
                 postHealthy: wResult.postCanaryHealth.healthy,
                 postCanaryHealth: {...wResult.postCanaryHealth},
                 triggerResult: wResult.triggerResult,
+                triggerCanonical: wResult.triggerCanonical,
                 triggerType: wResult.triggerType,
+                selectedMarker: wResult.selectedMarker,
                 triggerAborted: wResult.triggerAborted,
                 changedPaths: wResult.changedPaths.slice(),
                 guardSamples: {...wResult.guardSamples}
@@ -289,9 +316,35 @@ export async function runControlWaveLoop({
             nextProfile = "positive";
         }
 
-        if (isVerboseLogging())
+        if (isVerboseLogging()) {
             verboseWaveLines.push(helpers.formatWaveSummaryLine(
                 attempt + 1, profile, wResult, null, {config}));
+            var rt = wResult.roleTimings;
+            if (rt) {
+                var parts = [];
+                for (var ri = 0; ri < config.roleShort.length; ri++) {
+                    var label = config.roleLabels[ri];
+                    var t = rt[label];
+                    if (t) {
+                        parts.push(config.roleShort[ri] +
+                            "=" + Math.round(t.durationUs));
+                    }
+                }
+                verboseWaveLines.push(
+                    "       ipc-µs: " + parts.join(" "));
+            }
+
+            // Defer string formatting until after the loop to avoid stretching
+            // the gap before the next wave.
+            verboseWaveLines.push({
+                type: "wave-vector",
+                wave: attempt + 1,
+                profile,
+                result: wResult,
+                w9DelayNs: waveW9DelayNs,
+                betweenStats
+            });
+        }
 
         await waitMs(0);
         if (shouldStop?.()) {
@@ -301,9 +354,29 @@ export async function runControlWaveLoop({
         }
     }
 
-    // Emit wave output after the loop so logging cannot perturb wave timing.
-    if (verboseWaveLines.length) {
-        await verboseLog(verboseWaveLines.join("\n"));
+    for (var lineIndex = 0; lineIndex < verboseWaveLines.length; lineIndex++) {
+        var line = verboseWaveLines[lineIndex];
+        if (line && typeof line === "object" &&
+            line.type === "wave-vector") {
+            verboseWaveLines[lineIndex] = formatWaveVectorLine(line, config);
+        }
+    }
+
+    if (Array.isArray(deferredVerboseLines)) {
+        if (verboseWaveLines.length) {
+            deferredVerboseLines.push(
+                "======== ATTEMPT " + attemptNumber +
+                " WAVE DETAILS ========");
+            deferredVerboseLines.push(...verboseWaveLines);
+        }
+    } else {
+        // Emit wave output after the loop so logging cannot perturb wave timing.
+        // Keep each display update modest when a run produced many wave rows.
+        for (var flushFrom = 0; flushFrom < verboseWaveLines.length;
+            flushFrom += 6) {
+            await verboseLog(verboseWaveLines.slice(flushFrom, flushFrom + 6)
+                .join("\n"));
+        }
     }
 
     const positiveAttempts = profileCounts.positive || 0;
@@ -391,6 +464,109 @@ function median(values) {
   return sorted.length % 2
     ? sorted[middle]
     : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+// Compact hex form of one 16-field MemoryReportInfo vector, for the
+// machine-readable per-wave line. Fields are peaks cleared on read, so
+// each vector summarizes its own measurement window.
+function formatCounterVector(values) {
+    if (!values) return "na";
+    const parts = [];
+    for (let i = 0; i < values.length; i++) {
+        parts.push(values[i].toString(16));
+    }
+    return parts.join(",");
+}
+
+function formatProbeUs(value) {
+    return Number.isFinite(value) ? String(Math.round(value)) : "na";
+}
+
+function formatWaveVectorLine(record, config) {
+    const result = record.result;
+    const roleTimings = result.roleTimings;
+    const parts = [
+        "vec: w=" + record.wave,
+        "p=" + record.profile,
+        "win=" + (result.window ? 1 : 0),
+        "flip=" + (result.canaryRedirect ? 1 : 0),
+        "obs=" + (result.observedCanaryRedirect ? 1 : 0),
+        "shape=" + result.shape + "/10",
+        "m=" + (result.marginUsRaw === null
+            ? "na" : Math.round(result.marginUsRaw)),
+        "w9=" + Math.round(record.w9DelayNs / 1000) + "us",
+        "trg=0x" + Number(result.triggerCanonical).toString(16) +
+            "/" + result.triggerType,
+        "selected=" + (result.selectedMarker ? 1 : 0),
+        "canaryRes=0x" + Number(result.canaryResult).toString(16),
+        "canaryType=" + result.canaryType,
+        "abort=" + (result.triggerAborted ? 1 : 0),
+        "postHealthy=" + (result.postCanaryHealth.healthy ? 1 : 0),
+        "postTransport=" + result.postCanaryHealth.transport,
+        "postRes=0x" + Number(
+            result.postCanaryHealth.result).toString(16),
+        "postType=" + result.postCanaryHealth.type,
+        "changed=" + (result.changedPaths.length
+            ? result.changedPaths.join(",") : "-"),
+        "reject=" + (result.rejections.length
+            ? result.rejections.join(",") : "-")
+    ];
+    const guards = result.guardSamples || {};
+    parts.push("guards=" +
+        "c:" + (guards.completed ?? "na") + "," +
+        "h:" + (guards.earlyHole ?? "na") + "," +
+        "s:" + (guards.spacing ?? "na"));
+
+    let heapDelta;
+    if (result.preReleaseUsed === null ||
+        result.preReleaseUsed === undefined) {
+        heapDelta = "na";
+    } else {
+        heapDelta = "0x" + result.preReleaseUsed.toString(16);
+    }
+    parts.push("heapDelta=" + heapDelta);
+
+    if (result.shapeMissing.length) {
+        parts.push("missing=" + result.shapeMissing.join(","));
+    }
+    if (result.w9Probes) {
+        parts.push("rtt=" +
+            formatProbeUs(result.w9Probes.pinUs) + "," +
+            formatProbeUs(result.w9Probes.clearUs) + "," +
+            formatProbeUs(result.w9Probes.preUs));
+    }
+    if (roleTimings) {
+        const ipc = [];
+        for (let i = 0; i < config.roleLabels.length; i++) {
+            const timing = roleTimings[config.roleLabels[i]];
+            if (timing) ipc.push(Math.round(timing.durationUs));
+        }
+        parts.push("ipc=" + ipc.join(","));
+
+        if (!result.rejections.includes("trig-span")) {
+            const relative = [];
+            for (let i = 0; i < config.roleLabels.length; i++) {
+                const timing = roleTimings[config.roleLabels[i]];
+                if (timing) {
+                    relative.push(config.roleShort[i] + ":" +
+                        Math.round(timing.relStartUs) + "/" +
+                        Math.round(timing.relEndUs));
+                }
+            }
+            parts.push("rel=" + relative.join(","));
+        }
+    }
+
+    parts.push("cnt.btw=" + formatCounterVector(record.betweenStats));
+    if (result.counterVector) {
+        parts.push("cnt.held=" +
+            formatCounterVector(result.counterVector.held));
+        parts.push("cnt.pre=" +
+            formatCounterVector(result.counterVector.pre));
+        parts.push("cnt.post=" +
+            formatCounterVector(result.counterVector.after));
+    }
+    return "       " + parts.join(" ");
 }
 
 function addTimingCorrection(corrections, key, value) {

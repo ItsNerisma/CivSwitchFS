@@ -112,7 +112,7 @@ Each wave starts 13 worker threads behind a shared gate. When the gate opens, ea
 
 The trigger is W12's `GetEntryType` request with a very long path. W2 through W5 carry the path fragments used by that lookup. W1 sends a 64 KiB content-storage read through an `IStorage` handle.
 
-The exploit records when each request starts and returns. These client-side spans show how the requests overlap from the game's point of view, not the order in which `fsp-srv` executes them.
+The exploit measures when each request starts and returns. These client-side spans show how requests overlap from the game's point of view, not the order in which `fsp-srv` executes them.
 
 ### Worker roles
 
@@ -128,6 +128,10 @@ The table adds a short role name to each worker ID.
 | W9 (pin and release) | Pin, allocation probes, reservation close | Keeps the cache allocation alive, measures heap use, frees the reservation group, then signals the guards and trigger. |
 | W10-W11 (guards) | Guard `RenameFile` requests | Run after release. W11 samples W1's completion flag and signals W12. |
 | W12 (trigger) | Long-path `GetEntryType` | Waits for the gates, checks the abort flags, then performs the lookup. |
+
+All 13 workers use the same selected core. The core argument to `svcCreateThread` sets an ideal core, which still allows the scheduler to run a thread elsewhere when its affinity mask permits it. Before starting any worker, the exploit calls `svcSetThreadCoreMask` with a mask containing only that core. If any call fails, it closes the unstarted workers and abandons the wave.
+
+The worker priorities start at a value borrowed from a live game thread, then increase by each worker's index. Horizon gives smaller numbers higher priority, so W0 has the highest priority in this group and W12 the lowest. The single-core affinity makes those priority differences apply to the workers on the same scheduler. Priorities order runnable threads; they do not control the order in which `fsp-srv` processes requests.
 
 **The requests have different overlap requirements:**
 
@@ -152,15 +156,15 @@ On the first wave, W9 opens the persistent pin with `cmd 200` and keeps the retu
 For the Civ VII target profile, the pin must account for exactly 6,960 bytes and its measured lifetime must fit inside the canary request. Heap checks use that exact allocation as their reference. Later waves reuse the same handle and allow 192 bytes of counter jitter.
 
 > [!NOTE]
-> The race needs two things at once: W9 must free the 59-object group, while the pin keeps the target cache allocation alive. **CANARY FLIPPED** confirms the result: W6 saw a directory during W12, then the post-wave check saw the canary file again.
+> The race needs two things at once: W9 must free the 59-object group, while the pin keeps the target cache allocation alive. A qualified flip means W6 saw a directory during W12, then the post-wave check saw the canary file again.
 
 ### Timing within a wave
 
-Each worker starts after its configured delay:
+Each worker starts after its configured delay. The delays and priorities serve different purposes: the delay controls when a role becomes eligible, while priority helps order workers that are ready on the shared core.
 
 - W0 through W9: `0, 300, 350, 450, 550, 650, 1000, 1200, 1300, 1700` microseconds after the shared gate, in worker order.
 - W10 and W11: 150 and 300 microseconds after W9 signals that the reservation group has been freed.
-- W12: waits 1.6 milliseconds after the shared gate, then waits for the release and guard signals. After another 400 microseconds, it checks whether W1 has finished. If W1 is still running, W12 waits on its completion gate. It snapshots the abort flags before sending the trigger.
+- W12: waits for the release and guard signals without an initial delay. After another 400 microseconds, it checks whether W1 has finished. If W1 is still running, W12 waits on its completion gate. It snapshots the abort flags before sending the trigger.
 
 These defaults are in [`src/core/config.mjs`](src/core/config.mjs). The canary campaign may adjust the W0 through W9 delays and both guard delays, then carry an accepted schedule into the next full attempt.
 
@@ -176,7 +180,7 @@ sequenceDiagram
 
     M-->>W1: Start after 0.30 ms
     W1->>FS: IStorage Read 64 KiB
-    M-->>W12: Start fixed 1.60 ms wait
+    M-->>W12: Start waiting for release and guard gates
     M-->>W9: Start probes after 1.70 ms
     W9->>FS: Create or reuse pin and read counters
     W9->>FS: Release the 59-object group
@@ -198,7 +202,7 @@ The arrows show order, not scale. After its 400 microsecond sleep, W12 waits for
 
 ### Canary profiles and retry logic
 
-One canary campaign has a shared budget of 20 waves. It runs control profiles first, so the exploit can check the abort gates and long-path requests before treating a canary change as success.
+One canary campaign has a shared budget of 13 waves. It runs control profiles first, so the exploit can check the abort gates and long-path requests before treating a canary change as success.
 
 | Profile | What it checks | Expected result |
 |---|---|---|
@@ -221,15 +225,15 @@ flowchart TD
     E -->|expected error in a valid window| F[positive race]
     E -->|retry this profile if safe| E
     F -->|qualified canary flip| G[continue to cache alias]
-    F -->|no qualified flip, state safe, waves remain| F
-    A -->|unsafe state or 20-wave limit| X[end attempt]
-    B -->|unsafe state or 20-wave limit| X
-    D -->|unsafe state or 20-wave limit| X
-    E -->|unsafe state or 20-wave limit| X
-    F -->|unsafe state or 20-wave limit| X
+    F -->|no flip, waves remain| F
+    A -->|unsafe state or 13-wave limit| X[end attempt]
+    B -->|unsafe state or 13-wave limit| X
+    D -->|unsafe state or 13-wave limit| X
+    E -->|unsafe state or 13-wave limit| X
+    F -->|unsafe state or 13-wave limit| X
 ```
 
-The abort, extent-present, negative, and positive profiles retry until their result is qualified or the attempt must stop. `extent-absent` runs once as a reference. **All profiles share the same 20-wave budget.** An unsafe state or an exhausted budget ends the attempt.
+The abort, extent-present, negative, and positive profiles retry until their result is qualified or the attempt must stop. `extent-absent` runs once as a reference. **All profiles share the same 13-wave budget.** An unsafe state or an exhausted budget ends the attempt. The outer retry loop can start another attempt after cleanup proves that state safe.
 
 The absent and present path profiles check that W12 receives the end of its long path, not just the first fragment. The negative control then confirms the ordinary path-error response. Only after those controls pass does the positive profile try to flip the canary.
 
@@ -239,7 +243,7 @@ The absent and present path profiles check that W12 receives the end of its long
 - The pin and heap checks pass, at least `0x2600` cache bytes remain allocated before release, and no abort flag is set.
 - All 10 overlap spans match the pattern described above, including the 300 microsecond W11-to-W1 margin.
 
-The campaign logs **CANARY FLIPPED** only when W6 sees the canary as a directory during the positive trigger, no other path changes, and a post-wave check sees the canary as a file again.
+The campaign qualifies a canary flip only when W6 sees the canary as a directory during the positive trigger, no other path changes, and a post-wave check sees the canary as a file again.
 
 **Timing adjustments use repeated evidence:**
 

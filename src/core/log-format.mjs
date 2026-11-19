@@ -78,6 +78,9 @@ function humanStopReason(control) {
     match = /^profile-setup-failed-(.+)$/.exec(reason);
     if (match) return "could not configure the " + match[1] + " profile";
 
+    match = /^worker-pinning-failed-at-wave-(\d+)$/.exec(reason);
+    if (match) return "could not pin all workers before wave " + match[1];
+
     return reason.replace(/-/g, " ");
 }
 

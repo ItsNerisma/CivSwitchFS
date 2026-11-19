@@ -339,10 +339,15 @@ export async function installCacheAlias({
                         workerResources, gates, sendIndices);
                     wavesStarted += wave.started === 13 ? 1 : 0;
 
-                    if (wave.created < 13 || wave.started < 13) {
+                    if (wave.created < 13 || wave.pinned < 13 ||
+                        wave.started < 13) {
                         var relCode = roleSendCode(waveData.frames, 9, sendIndices[9]);
                         closeReservationGroup(group, wave.created < 13 || relCode !== 0, pktBuf);
-                        stepHardFailure = "worker-start-failed";
+                        if (wave.created === 13 && wave.pinned < 13) {
+                            stepHardFailure = "worker-pinning-failed";
+                        } else {
+                            stepHardFailure = "worker-start-failed";
+                        }
                         noteCopyFailure(stepHardFailure);
                         workerStateSafe = wave.workerStateSafe === true;
                         allStepsOk = false; break;

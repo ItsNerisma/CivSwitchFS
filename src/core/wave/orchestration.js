@@ -43,9 +43,9 @@ function createGateBlock() {
         earlyHole:          block + 0x600n,
         sampledCompleted:   block + 0x700n,
         sampledEarlyHole:   block + 0x800n,
-        zeroByte:           block + 0x900n,
-        spacingDecision:    block + 0xA00n,
-        roleDoneFlags:      block + 0xB00n
+        zeroByte:              block + 0x900n,
+        spacingDecision:       block + 0xA00n,
+        roleDoneFlags:         block + 0xB00n
     };
 }
 
@@ -158,15 +158,14 @@ function resetWaveState(frames, backups, packets, pktBackups, gates, extra) {
 // ── Wave execution ───────────────────────────────────────────────
 
 // Run one wave: create, start, signal, poll, join all workers.
-// Returns { created, started, done, joined, workerStateSafe, workers }
+// Returns { created, pinned, started, done, joined, workerStateSafe, workers }
 function executeWave(frames, scheduling, resources, gates, sendIndices) {
     var pinCore = scheduling.core;
 
     var workers = [];
     for (var i = 0; i < 13; i++) {
         workers.push(createRawWorker(frames[i].frame,
-            { priority: scheduling.priority + i, core: pinCore,
-              mask: scheduling.mask },
+            { priority: scheduling.priority + i, core: pinCore },
             resources[i]));
         if (workers[i].rc !== 0) break;
     }
@@ -176,15 +175,28 @@ function executeWave(frames, scheduling, resources, gates, sendIndices) {
             if (workers[i].rc === 0 && workers[i].handle)
                 closeRawThread(workers[i].handle);
         }
-        return { created: created, started: 0, done: 0, joined: 0,
+        return {
+            created: created, pinned: 0, started: 0, done: 0, joined: 0,
             workerStateSafe: true, workers: workers };
     }
 
-    // Pin every worker to one core so priority ordering is strict.
-    var pinFailed = 0;
+    // Set a single-core affinity mask before any worker can run.
+    var pinned = 0;
     for (var i = 0; i < 13; i++) {
         var pinRc = pinWorkerToCore(workers[i].handle, pinCore);
-        if (pinRc !== 0) pinFailed++;
+        if (pinRc === 0) pinned++;
+    }
+
+    if (pinned < 13) {
+        for (var i = 0; i < 13; i++) {
+            closeRawThread(workers[i].handle);
+        }
+
+        return {
+            created: created, pinned: pinned,
+            started: 0, done: 0, joined: 0,
+            workerStateSafe: true, workers: workers
+        };
     }
 
     var started = 0;
@@ -206,7 +218,8 @@ function executeWave(frames, scheduling, resources, gates, sendIndices) {
             if (rc === 0) closeRawThread(workers[i].handle);
             else safe = false;
         }
-        return { created: created, started: started, done: 0, joined: 0,
+        return { created: created, pinned: pinned, started: started,
+            done: 0, joined: 0,
             workerStateSafe: safe, workers: workers };
     }
 
@@ -245,7 +258,8 @@ function executeWave(frames, scheduling, resources, gates, sendIndices) {
     }
 
     return {
-        created: created, started: started, done: done, joined: joined,
+        created: created, pinned: pinned, started: started,
+        done: done, joined: joined,
         workerStateSafe: safe, workers: workers, waveT0: waveT0,
         signalResult: signalResult
     };

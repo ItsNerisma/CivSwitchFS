@@ -1,4 +1,4 @@
-// Start with verbose summaries disabled; controller Y toggles the mode.
+// Start with detailed wave summaries disabled; controller Y toggles the mode.
 export const VERBOSE_LOGGING = false;
 
 export function createFspIdentityConfig() {
@@ -8,6 +8,8 @@ export function createFspIdentityConfig() {
   var WAVE_READ_SIZE = 0x10000;    // 64 KiB IStorage::Read per wave
   var DIRTY_FILE_SIZE = 0x800000;  // 8 MiB dirty write
   var MAX_CONTROL_WAVES = 13;      // user-capped per launch
+  // Keep runs focused on canary qualification while this flag is enabled.
+  var CANARY_BENCH_MODE = true;
   var MAX_COPY_ATTEMPTS = 30;      // per nulWrites step per batch
   var COPY_BATCHES = 3;
   var MAX_ADDRESS_CANDIDATES = 5;
@@ -63,6 +65,7 @@ export function createFspIdentityConfig() {
     WAVE_READ_SIZE,
     DIRTY_FILE_SIZE,
     MAX_CONTROL_WAVES,
+    CANARY_BENCH_MODE,
     MAX_COPY_ATTEMPTS,
     COPY_BATCHES,
     MAX_ADDRESS_CANDIDATES,

@@ -45,9 +45,5 @@ const SVC_GetThreadCoreMask = sdk_base + 0x168b7cn; // x0=&out_core, x1=&out_mas
 var SVC_SetThreadCoreMask = 0n;
 const SVC_WaitSync = sdk_base + 0x168bf4n; // x0=&out_idx, x1=handles, w2=count, x3=timeout_ns
 
-// -- nn::os thread scheduling (for core mask pinning) ----------------------
-const F_nnos_SetThreadCoreMask = sdk_base + 0x1371a0n; // nn::os::SetThreadCoreMask — takes ThreadType*, not raw handle
-const F_nnos_GetAvailableCoreMask = sdk_base + 0x1371e0n; // nn::os::GetThreadAvailableCoreMask -> u64
-
 // -- nn::os thread manager list (for borrowing priority from live threads) --
 const THREAD_MANAGER_PTR = sdk_base + 0xb22280n; // read64 -> manager; manager+0xF0 = list; +0x1D0 = sentinel
