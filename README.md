@@ -15,7 +15,8 @@ CivSwitchFS is **semi-untethered**, RPC was fully removed :tada: ! It should als
 
 **It's intended for devs**, as all I give is a god `fsp-srv` handle (full FS) for you to play with. The rest is for you to figure out.
 
-Beware that this FS exploit is not 100% safe, it could corrupt your save, cache or worse. We had 0 brick case yet, but the risk itself is not proven to be 0.
+> [!IMPORTANT]
+> Beware that this FS exploit is not 100% safe, it could corrupt your save, cache or worse. We had 2 bricks on forks using that FS acquisition as a base. 
 
 ### Tested configuration
 
