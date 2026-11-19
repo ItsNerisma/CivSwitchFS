@@ -1,11 +1,13 @@
 # CivSwitchFS
 
-> [!IMPORTANT]
-> Thanks to [**Slapah**](https://github.com/byizmysh/IZCIVSwitch/blob/main/NOTICE.md#upstream) for the ns2jb filesystem port to CivSwitch and [**Kurumuz**](https://gitlab.com/kurumuz/ns2jb) for the improved fork of ns2jb from [**pepsipu**](https://gitlab.com/pepsipu/ns2jb), which laid the groundwork for this research. All kudos goes to them for the Civ FS port :heart:. Big thanks to Alula for giving really cool insights about making the FS acquisition more reliable, really goated !
->
-> If you are looking for a reliable semi-untethered KaiHEN access, this fork [CivSwitchFS-kaiHEN](https://github.com/s8n/CivSwitchFS-kaiHEN) from [@Ave](https://github.com/aveao) is the way to go.
+[!CAUTION]
+> Beware that this FS exploit is not 100% safe, it could corrupt your save, cache or worse. We had 2 bricks on forks using that FS acquisition as a base.
 
 This is payload provides **access to FS privileges** through an elevated fsp-srv handle. It runs inside the **CivSwitch Remote JS Loader**. That elevated session is exposed as `globalThis.fspSrv` for the next payloads.
+
+
+> [!NOTE]
+> If you are looking for a reliable semi-untethered KaiHEN access, this fork [CivSwitchFS-kaiHEN](https://github.com/s8n/CivSwitchFS-kaiHEN) from [@Ave](https://github.com/aveao) is the way to go.
 
 ## A bit of a preface
 
@@ -13,10 +15,7 @@ Smol demo (updated) https://streamable.com/wtcdnk
 
 CivSwitchFS is **semi-untethered**, RPC was fully removed :tada: ! It should also be more consistent for any hardware.
 
-**It's intended for devs**, as all I give is a god `fsp-srv` handle (full FS) for you to play with. The rest is for you to figure out.
-
-> [!IMPORTANT]
-> Beware that this FS exploit is not 100% safe, it could corrupt your save, cache or worse. We had 2 bricks on forks using that FS acquisition as a base. 
+**It's intended for devs**, as all I give is a god `fsp-srv` handle (full FS) for you to play with. The rest is for you to figure out. 
 
 ### Tested configuration
 
