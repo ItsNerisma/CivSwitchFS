@@ -89,8 +89,7 @@ An example can be found in `examples/user-storage`.
 
 ## Notes
 
-- The auto timing calibration is not perfect yet, some freezes can happen
-- THERE IS SO MUCH MORE to be done, I'm just releasing now so you guys can study the semi-untethered stuff
+- I've let my bench mode and worker easy configuration in there, feel free to play with it
 - You can learn about how the exploit works [there](https://github.com/ItsNerisma/CivSwitchFS/blob/main/HOW_IT_WORKS.md)
 
 ## Project structure
