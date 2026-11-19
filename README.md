@@ -5,10 +5,6 @@
 
 This is payload provides **access to FS privileges** through an elevated fsp-srv handle. It runs inside the **CivSwitch Remote JS Loader**. That elevated session is exposed as `globalThis.fspSrv` for the next payloads.
 
-
-> [!NOTE]
-> If you are looking for a reliable semi-untethered KaiHEN access, this fork [CivSwitchFS-kaiHEN](https://github.com/s8n/CivSwitchFS-kaiHEN) from [@Ave](https://github.com/aveao) is the way to go.
-
 ## A bit of a preface
 
 Smol demo (updated) https://streamable.com/wtcdnk
