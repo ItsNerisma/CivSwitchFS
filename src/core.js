@@ -186,10 +186,10 @@ export async function run() {
         let preReservationFallbackUsed = false;
 
         await log(
-            "===========================\n" +
+            "==========================\n" +
             "CivSwitchFS (no RPC) by Nerisma\n" +
             "Thanks to Slapah, Pepsipu, Kurumuz and Alula\n" +
-            "===========================");
+            "==========================");
         await log(isVerboseLogging()
             ? "Verbose logging is on (controller Y toggles the mode)."
             : "Normal logging is on (controller Y enables verbose summaries).");
