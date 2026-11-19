@@ -108,7 +108,9 @@ export async function captureReleaseBaseline({
             }
             prevEnd = lo;
         }
-        snapshotOk = prefix0Ok && prevEnd > config.CONTROL_SIZE;
+        // The scan skips the first cache block and needs one full block after it.
+        const minimumScanSpan = config.CONTROL_SIZE * 2;
+        snapshotOk = prefix0Ok && prevEnd >= minimumScanSpan;
     }
 
     return {ok: true, previousBuffer, currentBuffer, prevEnd, snapshotOk,

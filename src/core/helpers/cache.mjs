@@ -249,7 +249,7 @@ export async function qualifyCacheBucketPeriod(input) {
     return {ok: periodAliasOk, addressCopy};
 }
 
-function inspectCandidateCacheAlias(candidateHandle, addressCopy) {
+export function inspectCandidateCacheAlias(candidateHandle, addressCopy) {
     if (!addressCopy || !addressCopy.config)
         return {state: "unavailable", error: null, detail: "address baseline unavailable"};
     var baseline = addressCopy.aliasControlHex;
