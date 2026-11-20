@@ -285,7 +285,7 @@ Those 16 bytes give discovery a known value to find in memory. If either baselin
 
 The `cmd 1002` path copy stops at a NUL byte. `nulWrites` builds seven prefixes, replacing earlier zero bytes with `B` so each prefix can be sent as a path.
 
-Each of the seven prefixes gets up to 90 attempts, in three batches of 30. **A prefix passes only when the wave qualifies, at least `0x2810` cache bytes remain allocated before release, and no unexpected path changes.**
+Each of the seven prefixes gets up to 90 attempts, in three batches of 30. **A prefix passes only when the wave qualifies, at least `0x2600` cache bytes remain allocated before release, and no unexpected path changes.** This matches the qualified receive-window floor.
 
 ```mermaid
 flowchart TD

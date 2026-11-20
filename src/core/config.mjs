@@ -26,8 +26,8 @@ export function createFspIdentityConfig() {
   var ALIAS_OFFSET = 0x1400000;    // 20 MiB — alias target
   var MARKER_OFFSET = 0x2340;      // byte offset into cache entry metadata
   var WINDOW_MINIMUM_CACHE_HELD = 0x2600; // reference receive-window floor
-  // Extra reference guard applied uniformly to every field copy.
-  var FIELD_MINIMUM_CACHE_HELD = 0x2810;
+  // Use the qualified receive-window floor for each alias field copy.
+  var FIELD_MINIMUM_CACHE_HELD = WINDOW_MINIMUM_CACHE_HELD;
   // Normal alias waves rewrite save:/hole/commit_data (8 MiB) and overlap Commit.
   var MONITORING_ROUNDS = 4;        // extra snapshot re-reads after release
   var CACHE_READ_SIZE = 0x200000;  // 2 MiB widened read
