@@ -88,9 +88,8 @@ export async function installAddressHeader(input) {
         var addrAttempts = 0;
         var acceptedResult = null;
         var addrWinFail = 0, addrPreLow = 0, addrPathMiss = 0;
-        for (var batch = 0; batch < config.COPY_BATCHES && !confirmed &&
-            !stoppedByUser && !shouldStop?.(); batch++) {
-        for (var attempt = 0; attempt < config.MAX_COPY_ATTEMPTS &&
+        for (var attempt = 0;
+            attempt < config.MAX_CACHE_WAVES_PER_STEP &&
             !stoppedByUser && !shouldStop?.(); attempt++) {
             addrAttempts++;
             if (!writeDirtyData(savedHandle, dirtyFilePath, config.DIRTY_FILE_SIZE,
@@ -175,7 +174,6 @@ export async function installAddressHeader(input) {
             if (shouldStop?.()) stoppedByUser = true;
             if (confirmed || stoppedByUser) break;
         }
-        }
         if (stoppedByUser) {
             await verboseLog(stageName + " stopped during step " +
                 (stepIdx + 1) + "/" + steps.length + " after " +
@@ -205,7 +203,6 @@ export async function installAddressHeader(input) {
     if (shouldStop?.()) stoppedByUser = true;
     return copyResult(!stoppedByUser);
 }
-
 export async function qualifyCacheBucketPeriod(input) {
     let candidateHandle = input.candidateHandle;
     let primeHex = input.primeHex;
@@ -276,49 +273,4 @@ export function inspectCandidateCacheAlias(candidateHandle, addressCopy) {
         return {state: "unavailable", error: null,
             detail: String(error?.message || error)};
     }
-}
-
-export async function retireCandidateCache(input) {
-    let candidateCacheNeedsRetirement = input.candidateCacheNeedsRetirement;
-    let candidateCacheRetired = input.candidateCacheRetired;
-    let candidateHandle = input.candidateHandle;
-    let addressCopy = input.addressCopy;
-    if (!candidateHandle || !candidateCacheNeedsRetirement)
-        return {ok: true, addressCopy: {...addressCopy, candidateCacheRetired},
-            retirementSkipped: false};
-
-    var precheck = inspectCandidateCacheAlias(candidateHandle, addressCopy);
-    if (precheck.state === "original") {
-        candidateCacheRetired = true;
-        addressCopy = {...addressCopy, candidateCacheRetired};
-        await verboseLog("Candidate cache precheck=original · read=" +
-            hex32(precheck.error) + " · skipping retirement waves.");
-        return {ok: true, addressCopy, candidateCacheRetired,
-            retirementSkipped: true};
-    }
-
-    await verboseLog("Candidate cache precheck=" + precheck.state +
-        " · read=" + (precheck.error == null
-            ? "unavailable" : hex32(precheck.error)) +
-        (precheck.detail ? " · " + precheck.detail : "") +
-        " · running retirement waves.");
-    var retireBytes = [];
-    for (var i = 0; i < 0x10; i++) retireBytes.push(0x42);
-    var retirement = await installAddressHeader({...addressCopy,
-        desiredBytes: retireBytes, stageName: "cache-retire"});
-    addressCopy = retirement.addressCopy;
-    var retired = retirement.ok;
-    var readback = null;
-    if (!retired && addressCopy.workerStateSafe === true) {
-        // A rejected timing window can still have cleared the valid byte.
-        // Only the candidate's original bytes prove that the alias is gone.
-        readback = inspectCandidateCacheAlias(candidateHandle, addressCopy);
-        retired = readback.state === "original";
-    }
-    if (retired) {
-        candidateCacheRetired = true;
-        addressCopy = {...addressCopy, candidateCacheRetired};
-    }
-    return {ok: retired, addressCopy, candidateCacheRetired,
-        retirementSkipped: false};
 }

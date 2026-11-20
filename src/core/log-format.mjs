@@ -546,7 +546,7 @@ export function formatCanaryResult(control, config) {
 export function formatAliasResult(alias) {
     if (alias.aliasInstalled) {
         return "Cache alias installed · " + alias.copyStepsCompleted +
-            "/7 steps · " + alias.copyWavesTotal + " waves.";
+            "/7 steps · " + alias.copyWavesTotal + " total copy waves.";
     }
 
     const reasons = Object.entries(alias.copyFailureCounts || {})
@@ -561,7 +561,7 @@ export function formatAliasResult(alias) {
         .join(",") || "none";
 
     return "Cache alias rejected · " + alias.copyStepsCompleted +
-        "/7 steps · " + alias.copyWavesTotal + " waves · workers=" +
+        "/7 steps · " + alias.copyWavesTotal + " total copy waves · workers=" +
         (alias.workerStateSafe ? "safe" : "unsafe") +
         " · main cause=" + (alias.copyFailureReason || "unknown").replace(/-/g, " ") +
         " · frequent failures=" + reasons +
@@ -704,15 +704,29 @@ export function formatCleanupResult(cleanup, workerStateSafe) {
 }
 
 export function formatRetirementResult(retired) {
+    if (retired?.failureReason ===
+        "candidate-cache-invalidation-unconfirmed") {
+        return "Candidate cache invalidation was not confirmed; " +
+            "candidate storage remains open.";
+    }
+
+    if (retired?.failureReason ===
+        "candidate-cache-verification-unconfirmed") {
+        return "Candidate cache readback was not confirmed; " +
+            "cache state remains unconfirmed.";
+    }
+
     if (!retired?.ok || retired?.failureReason) {
         return "Endpoint retirement or close failed (reason=" +
             (retired?.failureReason || "cleanup-safety-not-verified") +
             "; close=" + formatCode(retired?.candidateCloseResult) + ").";
     }
 
-    if (retired.candidateCacheRetirementSkipped)
-        return "Candidate readback matches the original data; retirement waves " +
-            "were skipped and candidate storage closed.";
+    if (retired.addressCopy?.candidateCacheVerification ===
+        "fresh-readback-original") {
+        return "Candidate cache readback passed on a fresh storage; " +
+            "candidate storage closed.";
+    }
 
     if (retired.candidateCacheRetired)
         return "Candidate cache retired and candidate storage closed.";

@@ -244,6 +244,18 @@ export async function createScratchTree({
             "result=" + hex32(spanMarkerResult));
     }
 
+    // Commit the full scratch tree so its metadata is no longer dirty
+    // when writeDirtyData adds DIRTY_FILE_SIZE bytes before each wave.
+    // Without this, metadata from the files above sits on top of the
+    // dirty write and can push total outstanding bytes past the BC save
+    // dirty cap (~8 MiB), poisoning the FS session.
+    var scratchTreeCommitResult = ipcCommit(savedHandle);
+    if (scratchTreeCommitResult !== 0) {
+        removeScratchTree(savedHandle, SCRATCH_DIR); cleanupHandles();
+        return failedStep("scratch-tree-commit-failed",
+            "result=" + hex32(scratchTreeCommitResult));
+    }
+
   return {ok: true, SCRATCH_DIR, abortControlCanonical, canaryPath,
       canaryDirectories, canaryCreateResult, dirtyFilePath, segments,
       selectedDir, setupPath, setupPkt};

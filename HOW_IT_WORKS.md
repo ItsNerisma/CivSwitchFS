@@ -92,7 +92,7 @@ Wave workers use their own clones. W12 uses the marker handle for the extent pro
 
 The scratch tree makes each profile's effect visible and repeatable:
 
-- `commit_data` is an 8 MiB file. Before every wave, the exploit rewrites it with nonzero bytes so W0's save `Commit` has work to do.
+- `commit_data` is a 7 MiB file. Before every wave, the exploit rewrites it with nonzero bytes so W0's save `Commit` has work to do.
 - `canary` is a one-byte file at the end of a 1,440-character path (`0x5A0`). W6 checks its type around the trigger.
 - `selected` is the directory in the positive trigger path.
 - `SPAN_MARKER` sits at the end of a nested path. The extent profiles compare that path with the marker absent and present.
@@ -108,7 +108,7 @@ The final session also stays in domain form so later payloads can use its handle
 
 ### What happens in a wave
 
-Each wave starts 13 worker threads behind a shared gate. When the gate opens, each worker waits its assigned delay and runs its IPC work. The campaign repeats waves to see whether the schedule produces the required timing pattern and filesystem result.
+Each wave starts 11 worker threads behind a shared gate. The worker IDs remain in 13 stable slots, but W7 and W8 are inactive. When the gate opens, each active worker waits its assigned delay and runs its IPC work. The campaign repeats waves to see whether the schedule produces the required timing pattern and filesystem result.
 
 The trigger is W12's `GetEntryType` request with a very long path. W2 through W5 carry the path fragments used by that lookup. W1 sends a 64 KiB content-storage read through an `IStorage` handle.
 
@@ -116,34 +116,33 @@ The exploit measures when each request starts and returns. These client-side spa
 
 ### Worker roles
 
-The table adds a short role name to each worker ID.
+The table lists active workers with short role names. W7 and W8 are omitted because they are inactive.
 
 | Worker | Request | Role in the race |
 |---|---|---|
-| W0 (commit) | Save `Commit` | Holds the 8 MiB save commit open across the trigger, adding save work to the overlap. |
+| W0 (commit) | Save `Commit` | Holds the 7 MiB save commit open across the trigger, adding save work to the overlap. |
 | W1 (bottleneck) | 64 KiB `IStorage::Read` | Keeps W12 waiting and sets the measured completion boundary. |
 | W2-W5 (fragments) | Four fragment requests (`cmd 1002`) | Carry the rest of the long path used by W12. |
 | W6 (canary check) | `GetEntryType` for the canary | Samples the canary during the trigger. A temporary directory result is the race signal. |
-| W7-W8 (fillers) | Filler `RenameFile` requests | Keep two other paths in flight, then let the post-wave check detect unexpected changes. |
 | W9 (pin and release) | Pin, allocation probes, reservation close | Keeps the cache allocation alive, measures heap use, frees the reservation group, then signals the guards and trigger. |
 | W10-W11 (guards) | Guard `RenameFile` requests | Run after release. W11 samples W1's completion flag and signals W12. |
 | W12 (trigger) | Long-path `GetEntryType` | Waits for the gates, checks the abort flags, then performs the lookup. |
 
-All 13 workers use the same selected core. The core argument to `svcCreateThread` sets an ideal core, which still allows the scheduler to run a thread elsewhere when its affinity mask permits it. Before starting any worker, the exploit calls `svcSetThreadCoreMask` with a mask containing only that core. If any call fails, it closes the unstarted workers and abandons the wave.
+All 11 active workers use the same selected core. The core argument to `svcCreateThread` sets an ideal core, which still allows the scheduler to run a thread elsewhere when its affinity mask permits it. Before starting any worker, the exploit calls `svcSetThreadCoreMask` with a mask containing only that core. If any call fails, it closes the unstarted workers and abandons the wave.
 
 The worker priorities start at a value borrowed from a live game thread, then increase by each worker's index. Horizon gives smaller numbers higher priority, so W0 has the highest priority in this group and W12 the lowest. The single-core affinity makes those priority differences apply to the workers on the same scheduler. Priorities order runnable threads; they do not control the order in which `fsp-srv` processes requests.
 
 **The requests have different overlap requirements:**
 
 - W0 and W2-W5 must remain in flight for W12's entire lookup. This keeps the save commit and all path fragments active while the trigger runs.
-- W6-W8 and W10-W11 must already be in flight when W12 starts. W6 can sample the canary during the lookup, the filler paths act as controls, and W11's guard signal lets W12 continue.
+- W6 and W10-W11 must already be in flight when W12 starts. W6 samples the canary during the lookup, and W11's guard signal lets W12 continue.
 - W9 has a separate release check because freeing the reservation group is the heap change the race is trying to line up with those requests.
 
 W1 is the **bottleneck** because W12 waits for its read to complete before sending the trigger. For the wave to qualify, W11's request must start while W1 is still running. **The 300 microsecond floor is a pass threshold, not a wait required by `GetEntryType`.** W1 must remain pending for at least that long after W11 starts. A shorter overlap is too narrow to count as a receive window. When retuning, the campaign aims for 500 microseconds to leave extra slack.
 
 ### Reservations and persistent pin
 
-Before each wave, `cmd 1200` creates **59 service-domain objects**. They are separate from the 13 workers.
+Before each wave, `cmd 1200` creates **59 service-domain objects**. They are separate from the 11 active workers.
 
 The 59 objects **create a known heap shape**. W9 frees them while the other requests are still running, so the heap change happens during the filesystem race.
 
@@ -162,11 +161,11 @@ For the Civ VII target profile, the pin must account for exactly 6,960 bytes and
 
 Each worker starts after its configured delay. The delays and priorities serve different purposes: the delay controls when a role becomes eligible, while priority helps order workers that are ready on the shared core.
 
-- W0 through W9: `0, 300, 350, 450, 550, 650, 1000, 1200, 1300, 1700` microseconds after the shared gate, in worker order.
+- W0 through W6: `0, 300, 350, 450, 550, 650, 1000` microseconds after the shared gate, in worker order. W7 and W8 are inactive. W9 starts after `1700` microseconds.
 - W10 and W11: 150 and 300 microseconds after W9 signals that the reservation group has been freed.
 - W12: waits for the release and guard signals without an initial delay. After another 400 microseconds, it checks whether W1 has finished. If W1 is still running, W12 waits on its completion gate. It snapshots the abort flags before sending the trigger.
 
-These defaults are in [`src/core/config.mjs`](src/core/config.mjs). The canary campaign may adjust the W0 through W9 delays and both guard delays, then carry an accepted schedule into the next full attempt.
+These defaults are in [`src/core/config.mjs`](src/core/config.mjs). The canary campaign may adjust the active W0 through W6 and W9 delays, along with both guard delays, then carry an accepted schedule into the next full attempt.
 
 ```mermaid
 sequenceDiagram
@@ -239,9 +238,9 @@ The absent and present path profiles check that W12 receives the end of its long
 
 **A positive wave counts as a valid window only when:**
 
-- All 13 workers finish and join. The reservation group releases, and the IPC requests return their expected results.
+- All 11 active workers finish and join. The reservation group releases, and the IPC requests return their expected results.
 - The pin and heap checks pass, at least `0x2600` cache bytes remain allocated before release, and no abort flag is set.
-- All 10 overlap spans match the pattern described above, including the 300 microsecond W11-to-W1 margin.
+- All 8 active overlap spans match the pattern described above, including the 300 microsecond W11-to-W1 margin.
 
 The campaign qualifies a canary flip only when W6 sees the canary as a directory during the positive trigger, no other path changes, and a post-wave check sees the canary as a file again.
 
@@ -285,7 +284,9 @@ Those 16 bytes give discovery a known value to find in memory. If either baselin
 
 The `cmd 1002` path copy stops at a NUL byte. `nulWrites` builds seven prefixes, replacing earlier zero bytes with `B` so each prefix can be sent as a path.
 
-Each of the seven prefixes gets up to 90 attempts, in three batches of 30. **A prefix passes only when the wave qualifies, at least `0x2810` cache bytes remain allocated before release, and no unexpected path changes.**
+Each of the seven prefixes gets up to 10 attempts. **A prefix passes only when the wave qualifies, at least `0x2810` cache bytes remain allocated before release, and no unexpected path changes.**
+
+For a clean candidate cache, cleanup first tries `IStorage::OperateRange` with operation 2. If invalidation is not confirmed, cleanup skips retirement waves and stops the attempt. With workers quiesced and no retained endpoint active, the payload reports `STATE IS SAFE TO RESTART`. Dirty retained endpoints still use retirement waves because invalidation could flush corrupted data.
 
 ```mermaid
 flowchart TD
@@ -294,7 +295,7 @@ flowchart TD
     C --> D{Timing, heap, and path checks pass?}
     D -->|No| E{Attempts left for this piece?}
     E -->|Yes| C
-    E -->|No| N{Original bytes read back?}
+    E -->|No| N[Stop alias installation]
     D -->|Yes| F{All seven pieces copied?}
     F -->|No| B
     F -->|Yes| G[Read 2 MiB at offset 0x1400000]
@@ -302,13 +303,15 @@ flowchart TD
     H -->|No| N
     H -->|Yes| I[Alias confirmed]
     I --> J[Read adjacent fsp-srv heap for discovery]
-    N -->|Yes| O[Close candidate without retirement waves]
-    N -->|No or uncertain| X[Retire candidate cache]
+    N --> O[Invalidate candidate storage cache]
+    O --> P{Invalidation confirmed?}
+    P -->|Yes| Q[Close candidate]
+    P -->|No| R[Skip retirement waves and stop]
 ```
 
 **Discovery starts with a 2 MiB read at offset `0x1400000`.** Its first bytes must match the values primed at offset `0`.
 
-**If alias installation was attempted, cleanup checks the candidate read at offset `0x1400000` before launching retirement waves.** If it returns the original bytes, cleanup verifies that the alias is inactive and closes the candidate without the extra waves. If it returns the primed alias bytes, unexpected data, or a read error, cleanup runs the retirement path; an incomplete copy still leaves the mapping uncertain.
+**If alias installation was attempted, cleanup invalidates the candidate storage cache before closing it.** If invalidation is not confirmed, cleanup leaves the candidate handle open and skips retirement waves. The run reports `STATE IS SAFE TO RESTART` only when workers have stopped and no retained endpoint is active. Relaunch the game normally.
 
 > [!NOTE]
 > **The cache entry is tagged for offset 20 MiB but holds bytes primed at offset 0.** A widened read exposes the mismatch, then crosses the 16 KiB cache block into nearby `fsp-srv` memory. Discovery uses that memory window to find the objects it needs to promote.

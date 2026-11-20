@@ -246,7 +246,9 @@ function ipcFileInvalidate(fsHandle, path, size) {
     var fileHandle = ipcOpenFile(fsHandle, path, 1);
     if (!fileHandle) return -1;
     var pkt = allocPage(0x2000);
-    prepPacket(pkt, 4, 0x0C, []);
+    // OperateRange input is {u32 operation, u32 padding, s64 offset, s64 size}.
+    // Its 24-byte CMIF input requires 14 HIPC raw words.
+    prepPacket(pkt, 4, 0x0E, []);
     write32(pkt + 0x10n, 0x49434653n);
     write32(pkt + 0x18n, 5n);                    // cmd 5 = OperateRange
     write32(pkt + 0x20n, 2n);                    // operation = 2 (invalidate)

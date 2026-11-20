@@ -120,21 +120,30 @@
             return new Promise(resolve => requestAnimationFrame(resolve));
         }
 
+        // Keep Gezine's promise ordering so awaited logs include earlier paints.
+        var tail = Promise.resolve();
+
         function clearLog() {
-            lines.length = 0;
-            output.textContent = '';
-            output.scrollTop = 0;
-            return waitForDisplayFrame();
+            tail = tail.then(function() {
+                lines.length = 0;
+                output.textContent = '';
+                output.scrollTop = 0;
+                return waitForDisplayFrame();
+            });
+            return tail;
         }
 
         window.log = function log(msg) {
-            var timestamp = formatTimestamp(new Date());
-            var messageLines = String(msg).replace(/\r\n?/g, '\n')
-                .split('\n');
-            messageLines.forEach(function(line) {
-                appendLine(line, timestamp);
+            tail = tail.then(function() {
+                var timestamp = formatTimestamp(new Date());
+                var messageLines = String(msg).replace(/\r\n?/g, '\n')
+                    .split('\n');
+                messageLines.forEach(function(line) {
+                    appendLine(line, timestamp);
+                });
+                return waitForDisplayFrame();
             });
-            return waitForDisplayFrame();
+            return tail;
         };
 
         window.log.clear = clearLog;
@@ -1272,7 +1281,8 @@
 
         let _log_socket_fd = null;
         const _loader_old_log = window.log;
-        window.log = async function (message) {
+        const _loader_old_log_clear = _loader_old_log.clear;
+        const _loader_log = async function (message) {
             if (_log_socket_fd !== null) {
                 try {
                     const bytes = text_encode(String(message) + "\n");
@@ -1295,8 +1305,16 @@
                     }
                 } catch (e) {}
             }
-            return _loader_old_log(message);
+            return _loader_old_log.apply(this, arguments);
         };
+        // Preserve optional logger APIs such as the custom clear method.
+        if (typeof _loader_old_log_clear === "function") {
+            _loader_log.clear = function () {
+                return _loader_old_log_clear.apply(
+                    _loader_old_log, arguments);
+            };
+        }
+        window.log = _loader_log;
 
         function create_socket() {
             for (let i = 0; i < 16; i++) write8(sockaddr_in + BigInt(i), 0);
