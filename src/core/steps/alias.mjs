@@ -318,12 +318,11 @@ export async function installCacheAlias({
                 var acceptedResult = null;
                 var stepProgressReported = false;
                 var stepProgressThreshold = Math.ceil(
-                    config.MAX_COPY_ATTEMPTS * config.COPY_BATCHES / 2);
+                    config.MAX_CACHE_WAVES_PER_STEP / 2);
 
-                for (var batch = 0; batch < config.COPY_BATCHES &&
-                    !stepConfirmed && !stoppedByUser && !shouldStop?.(); batch++) {
-                for (var ca = 0; ca < config.MAX_COPY_ATTEMPTS &&
-                    !stoppedByUser && !shouldStop?.(); ca++) {
+                for (var waveAttempt = 0;
+                    waveAttempt < config.MAX_CACHE_WAVES_PER_STEP &&
+                    !stoppedByUser && !shouldStop?.(); waveAttempt++) {
                     stepAttempts++;
 
                     if (!writeDirtyData(savedHandle, dirtyFilePath, config.DIRTY_FILE_SIZE,
@@ -504,13 +503,13 @@ export async function installCacheAlias({
                         if (!isVerboseLogging())
                             await reportProgress("Memory alias progress: copy step " +
                                 (stepIdx + 1) + "/" + steps.length +
-                                " complete after " + copyWavesTotal + " waves.");
+                                " complete after " + stepAttempts + " waves.");
                     } else if (reportProgress && !stepProgressReported &&
                         stepAttempts >= stepProgressThreshold) {
                         await reportProgress("Memory alias progress: copy step " +
                             (stepIdx + 1) + "/" + steps.length +
                             " is still searching after " + stepAttempts + "/" +
-                            (config.MAX_COPY_ATTEMPTS * config.COPY_BATCHES) +
+                            config.MAX_CACHE_WAVES_PER_STEP +
                             " waves.");
                         await verboseLog("Memory alias diagnostics: copy step " +
                             (stepIdx + 1) + "/" + steps.length + " after " +
@@ -538,7 +537,6 @@ export async function installCacheAlias({
                         copyFailureReason = "stopped-by-user";
                     }
                     if (stepConfirmed || stoppedByUser) break;
-                }
                 }
 
                 if (stoppedByUser && !stepConfirmed) {

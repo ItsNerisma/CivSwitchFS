@@ -34,8 +34,7 @@ import {
 import {
   inspectCandidateCacheAlias,
   installAddressHeader,
-  qualifyCacheBucketPeriod,
-  retireCandidateCache
+  qualifyCacheBucketPeriod
 } from "./cache.mjs";
 
 import {
@@ -86,7 +85,6 @@ export function createFspIdentityHelpers(options = {}) {
     inspectCandidateCacheAlias,
     installAddressHeader,
     qualifyCacheBucketPeriod,
-    retireCandidateCache,
     buildPlans,
     configureProfile,
     configurePayload,

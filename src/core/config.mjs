@@ -6,12 +6,11 @@ export function createFspIdentityConfig() {
 
   var SLOT_SIZE = 0x800;
   var WAVE_READ_SIZE = 0x10000;    // 64 KiB IStorage::Read per wave
-  var DIRTY_FILE_SIZE = 0x800000;  // 8 MiB dirty write
+  var DIRTY_FILE_SIZE = 0x700000;  // 7 MiB dirty write (1 MiB headroom under BC save cap)
   var MAX_CONTROL_WAVES = 13;      // user-capped per launch
   // Keep runs focused on canary qualification while this flag is enabled.
   var CANARY_BENCH_MODE = false;
-  var MAX_COPY_ATTEMPTS = 30;      // per nulWrites step per batch
-  var COPY_BATCHES = 3;
+  var MAX_CACHE_WAVES_PER_STEP = 10; // limit per field-copy or retirement step
   var MAX_ADDRESS_CANDIDATES = 5;
   var MAX_POOL_REFINEMENT_READS = 16;
   var MAX_POOL_ANCHOR_CANDIDATES = 4;
@@ -28,7 +27,7 @@ export function createFspIdentityConfig() {
   var WINDOW_MINIMUM_CACHE_HELD = 0x2600; // reference receive-window floor
   // Extra reference guard applied uniformly to every field copy.
   var FIELD_MINIMUM_CACHE_HELD = 0x2810;
-  // Normal alias waves rewrite save:/hole/commit_data (8 MiB) and overlap Commit.
+  // Normal alias waves rewrite save:/hole/commit_data (7 MiB) and overlap Commit.
   var MONITORING_ROUNDS = 4;        // extra snapshot re-reads after release
   var CACHE_READ_SIZE = 0x200000;  // 2 MiB widened read
   var CONTROL_SIZE = 0x4000;       // 16 KiB — one cache block
@@ -83,8 +82,7 @@ export function createFspIdentityConfig() {
     DIRTY_FILE_SIZE,
     MAX_CONTROL_WAVES,
     CANARY_BENCH_MODE,
-    MAX_COPY_ATTEMPTS,
-    COPY_BATCHES,
+    MAX_CACHE_WAVES_PER_STEP,
     MAX_ADDRESS_CANDIDATES,
     MAX_POOL_REFINEMENT_READS,
     MAX_POOL_ANCHOR_CANDIDATES,

@@ -35,7 +35,8 @@ import {
 } from "./core/steps/discovery.mjs";
 import {
   retireCandidateCacheAndClose,
-  cleanupScratchAndHandles
+  cleanupScratchAndHandles,
+  formatUnsafeState
 } from "./core/steps/cleanup.mjs";
 import {createFspIdentityHelpers} from "./core/helpers/index.mjs";
 import {runPromotionStep} from "./core/promotion.mjs";
@@ -221,13 +222,16 @@ export async function run() {
             positiveWindowsTotal += result.positiveWindows || 0;
             qualifiedCanaryFlipsTotal += result.qualifiedCanaryFlips || 0;
 
-            if (timingPersistence.stopRequested || result.stoppedByUser)
+            if (timingPersistence.stopRequested || result.stoppedByUser) {
+                await logSafeRestartStatus(result);
                 return;
+            }
 
             if (result.permissionProven) {
                 if (result.promotionRestored && result.safeToRetry) {
                     await log("Attempt complete.");
                 }
+                await logSafeRestartStatus(result);
                 return;
             }
 
@@ -290,8 +294,9 @@ export async function run() {
                     ? " Restart the game before another run."
                     : "";
                 await log("Stopped after " + attempt +
-                    " attempts; user storage access was not verified. " +
+                    " attempts; user storage access was not verified.\n" +
                     windowSummary + restartHint);
+                await logSafeRestartStatus(result);
                 return;
             }
 
@@ -353,6 +358,15 @@ export async function run() {
             }
         }
     }
+}
+
+async function logSafeRestartStatus(result) {
+    if (!result?.safeToRetry) {
+        return;
+    }
+
+    await log("STATE IS SAFE TO RESTART - Relaunch the game normally; " +
+        "no hard reboot needed.");
 }
 
 function formatCanaryFlipSummary(qualifiedFlips, positiveWaves) {
@@ -873,21 +887,42 @@ async function runTrackedAttempt(canaryTimingSchedule,
         const lightCleanupComplete = attemptState.lightCleanupVerified &&
             attemptState.holeCleanupVerified && trackingEnded;
         await log(lightCleanupComplete
-            ? "Temporary handles closed; fspSrv and candidate storage remain open."
-            : "Cleanup incomplete; fspSrv and candidate storage remain open.");
+            ? "Temporary handles closed.\nfspSrv and candidate storage remain open."
+            : "Cleanup incomplete.\nfspSrv and candidate storage remain open.");
     } else if (attemptState.pidPromotionVerified) {
         const cleanupComplete = attemptState.cleanupVerified &&
             attemptState.holeCleanupVerified && trackingEnded &&
             attemptState.promotionTestHandlesClosed;
         await log(cleanupComplete
-            ? "Promotion complete; temporary handles closed; PID fields remain promoted."
-            : "Promotion complete; cleanup incomplete; PID fields remain promoted.");
+            ? "Promotion complete; temporary handles closed.\nPID fields remain promoted."
+            : "Promotion complete, but cleanup incomplete.\nPID fields remain promoted.");
     } else if (attemptState.safeToRetry) {
-        await log(attemptState.cleanupVerified
-            ? "Cleanup complete."
-            : "Cleanup is sufficient for another attempt.");
-    } else {
-        await log("Cleanup failed; another attempt is unsafe.");
+        await log("STATE IS SAFE - continuing.");
+    } else if (!attemptState.retainedEndpointActive &&
+        attemptState.cacheRetirementVerified &&
+        attemptState.workerStateSafe &&
+        attemptState.workersQuiesced &&
+        !executionError) {
+        // The cache readback is a separate requirement: a clean entry avoids
+        // the dirty-flush hazard, but does not prove a fresh storage handle
+        // can no longer observe the alias.
+        await log("STATE IS SAFE TO RESTART - Relaunch the game normally; " +
+            "no hard reboot needed.");
+    } else if (!(attemptState.retainedEndpointActive &&
+            !attemptState.cacheRetirementVerified)) {
+        // No dedicated verdict fires for this ending: keep the explicit
+        // unknown-state instruction instead of a vague cleanup note.
+        await log("STATE IS UNKNOWN - hard reboot now " +
+            "(hold Power for 15 seconds).");
+    }
+
+    // The promotion-retained path keeps the endpoint on purpose, so an
+    // unretired cache there is not a retirement failure.
+    if (!attemptState.promotionRetained &&
+        attemptState.retainedEndpointActive &&
+        !attemptState.cacheRetirementVerified) {
+        await log(formatUnsafeState(
+            "Retained endpoint is active and cache retirement failed."));
     }
 
     if (executionError)
@@ -904,6 +939,8 @@ async function runTrackedAttempt(canaryTimingSchedule,
         if (!timingPersistence?.resetRequested)
             await clearVisualLog();
         await log("You just Civ Sevened your machine, congrats");
+        await log("Cleanup verified: the god fsp-srv handle and its " +
+            "storage remain.");
         if (timingPersistence?.adjustedThisRun &&
             !timingPersistence.resetRequested &&
             !timingPersistence.savedThisRun) {
@@ -1073,8 +1110,8 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
     const stopAndCleanup = async options => {
         cleanupAttempted = true;
         await beginCleanupLog(attemptState);
-        // Cleanup may itself launch cache-retirement waves. If that throws,
-        // keep the allocation scope alive because a worker may still use it.
+        // If cleanup throws while a worker may still use its buffers, keep
+        // the allocation scope alive for the guarded fallback cleanup.
         attemptState.workersQuiesced = false;
         const cleanupOptions = {...options,
             dirtyFileSize: config.DIRTY_FILE_SIZE,
@@ -1820,7 +1857,8 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
             temporaryHandle: 0,
             triggerHandle: handles.triggerHandle,
             workerStateSafe: promotion.workerStateSafe,
-            dirtyFileSize: config.DIRTY_FILE_SIZE
+            dirtyFileSize: config.DIRTY_FILE_SIZE,
+            dirtyFilePath: scratch.dirtyFilePath
         });
 
         attemptState.promotionRetained = true;
@@ -1863,6 +1901,7 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
                 (promotion.addressCopy || address.addressCopy)
                     .candidateCacheNeedsRetirement),
         candidateHandle: handles.candidateHandle,
+        rootSession: handles.rootSession,
         retireRetainedEndpoint: promotion.retireRetainedEndpoint,
         workerStateSafe: promotion.workerStateSafe
     });
@@ -1899,7 +1938,8 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
         temporaryHandle: 0,
         triggerHandle: handles.triggerHandle,
         workerStateSafe: retired.workerStateSafe,
-        dirtyFileSize: config.DIRTY_FILE_SIZE
+        dirtyFileSize: config.DIRTY_FILE_SIZE,
+        dirtyFilePath: scratch.dirtyFilePath
     });
 
     await verboseLog(formatCleanupResult(cleanup, retired.workerStateSafe));
@@ -1953,6 +1993,7 @@ async function performStopAndCleanup({
                 candidateCacheNeedsRetirement ||
                 Boolean(addressCopy?.candidateCacheNeedsRetirement),
             candidateHandle: retired.candidateHandle,
+            rootSession: handles?.rootSession || 0,
             retireRetainedEndpoint: null,
             workerStateSafe: Boolean(workerStateSafe)
         });
@@ -1986,7 +2027,8 @@ async function performStopAndCleanup({
             ? 0 : handles?.temporaryHandle || 0,
         triggerHandle: handles?.triggerHandle || 0,
         workerStateSafe: finalWorkerStateSafe,
-        dirtyFileSize
+        dirtyFileSize,
+        dirtyFilePath: scratch?.dirtyFilePath || ""
     });
 
     await verboseLog(formatCleanupResult(cleanup, finalWorkerStateSafe));
