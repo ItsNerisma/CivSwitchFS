@@ -54,25 +54,21 @@ Restart Civilization VII, then load the save prepared for CivSwitchFS. The persi
 
 #### Controls
 
-- **X**: use the built-in timings from the next attempt and delete `save:/civswitchfs/timings.json` when the current run ends
 - **B** or **Cancel**: finish the current wave, clean up, then stop without starting more waves or attempts
 - **Y**: toggle between normal and verbose summaries
 
 These controls work while the exploit is running. 
 
-#### Timing calibration
+#### Race timing schedule
 
-Without a valid saved timing file, the active workers start with these delays, in nanoseconds:
+The canary campaign uses this fixed schedule, in nanoseconds:
 
 - W0-W6, in role order: `0`, `300000`, `350000`, `450000`, `550000`, `650000`, `1000000`
 - W9 release: `1700000`
 - W10-W11 guards, after release: `150000`, `300000`
 - W7 and W8 filler workers are disabled. W12 is gate-driven and does not use this delay list.
 
-> [!NOTE]
-> The campaign can adjust timings from measured results. Adjusted timings are saved to `save:/civswitchfs/timings.json` after a successful run and reused on the next launch. Press X to return to the built-in timings.
-
-The built-in delays are defined in [src/core/config.mjs](src/core/config.mjs).
+The payload reads these values from [src/core/config.mjs](src/core/config.mjs). It does not load or save timing schedules in save data. Change the source values to retune the schedule.
 
 ---
 
@@ -80,14 +76,14 @@ The built-in delays are defined in [src/core/config.mjs](src/core/config.mjs).
 
 - **`You just Civ Sevened your machine, congrats`**: the exploit succeeded and the elevated session is available as `globalThis.fspSrv` for follow-up payloads.
 - **`CANARY FLIPPED`**: the race qualification passed. The payload is still checking memory and promoting the filesystem session. Wait for the success message.
-- **`Canary did not flip.`**: this attempt did not qualify the race, so later stages were skipped. The campaign may adjust timings and retry. If the final status says `STATE IS SAFE TO RESTART`, restart the game to launch another run.
+- **`Canary did not flip.`**: this attempt did not qualify the race, so later stages were skipped. The campaign retries with the configured schedule. If the final status says `STATE IS SAFE TO RESTART`, restart the game to launch another run.
 - **`STATE IS SAFE TO RESTART`**: no dirty retained cache endpoint remains. Restart Civilization VII normally.
 - **`STATE IS UNSAFE`**: do not close the game or reboot normally. Hard reboot by holding the power button for 15 seconds. See [the hard reboot explanation](BRICK_RISKS.md#why-a-hard-reboot-is-the-safe-option-here).
 - **`STATE IS UNKNOWN`**: cleanup could not be verified. Treat it as unsafe and hard reboot as described above.
 
 If failures continue across several runs with the same symptoms (no canary flip, memory adress not found), I recommend starting from a fresh Civ VII save and software data:
 
-- Delete Civ VII save data in **System Settings > Data Management > Delete Save Data**. This also removes CivSwitchFS persistence and saved timings because they live in the game save.
+- Delete Civ VII save data in **System Settings > Data Management > Delete Save Data**. This also removes CivSwitchFS persistence stored in the game save.
 - For a physical cartridge, eject it, select Civilization VII on the HOME menu, press **+**, then choose **Data Management > Delete Software**. Reinsert the cartridge afterward.
 - Set up CivSwitch again, run `npm run persist -- <console-ip>` while its loader is reachable, then restart Civilization VII and load the prepared save.
 

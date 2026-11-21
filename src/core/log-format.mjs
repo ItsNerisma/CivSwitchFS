@@ -457,24 +457,6 @@ const CANARY_STATE_LABELS = {
 export function formatCanaryResult(control, config) {
     if (!control) return "Canary run failed before returning a result.";
 
-    const adjustmentTotals = Object.create(null);
-    for (const adjustment of control.timingAdjustments || []) {
-        adjustmentTotals[adjustment.role] =
-            (adjustmentTotals[adjustment.role] || 0) + adjustment.deltaUs;
-    }
-    const timingAdjustments = Object.keys(adjustmentTotals).sort()
-        .filter(role => Math.abs(adjustmentTotals[role]) >= 0.5)
-        .map(role => role + ":" +
-            (adjustmentTotals[role] >= 0 ? "+" : "") +
-            adjustmentTotals[role].toFixed(0) + "us")
-        .join(",");
-    const adjustedFromControls = (control.timingAdjustments || []).some(
-        adjustment => adjustment.source === "control");
-    const timingAdjustmentSuffix = timingAdjustments
-        ? "; next-attempt timing adjustments={" + timingAdjustments + "}" +
-            (adjustedFromControls ? " from control waves" : "")
-        : "";
-
     const counts = control.profileCounts || {};
     const controls = [
         ["pin", (counts["abort-control"] || 0) > 0,
@@ -522,7 +504,7 @@ export function formatCanaryResult(control, config) {
             : "controls incomplete";
 
     if (control.canaryQualified)
-        return "CANARY FLIPPED · " + positiveSummary + timingAdjustmentSuffix;
+        return "CANARY FLIPPED · " + positiveSummary;
 
     const outcome = control.campaignState === "worker-unsafe"
         ? "Canary aborted"
@@ -535,7 +517,7 @@ export function formatCanaryResult(control, config) {
         " · " + positiveSummary +
         " · workers=" + (control.workerStateSafe ? "safe" : "unsafe") +
         " · stop=" + humanStopReason(control) +
-        issueSummary + timingAdjustmentSuffix;
+        issueSummary;
 }
 
 

@@ -67,20 +67,12 @@ const {
     beginAllocationTracking,
     checkWindow,
     closeHandle,
-    cloneObject,
     cmifReply,
     endAllocationTracking,
     extractRoleTimings,
     freeTrackedAllocations,
-    getMountHandle,
     ipcCommitChecked,
-    ipcCreateDirectoryChecked,
-    ipcDeleteFileChecked,
     ipcDeleteDirectoryRecursivelyChecked,
-    ipcGetEntryTypeChecked,
-    ipcReadFileChecked,
-    ipcRenameFileChecked,
-    ipcWriteFileChecked,
     prepPacket,
     read32,
     readAllocationCounters,
@@ -91,17 +83,10 @@ const {
 } = coreRuntime;
 
 const BASE_ATTEMPTS = 10;
-const MAX_TOTAL_ATTEMPTS = 30;
+const MAX_TOTAL_ATTEMPTS = BASE_ATTEMPTS + 1; // Final allocation-order fallback.
 const RETRY_PAUSE_MS = 100;
 const SCRATCH_DIR = "/hole";
 const NOT_FOUND = 0x202;
-const TIMING_SAVE_DIR = "/civswitchfs";
-const TIMING_SAVE_PATH = TIMING_SAVE_DIR + "/timings.json";
-const TIMING_SAVE_TEMP_PATH = TIMING_SAVE_PATH + ".tmp";
-const TIMING_SAVE_DISPLAY_PATH = "save:" + TIMING_SAVE_PATH;
-const TIMING_SAVE_VERSION = 1;
-const MAX_TIMING_SAVE_BYTES = 1024;
-const MAX_TIMING_DELAY_NS = 10000000;
 
 // ---------------------------------------------------------------------------
 // Entry point (bounded retry loop)
@@ -118,37 +103,22 @@ export async function run() {
 
     const previousVerboseLogging = setVerboseLogging(
         VERBOSE_LOGGING || experimentMode);
-    const timingPersistence = {
-        checked: false,
-        loaded: false,
-        adjustedThisRun: false,
-        savedThisRun: false,
-        deletedThisRun: false,
-        resetRequested: false,
-        resetPending: false,
-        useDefaultsThisAttempt: false,
+    const runControl = {
         stopRequested: false,
-        saveError: null,
-        resetLogPromise: Promise.resolve(),
         stopLogPromise: Promise.resolve(),
         verbosityLogPromise: Promise.resolve(),
         currentAttempt: 0,
         deferredWaveLogLines: []
     };
-    const builtInTimingSchedule = {
-        roleDelays: defaultTimingConfig.roleDelays.slice(),
-        guardDelays: defaultTimingConfig.guardDelays.slice(),
-        baselineRoleDelays: defaultTimingConfig.roleDelays.slice(),
-        baselineGuardDelays: defaultTimingConfig.guardDelays.slice()
-    };
     let inputControls = null;
     let positiveAttemptsTotal = 0;
+    let positiveWindowsTotal = 0;
     let qualifiedCanaryFlipsTotal = 0;
 
     try {
         function queueVerbosityMessage(message) {
-            timingPersistence.verbosityLogPromise =
-                timingPersistence.verbosityLogPromise.then(() => log(message))
+            runControl.verbosityLogPromise =
+                runControl.verbosityLogPromise.then(() => log(message))
                     .catch(() => {});
         }
 
@@ -160,29 +130,17 @@ export async function run() {
                     ? "Verbose logging enabled (controller Y switches to normal)."
                     : "Normal logging enabled.");
             },
-            onResetTimings() {
-                timingPersistence.resetRequested = true;
-                timingPersistence.resetPending = true;
-                timingPersistence.resetLogPromise =
-                    timingPersistence.resetLogPromise.then(() => log(
-                        "X pressed: the next attempt, if one runs, will use built-in timings; " +
-                        TIMING_SAVE_DISPLAY_PATH +
-                        " will be deleted when this run ends.")
-                    ).catch(() => {});
-            },
             onStop() {
-                if (timingPersistence.stopRequested) return;
-                timingPersistence.stopRequested = true;
-                timingPersistence.stopLogPromise = log(
+                if (runControl.stopRequested) return;
+                runControl.stopRequested = true;
+                runControl.stopLogPromise = log(
                     "B/cancel pressed: stop requested. The current wave, if any, will finish; " +
                     "no further waves or attempts will launch.")
                     .catch(() => {});
             }
         });
 
-        let canaryTimingSchedule = null;
         let attemptLimit = BASE_ATTEMPTS;
-        let positiveWindowsTotal = 0;
         let usePreReservation = false;
         let preReservationFallbackUsed = false;
 
@@ -194,33 +152,23 @@ export async function run() {
         await log(isVerboseLogging()
             ? "Verbose logging is on (controller Y toggles the mode)."
             : "Normal logging is on (controller Y enables verbose summaries).");
-        await log("Checking for saved timings...");
+        await log("Using the built-in race timing schedule.");
         for (let attempt = 1; attempt <= attemptLimit; attempt++) {
-            if (timingPersistence.stopRequested) return;
+            if (runControl.stopRequested) return;
             await log("======== ATTEMPT " + attempt + " ========");
             if (usePreReservation) {
                 await log("Retrying with the reservation group opened before " +
                     "candidate storage.");
             }
-            if (timingPersistence.stopRequested) return;
-            timingPersistence.currentAttempt = attempt;
-            if (timingPersistence.resetPending) {
-                canaryTimingSchedule = copyCanaryTimingSchedule(
-                    builtInTimingSchedule);
-                timingPersistence.resetPending = false;
-                timingPersistence.useDefaultsThisAttempt = true;
-            } else {
-                timingPersistence.useDefaultsThisAttempt = false;
-            }
-            // The hard-cap attempt verifies the last schedule without retuning.
-            const result = await runTrackedAttempt(canaryTimingSchedule,
-                attempt < MAX_TOTAL_ATTEMPTS, timingPersistence,
-                usePreReservation);
+            if (runControl.stopRequested) return;
+            runControl.currentAttempt = attempt;
+            const result = await runTrackedAttempt(usePreReservation,
+                runControl);
             positiveAttemptsTotal += result.positiveAttempts || 0;
             positiveWindowsTotal += result.positiveWindows || 0;
             qualifiedCanaryFlipsTotal += result.qualifiedCanaryFlips || 0;
 
-            if (timingPersistence.stopRequested || result.stoppedByUser) {
+            if (runControl.stopRequested || result.stoppedByUser) {
                 await logSafeRestartStatus(result);
                 return;
             }
@@ -235,25 +183,6 @@ export async function run() {
 
             if (!result.safeToRetry) {
                 return;
-            }
-
-            canaryTimingSchedule = copyCanaryTimingSchedule(
-                result.canaryTimingSchedule) || canaryTimingSchedule;
-
-            if (result.timingAdjustments?.length) {
-                const timingSource = result.timingAdjustments.some(
-                    adjustment => adjustment.source === "control")
-                    ? " from control waves" : "";
-                if (attemptLimit < MAX_TOTAL_ATTEMPTS) {
-                    attemptLimit++;
-                    await log("Timing changed" + timingSource +
-                        "; extending the campaign to " +
-                        attemptLimit + " attempts so the adjusted schedule can be tested.");
-                } else if (attempt < MAX_TOTAL_ATTEMPTS) {
-                    await log("Timing changed" + timingSource + "; attempt " +
-                        MAX_TOTAL_ATTEMPTS +
-                        " is reserved to validate the adjusted schedule.");
-                }
             }
 
             if (result.retryWithPreReservation &&
@@ -306,34 +235,9 @@ export async function run() {
     } finally {
         await waitMs(0);
         try {
-            await timingPersistence.verbosityLogPromise;
-            if (timingPersistence.stopRequested)
-                await timingPersistence.stopLogPromise;
-            if (timingPersistence.resetRequested) {
-                await timingPersistence.resetLogPromise;
-                await log("Deleting saved timing configuration...");
-                let deleted;
-                try {
-                    deleted = deleteTimingScheduleFromFreshSaveHandle();
-                } catch (error) {
-                    deleted = {ok: false,
-                        error: String(error?.message || error)};
-                }
-                if (deleted.ok) {
-                    timingPersistence.deletedThisRun = true;
-                    await log(deleted.deletedPaths.length
-                        ? "Deleted saved timing configuration from " +
-                            TIMING_SAVE_DISPLAY_PATH + "."
-                        : "No saved timing configuration remained at " +
-                            TIMING_SAVE_DISPLAY_PATH + ".");
-                } else {
-                    await log("Could not delete saved timing configuration from " +
-                        TIMING_SAVE_DISPLAY_PATH + " (" + deleted.error + ").");
-                }
-                if (deleted.cleanupWarning)
-                    await verboseLog("Timing config deletion cleanup: " +
-                        deleted.cleanupWarning);
-            }
+            await runControl.verbosityLogPromise;
+            if (runControl.stopRequested)
+                await runControl.stopLogPromise;
         } finally {
             inputControls?.clearRunActions?.();
             inputControls?.dispose?.();
@@ -346,7 +250,7 @@ export async function run() {
                 }
 
                 await flushDeferredWaveLogLines(
-                    timingPersistence.deferredWaveLogLines,
+                    runControl.deferredWaveLogLines,
                     finalSummary);
             } catch (error) {
                 try {
@@ -381,47 +285,6 @@ function formatCanaryFlipSummary(qualifiedFlips, positiveWaves) {
         qualifiedFlips + "/" + positiveWaves + " positive waves).";
 }
 
-function copyCanaryTimingSchedule(schedule) {
-    if (!schedule || !Array.isArray(schedule.roleDelays) ||
-        !Array.isArray(schedule.guardDelays) ||
-        !Array.isArray(schedule.baselineRoleDelays) ||
-        !Array.isArray(schedule.baselineGuardDelays)) return null;
-    return {
-        roleDelays: schedule.roleDelays.slice(),
-        guardDelays: schedule.guardDelays.slice(),
-        baselineRoleDelays: schedule.baselineRoleDelays.slice(),
-        baselineGuardDelays: schedule.baselineGuardDelays.slice()
-    };
-}
-
-function formatFinalTimingSchedule(schedule, timingPersistence) {
-    if (!schedule || !isValidTimingValues(
-        schedule.roleDelays, schedule.guardDelays)) {
-        return ["Final timing values are unavailable."];
-    }
-
-    if (timingPersistence?.resetRequested) {
-        return [];
-    }
-
-    if (timingPersistence?.adjustedThisRun &&
-        !timingPersistence.savedThisRun) {
-        return [
-            "Adjusted timings could not be saved to " +
-                TIMING_SAVE_DISPLAY_PATH + "; current values:",
-            "var roleDelays = [" + schedule.roleDelays.join(", ") + "];",
-            "var guardDelays = [" + schedule.guardDelays.join(", ") + "];"
-        ];
-    }
-
-    if (timingPersistence?.savedThisRun || timingPersistence?.loaded) {
-        return ["Adjusted timings have been saved in " +
-            TIMING_SAVE_DISPLAY_PATH + "."];
-    }
-
-    return [];
-}
-
 async function beginCleanupLog(attemptState) {
     if (attemptState.cleanupLogStarted) return;
     attemptState.cleanupLogStarted = true;
@@ -449,324 +312,6 @@ async function flushDeferredWaveLogLines(lines, finalSummary = null) {
     await log("Log display done");
 }
 
-function isValidTimingArray(values, expectedLength) {
-    if (!Array.isArray(values) || values.length !== expectedLength ||
-        !values.every(value => Number.isSafeInteger(value) && value >= 0 &&
-            value <= MAX_TIMING_DELAY_NS)) return false;
-    for (let i = 1; i < values.length; i++)
-        if (values[i] - values[i - 1] < 50000) return false;
-    return true;
-}
-
-function isValidTimingValues(roleDelays, guardDelays) {
-    return isValidTimingArray(roleDelays, 10) &&
-        isValidTimingArray(guardDelays, 2);
-}
-
-function loadTimingScheduleFromSave(handle) {
-    if (!handle) return {status: "unavailable", detail: "save handle unavailable"};
-
-    let result = {status: "unavailable", detail: "timing file unavailable"};
-    try {
-        const entry = ipcGetEntryTypeChecked(handle, TIMING_SAVE_PATH);
-        if (entry.transport !== 0) {
-            result = {status: "unavailable", detail: "entry transport " +
-                timingHex(entry.transport)};
-        } else if (entry.result === NOT_FOUND) {
-            result = {status: "missing"};
-        } else if (entry.result !== 0) {
-            result = {status: "unavailable", detail: "entry result " +
-                timingHex(entry.result)};
-        } else if (entry.type !== 1) {
-            result = {status: "invalid", detail: "timing path is not a file"};
-        } else {
-            const read = ipcReadFileChecked(handle, TIMING_SAVE_PATH,
-                MAX_TIMING_SAVE_BYTES);
-            if (!read.ok) {
-                result = {status: "invalid", detail: "read " + read.stage +
-                    (read.transport !== null && read.transport !== 0
-                        ? " transport " + timingHex(read.transport) : "") +
-                    (read.result !== null && read.result !== 0
-                        ? " result " + timingHex(read.result) : "")};
-            } else {
-                let json = "";
-                for (const byte of read.bytes)
-                    json += String.fromCharCode(byte);
-                const data = JSON.parse(json);
-                if (data?.version !== TIMING_SAVE_VERSION ||
-                    !isValidTimingValues(data.roleDelays, data.guardDelays)) {
-                    result = {status: "invalid",
-                        detail: "unsupported or invalid timing data"};
-                } else {
-                    result = {status: "loaded", schedule: {
-                        roleDelays: data.roleDelays.slice(),
-                        guardDelays: data.guardDelays.slice()
-                    }};
-                }
-            }
-        }
-    } catch (error) {
-        result = {status: "invalid", detail: String(error?.message || error)};
-    }
-    return result;
-}
-
-function persistTimingSchedule(handle, schedule) {
-    if (!handle || !schedule || !isValidTimingValues(
-        schedule.roleDelays, schedule.guardDelays)) {
-        return {ok: false, error: "invalid timing schedule or save handle"};
-    }
-
-    try {
-        const directory = ipcGetEntryTypeChecked(handle, TIMING_SAVE_DIR);
-        if (directory.transport !== 0)
-            throw new Error("directory transport " + timingHex(directory.transport));
-        if (directory.result === NOT_FOUND) {
-            requireTimingFsSuccess("create directory",
-                ipcCreateDirectoryChecked(handle, TIMING_SAVE_DIR));
-        } else if (directory.result !== 0) {
-            throw new Error("directory result " + timingHex(directory.result));
-        } else if (directory.type !== 0) {
-            throw new Error("timing directory path is not a directory");
-        }
-
-        const tempEntry = ipcGetEntryTypeChecked(handle, TIMING_SAVE_TEMP_PATH);
-        if (tempEntry.transport !== 0)
-            throw new Error("temporary entry transport " + timingHex(tempEntry.transport));
-        if (tempEntry.result === 0) {
-            if (tempEntry.type !== 1)
-                throw new Error("temporary timing path is not a file");
-            requireTimingFsSuccess("remove stale temporary file",
-                ipcDeleteFileChecked(handle, TIMING_SAVE_TEMP_PATH));
-        } else if (tempEntry.result !== NOT_FOUND) {
-            throw new Error("temporary entry result " + timingHex(tempEntry.result));
-        }
-
-        const serialized = JSON.stringify({version: TIMING_SAVE_VERSION,
-            roleDelays: schedule.roleDelays,
-            guardDelays: schedule.guardDelays});
-        const bytes = [];
-        for (let i = 0; i < serialized.length; i++)
-            bytes.push(serialized.charCodeAt(i));
-        const written = ipcWriteFileChecked(handle, TIMING_SAVE_TEMP_PATH, bytes);
-        if (!written.ok)
-            throw new Error("write temporary file " + written.stage +
-                (written.transport !== null && written.transport !== 0
-                    ? " transport " + timingHex(written.transport) : "") +
-                (written.result !== null && written.result !== 0
-                    ? " result " + timingHex(written.result) : ""));
-
-        const staged = ipcReadFileChecked(handle, TIMING_SAVE_TEMP_PATH,
-            MAX_TIMING_SAVE_BYTES);
-        if (!staged.ok)
-            throw new Error("temporary file readback " + staged.stage +
-                (staged.transport !== null && staged.transport !== 0
-                    ? " transport " + timingHex(staged.transport) : "") +
-                (staged.result !== null && staged.result !== 0
-                    ? " result " + timingHex(staged.result) : ""));
-        const stagedMismatch = timingBytesMismatch(bytes, staged.bytes);
-        if (stagedMismatch)
-            throw new Error("temporary file readback mismatch: " + stagedMismatch);
-
-        const targetEntry = ipcGetEntryTypeChecked(handle, TIMING_SAVE_PATH);
-        if (targetEntry.transport !== 0)
-            throw new Error("target entry transport " + timingHex(targetEntry.transport));
-        if (targetEntry.result === 0) {
-            if (targetEntry.type !== 1)
-                throw new Error("timing save path is not a file");
-            requireTimingFsSuccess("remove old timing file",
-                ipcDeleteFileChecked(handle, TIMING_SAVE_PATH));
-        } else if (targetEntry.result !== NOT_FOUND) {
-            throw new Error("target entry result " + timingHex(targetEntry.result));
-        }
-
-        requireTimingFsSuccess("publish timing file",
-            ipcRenameFileChecked(handle, TIMING_SAVE_TEMP_PATH,
-                TIMING_SAVE_PATH));
-        requireTimingFsSuccess("commit timing file", ipcCommitChecked(handle));
-
-        const saved = ipcReadFileChecked(handle, TIMING_SAVE_PATH,
-            MAX_TIMING_SAVE_BYTES);
-        if (!saved.ok)
-            throw new Error("saved timing file readback " + saved.stage +
-                (saved.transport !== null && saved.transport !== 0
-                    ? " transport " + timingHex(saved.transport) : "") +
-                (saved.result !== null && saved.result !== 0
-                    ? " result " + timingHex(saved.result) : ""));
-        const savedMismatch = timingBytesMismatch(bytes, saved.bytes);
-        if (savedMismatch)
-            throw new Error("saved timing file readback mismatch: " + savedMismatch);
-        return {ok: true};
-    } catch (error) {
-        return {ok: false, error: String(error?.message || error)};
-    }
-}
-
-function persistTimingScheduleFromFreshSaveHandle(schedule) {
-    const tracker = beginAllocationTracking();
-    if (!tracker)
-        return {ok: false, error: "could not start save allocation tracking"};
-
-    let handle = 0;
-    let result = {ok: false, error: "save mount unavailable"};
-    let cleanupWarning = null;
-    try {
-        const mount = getMountHandle("save");
-        if (!mount) throw new Error("save mount unavailable");
-        handle = cloneObject(mount.handle, mount.objId);
-        if (!handle) throw new Error("could not clone save mount");
-        result = persistTimingSchedule(handle, schedule);
-    } catch (error) {
-        result = {ok: false, error: String(error?.message || error)};
-    } finally {
-        if (handle) {
-            try {
-                const closeResult = Number(closeHandle(handle)) >>> 0;
-                if (closeResult !== 0)
-                    cleanupWarning = "save handle close " + timingHex(closeResult);
-            } catch (error) {
-                cleanupWarning = "save handle close threw: " +
-                    String(error?.message || error);
-            }
-        }
-
-        if (!endAllocationTracking(tracker)) {
-            cleanupWarning = (cleanupWarning ? cleanupWarning + "; " : "") +
-                "save allocation tracking did not end cleanly";
-        } else {
-            const freed = freeTrackedAllocations(tracker);
-            if (!freed.ok)
-                cleanupWarning = (cleanupWarning ? cleanupWarning + "; " : "") +
-                    "save buffer cleanup failed";
-        }
-    }
-
-    if (cleanupWarning) result.cleanupWarning = cleanupWarning;
-    return result;
-}
-
-function deleteTimingSchedule(handle) {
-    if (!handle) return {ok: false, error: "save handle unavailable"};
-
-    const deletedPaths = [];
-    const errors = [];
-    for (const path of [TIMING_SAVE_PATH, TIMING_SAVE_TEMP_PATH]) {
-        try {
-            const entry = ipcGetEntryTypeChecked(handle, path);
-            if (entry.transport !== 0)
-                throw new Error("entry transport " + timingHex(entry.transport));
-            if (entry.result === NOT_FOUND) continue;
-            if (entry.result !== 0)
-                throw new Error("entry result " + timingHex(entry.result));
-            if (entry.type !== 1)
-                throw new Error("timing path is not a file: " + path);
-
-            requireTimingFsSuccess("delete " + path,
-                ipcDeleteFileChecked(handle, path));
-            deletedPaths.push(path);
-        } catch (error) {
-            errors.push(path + ": " + String(error?.message || error));
-        }
-    }
-
-    if (deletedPaths.length) {
-        try {
-            requireTimingFsSuccess("commit timing config deletion",
-                ipcCommitChecked(handle));
-        } catch (error) {
-            errors.push(String(error?.message || error));
-        }
-        for (const path of deletedPaths) {
-            try {
-                const entry = ipcGetEntryTypeChecked(handle, path);
-                if (entry.transport !== 0)
-                    throw new Error("verify deletion transport " +
-                        timingHex(entry.transport));
-                if (entry.result !== NOT_FOUND)
-                    throw new Error("verify deletion result " +
-                        timingHex(entry.result));
-            } catch (error) {
-                errors.push("verify " + path + ": " +
-                    String(error?.message || error));
-            }
-        }
-    }
-
-    return errors.length
-        ? {ok: false, error: errors.join("; "), deletedPaths}
-        : {ok: true, deletedPaths};
-}
-
-function deleteTimingScheduleFromFreshSaveHandle() {
-    const tracker = beginAllocationTracking();
-    if (!tracker)
-        return {ok: false, error: "could not start save allocation tracking"};
-
-    let handle = 0;
-    let result = {ok: false, error: "save mount unavailable"};
-    let cleanupWarning = null;
-    try {
-        const mount = getMountHandle("save");
-        if (!mount) throw new Error("save mount unavailable");
-        handle = cloneObject(mount.handle, mount.objId);
-        if (!handle) throw new Error("could not clone save mount");
-        result = deleteTimingSchedule(handle);
-    } catch (error) {
-        result = {ok: false, error: String(error?.message || error)};
-    } finally {
-        if (handle) {
-            try {
-                const closeResult = Number(closeHandle(handle)) >>> 0;
-                if (closeResult !== 0)
-                    cleanupWarning = "save handle close " + timingHex(closeResult);
-            } catch (error) {
-                cleanupWarning = "save handle close threw: " +
-                    String(error?.message || error);
-            }
-        }
-
-        if (!endAllocationTracking(tracker)) {
-            cleanupWarning = (cleanupWarning ? cleanupWarning + "; " : "") +
-                "save allocation tracking did not end cleanly";
-        } else {
-            const freed = freeTrackedAllocations(tracker);
-            if (!freed.ok)
-                cleanupWarning = (cleanupWarning ? cleanupWarning + "; " : "") +
-                    "save buffer cleanup failed";
-        }
-    }
-
-    if (cleanupWarning) result.cleanupWarning = cleanupWarning;
-    return result;
-}
-
-function requireTimingFsSuccess(operation, reply) {
-    if (reply.transport !== 0)
-        throw new Error(operation + " transport " + timingHex(reply.transport));
-    if (reply.result !== 0)
-        throw new Error(operation + " result " + timingHex(reply.result));
-}
-
-function timingBytesMismatch(expected, actual) {
-    if (!actual) return "no bytes returned";
-    if (expected.length !== actual.length)
-        return "length expected " + expected.length + ", got " + actual.length;
-    for (let i = 0; i < expected.length; i++) {
-        if (expected[i] !== actual[i])
-            return "byte " + i + " expected " + timingByteHex(expected[i]) +
-                ", got " + timingByteHex(actual[i]);
-    }
-    return null;
-}
-
-function timingByteHex(value) {
-    return "0x" + (Number(value) & 0xFF).toString(16).padStart(2, "0");
-}
-
-function timingHex(value) {
-    return "0x" + (Number(value) >>> 0).toString(16).padStart(8, "0");
-}
-
 function reportAddressProgress(message) {
     if (typeof message !== "string") return Promise.resolve();
 
@@ -783,9 +328,8 @@ function reportAddressProgress(message) {
 // Tracked attempt (one full attempt with allocation tracking)
 // ---------------------------------------------------------------------------
 
-async function runTrackedAttempt(canaryTimingSchedule,
-    allowTimingAdjustments = true, timingPersistence = null,
-    usePreReservation = false) {
+async function runTrackedAttempt(usePreReservation = false,
+    runControl = null) {
     const attemptState = {
         usePreReservation: usePreReservation === true,
         preReservationTested: false,
@@ -794,10 +338,8 @@ async function runTrackedAttempt(canaryTimingSchedule,
         stoppedByUser: false,
         qualifiedCanaryFlips: 0,
         pidPromotionVerified: false,
-        canaryTimingSchedule: copyCanaryTimingSchedule(canaryTimingSchedule),
         positiveAttempts: 0,
         positiveWindows: 0,
-        timingAdjustments: [],
         promotionRestored: false,
         cleanupVerified: false,
         workerStateSafe: true,
@@ -833,8 +375,7 @@ async function runTrackedAttempt(canaryTimingSchedule,
     let executionError = null;
 
     try {
-        await runPayload(attemptState, allowTimingAdjustments,
-            timingPersistence);
+        await runPayload(attemptState, runControl);
     } catch (error) {
         const errorName = error?.name && error.name !== "Error"
             ? error.name + ": " : "";
@@ -935,36 +476,10 @@ async function runTrackedAttempt(canaryTimingSchedule,
         attemptState.holeCleanupVerified &&
         trackingEnded);
     if (completedWithCleanSession) {
-        if (!timingPersistence?.resetRequested)
-            await clearVisualLog();
+        await clearVisualLog();
         await log("You just Civ Sevened your machine, congrats");
         await log("Cleanup verified: the god fsp-srv handle and its " +
             "storage remain.");
-        if (timingPersistence?.adjustedThisRun &&
-            !timingPersistence.resetRequested &&
-            !timingPersistence.savedThisRun) {
-            await log("Saving adjusted timings...");
-            const saved = persistTimingScheduleFromFreshSaveHandle(
-                attemptState.canaryTimingSchedule);
-            if (saved.ok) {
-                timingPersistence.savedThisRun = true;
-                timingPersistence.saveError = null;
-                if (saved.cleanupWarning)
-                    await verboseLog("Timing save cleanup: " +
-                        saved.cleanupWarning);
-            } else {
-                timingPersistence.saveError = saved.error;
-                await log("Could not save adjusted timings (" +
-                    saved.error + "); keeping them for this run.");
-                if (saved.cleanupWarning)
-                    await verboseLog("Timing save cleanup: " +
-                        saved.cleanupWarning);
-            }
-        }
-        for (const line of formatFinalTimingSchedule(
-            attemptState.canaryTimingSchedule, timingPersistence)) {
-            await log(line);
-        }
     }
 
     return attemptState;
@@ -975,27 +490,8 @@ async function runTrackedAttempt(canaryTimingSchedule,
 // Main payload (single attempt)
 // ---------------------------------------------------------------------------
 
-async function runPayload(attemptState, allowTimingAdjustments = true,
-    timingPersistence = null) {
+async function runPayload(attemptState, runControl = null) {
     const config = createFspIdentityConfig();
-    const timingBaseline = {
-        roleDelays: config.roleDelays.slice(),
-        guardDelays: config.guardDelays.slice()
-    };
-    const carriedSchedule = copyCanaryTimingSchedule(
-        attemptState.canaryTimingSchedule);
-    if (!timingPersistence?.useDefaultsThisAttempt && carriedSchedule &&
-        carriedSchedule.roleDelays.length === config.roleDelays.length &&
-        carriedSchedule.guardDelays.length === config.guardDelays.length &&
-        carriedSchedule.baselineRoleDelays.length === config.roleDelays.length &&
-        carriedSchedule.baselineGuardDelays.length === config.guardDelays.length) {
-        config.roleDelays.splice(0, config.roleDelays.length,
-            ...carriedSchedule.roleDelays);
-        config.guardDelays.splice(0, config.guardDelays.length,
-            ...carriedSchedule.guardDelays);
-        timingBaseline.roleDelays = carriedSchedule.baselineRoleDelays;
-        timingBaseline.guardDelays = carriedSchedule.baselineGuardDelays;
-    }
     const helpers = createFspIdentityHelpers({
         optimizeRootCandidateScan: true,
         collectRootScanTiming: true
@@ -1035,49 +531,6 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
         await beginCleanupLog(attemptState);
         helpers.cleanup(handles);
         return;
-    }
-
-    if (timingPersistence && !timingPersistence.checked) {
-        timingPersistence.checked = true;
-        if (timingPersistence.useDefaultsThisAttempt) {
-            const defaults = createFspIdentityConfig();
-            config.roleDelays.splice(0, config.roleDelays.length,
-                ...defaults.roleDelays);
-            config.guardDelays.splice(0, config.guardDelays.length,
-                ...defaults.guardDelays);
-            timingBaseline.roleDelays = defaults.roleDelays.slice();
-            timingBaseline.guardDelays = defaults.guardDelays.slice();
-            attemptState.canaryTimingSchedule = {
-                roleDelays: defaults.roleDelays.slice(),
-                guardDelays: defaults.guardDelays.slice(),
-                baselineRoleDelays: defaults.roleDelays.slice(),
-                baselineGuardDelays: defaults.guardDelays.slice()
-            };
-            await log("X reset requested before timing load; using built-in timings.");
-        } else {
-            const timingLoad = loadTimingScheduleFromSave(handles.savedHandle);
-            if (timingLoad.status === "loaded") {
-                config.roleDelays.splice(0, config.roleDelays.length,
-                    ...timingLoad.schedule.roleDelays);
-                config.guardDelays.splice(0, config.guardDelays.length,
-                    ...timingLoad.schedule.guardDelays);
-                attemptState.canaryTimingSchedule = {
-                    roleDelays: timingLoad.schedule.roleDelays.slice(),
-                    guardDelays: timingLoad.schedule.guardDelays.slice(),
-                    baselineRoleDelays: timingBaseline.roleDelays.slice(),
-                    baselineGuardDelays: timingBaseline.guardDelays.slice()
-                };
-                timingPersistence.loaded = true;
-                await log("Loaded saved timings from " +
-                    TIMING_SAVE_DISPLAY_PATH + ".");
-            } else if (timingLoad.status === "missing") {
-                await log("No saved timing file found; using built-in timings.");
-            } else {
-                await log("Could not load saved timings; using built-in timings.");
-                if (timingLoad.detail)
-                    await verboseLog("Timing load: " + timingLoad.detail);
-            }
-        }
     }
 
     const {pktBuf} = sessionSetup;
@@ -1273,11 +726,9 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
         setupPath: scratch.setupPath, setupPkt: scratch.setupPkt,
         triggerBuf: buffers.triggerBuf,
         renamePathBuffers,
-        timingBaseline,
-        allowTimingAdjustments,
-        shouldStop: () => timingPersistence?.stopRequested === true,
-        deferredVerboseLines: timingPersistence?.deferredWaveLogLines,
-        attemptNumber: timingPersistence?.currentAttempt
+        shouldStop: () => runControl?.stopRequested === true,
+        deferredVerboseLines: runControl?.deferredWaveLogLines,
+        attemptNumber: runControl?.currentAttempt
     });
 
     cleanupWorkerStateSafe = control?.workerStateSafe === true;
@@ -1286,15 +737,6 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
     attemptState.positiveWindows = control?.positiveWindows || 0;
     attemptState.qualifiedCanaryFlips =
         control?.positiveQualifiedFlips || 0;
-    attemptState.timingAdjustments = control?.timingAdjustments || [];
-    attemptState.canaryTimingSchedule = copyCanaryTimingSchedule(
-        control?.timingSchedule) || attemptState.canaryTimingSchedule;
-    const hasTimingAdjustment = Boolean(control?.timingAdjustments?.length);
-    if (hasTimingAdjustment && timingPersistence) {
-        timingPersistence.adjustedThisRun = true;
-        timingPersistence.savedThisRun = false;
-        timingPersistence.saveError = null;
-    }
     let canaryStageMessage;
     if (control?.stoppedByUser) {
         canaryStageMessage = "Stopped by user after the current wave; no further waves will launch.";
@@ -1302,16 +744,8 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
         canaryStageMessage = "CANARY FLIPPED";
     } else if (control?.positiveWindows) {
         canaryStageMessage = "Canary did not flip.";
-        if (hasTimingAdjustment) {
-            canaryStageMessage +=
-                " Timing will be adjusted for the next attempt.";
-        }
     } else {
         canaryStageMessage = "No valid canary window was found.";
-        if (hasTimingAdjustment) {
-            canaryStageMessage +=
-                " Timing will be adjusted for the next attempt.";
-        }
     }
 
     await log(canaryStageMessage);
@@ -1454,7 +888,7 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
         triggerBuf: buffers.triggerBuf,
         renamePathBuffers,
         reportProgress: log,
-        shouldStop: () => timingPersistence?.stopRequested === true
+        shouldStop: () => runControl?.stopRequested === true
     });
 
     cleanupWorkerStateSafe = alias?.workerStateSafe === true;
@@ -1512,7 +946,7 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
         analysis: analysisResources
     };
 
-    if (alias?.stoppedByUser || timingPersistence?.stopRequested) {
+    if (alias?.stoppedByUser || runControl?.stopRequested) {
         attemptState.stoppedByUser = true;
         await stopAndCleanup({
             reason: "Stopped by user during memory alias after the current wave; " +
@@ -1726,7 +1160,7 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
         candidateHandle: handles.candidateHandle,
         collectTimingProfile: true,
         reportProgress: reportAddressProgress,
-        shouldStop: () => timingPersistence?.stopRequested === true,
+        shouldStop: () => runControl?.stopRequested === true,
         pointerCandidates: release.pointerCandidates,
         primeHex: candidateSetup.primeHex,
         rootSession: handles.rootSession,
@@ -1768,7 +1202,7 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
     handles = {...handles, domainSession: address.domainSession};
     addressCopy = address?.addressCopy || addressCopy;
 
-    if (timingPersistence?.stopRequested) {
+    if (runControl?.stopRequested) {
         attemptState.stoppedByUser = true;
         await stopAndCleanup({
             reason: "Stopped by user during address qualification after the " +
