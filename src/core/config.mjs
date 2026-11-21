@@ -1,4 +1,4 @@
-// Start with verbose summaries disabled; controller Y toggles the mode.
+// Start with detailed wave summaries disabled; controller Y toggles the mode.
 export const VERBOSE_LOGGING = false;
 
 export function createFspIdentityConfig() {
@@ -6,10 +6,11 @@ export function createFspIdentityConfig() {
 
   var SLOT_SIZE = 0x800;
   var WAVE_READ_SIZE = 0x10000;    // 64 KiB IStorage::Read per wave
-  var DIRTY_FILE_SIZE = 0x800000;  // 8 MiB dirty write
+  var DIRTY_FILE_SIZE = 0x700000;  // 7 MiB dirty write (1 MiB headroom under BC save cap)
   var MAX_CONTROL_WAVES = 13;      // user-capped per launch
-  var MAX_COPY_ATTEMPTS = 30;      // per nulWrites step per batch
-  var COPY_BATCHES = 3;
+  // Keep runs focused on canary qualification while this flag is enabled.
+  var CANARY_BENCH_MODE = false;
+  var MAX_CACHE_WAVES_PER_STEP = 10; // limit per field-copy or retirement step
   var MAX_ADDRESS_CANDIDATES = 5;
   var MAX_POOL_REFINEMENT_READS = 16;
   var MAX_POOL_ANCHOR_CANDIDATES = 4;
@@ -26,7 +27,7 @@ export function createFspIdentityConfig() {
   var WINDOW_MINIMUM_CACHE_HELD = 0x2600; // reference receive-window floor
   // Extra reference guard applied uniformly to every field copy.
   var FIELD_MINIMUM_CACHE_HELD = 0x2810;
-  // Normal alias waves rewrite save:/hole/commit_data (8 MiB) and overlap Commit.
+  // Normal alias waves rewrite save:/hole/commit_data (7 MiB) and overlap Commit.
   var MONITORING_ROUNDS = 4;        // extra snapshot re-reads after release
   var CACHE_READ_SIZE = 0x200000;  // 2 MiB widened read
   var CONTROL_SIZE = 0x4000;       // 16 KiB — one cache block
@@ -41,7 +42,11 @@ export function createFspIdentityConfig() {
       0x01, 0x00
   ];
 
-  // My own working delays, seems to be best for the current implementation without RPC
+  // Workers are pinned to one core with decreasing priorities so the
+  // kernel scheduler fires them in deterministic order after each
+  // blocking IPC. The delays create real server-side overlap: BC saves
+  // allow concurrent operations (unlike DirectorySaveDataFileSystem's
+  // m_accessor_mutex), so the temporal spread is essential for the race.
   var roleDelays = [0, 300000, 350000, 450000, 550000, 650000, 1000000, 1200000, 1300000, 1700000];
   var guardDelays = [150000, 300000];
   // References from Slapah / Kurumuz
@@ -51,16 +56,33 @@ export function createFspIdentityConfig() {
       "canary", "filler0", "filler1", "release", "guard0", "guard1", "trigger"];
   var roleShort = ["C", "B", "F0", "F1", "F2", "F3", "Y", "X0", "X1", "R",
       "G0", "G1", "T"];
+
+  // Active worker roles in this wave. Change this single list to add
+  // or remove roles without touching the rest of the pipeline.
+  // Slot indices are stable (roleLabels[i] is always the same role).
+  var workerRoles = [0, 1, 2, 3, 4, 5, 6, 9, 10, 11, 12];
+  var WORKER_COUNT = workerRoles.length;
+
   var throughRoles = ["commit", "frag0", "frag1", "frag2", "frag3"];
-  var heldRoles = ["canary", "filler0", "filler1", "guard0", "guard1"];
+  var heldRoles = ["canary", "filler0", "filler1", "guard0", "guard1"]
+      .filter(function(name) {
+          return workerRoles.indexOf(roleLabels.indexOf(name)) >= 0;
+      });
   var overlapRoles = throughRoles.concat(heldRoles);
+  var OVERLAP_COUNT = overlapRoles.length;
+
+  // Protected roles: all active except bottleneck (1), release (9),
+  // trigger (12) — these three have special lifecycle handling.
+  var protectedRoles = workerRoles.filter(function(role) {
+      return role !== 1 && role !== 9 && role !== 12;
+  });
   return {
     SLOT_SIZE,
     WAVE_READ_SIZE,
     DIRTY_FILE_SIZE,
     MAX_CONTROL_WAVES,
-    MAX_COPY_ATTEMPTS,
-    COPY_BATCHES,
+    CANARY_BENCH_MODE,
+    MAX_CACHE_WAVES_PER_STEP,
     MAX_ADDRESS_CANDIDATES,
     MAX_POOL_REFINEMENT_READS,
     MAX_POOL_ANCHOR_CANDIDATES,
@@ -89,8 +111,12 @@ export function createFspIdentityConfig() {
     guardDelays,
     roleLabels,
     roleShort,
+    workerRoles,
+    WORKER_COUNT,
     throughRoles,
     heldRoles,
-    overlapRoles
+    overlapRoles,
+    OVERLAP_COUNT,
+    protectedRoles
   };
 }

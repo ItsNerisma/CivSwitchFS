@@ -127,11 +127,11 @@ const WAVE_REJECTION_LABELS = {
     "workers-done": "workers incomplete",
     transport: "IPC failed",
     "workers-join": "workers did not join",
-    "protected-10": "worker flags",
+    "protected": "worker flags",
     "release-sent": "release failed",
     signal: "completion signal",
     "trig-span": "trigger timing unavailable",
-    "shape-10": "overlap pattern",
+    "shape": "overlap pattern",
     "margin>=300": "margin below 300µs",
     "no-abort": "unexpected abort",
     tails: "path fragments",
@@ -182,7 +182,8 @@ function waveRejectionSummary(result, config, profile, verdict) {
     const reasons = [];
     for (const key of result.rejections || []) {
         let label = WAVE_REJECTION_LABELS[key] || key.replace(/-/g, " ");
-        if (key === "shape-10") label += " " + result.shape + "/10";
+        if (key === "shape") label += " " + result.shape + "/" +
+            config.OVERLAP_COUNT;
         if (key === "paths" && result.changedPaths?.length)
             label += ": " + result.changedPaths.join(",");
         if (!reasons.includes(label)) reasons.push(label);
@@ -310,10 +311,12 @@ export function formatWaveSummaryLine(id, profile, result, verdict, input) {
 
     if (result.pathReplyResults) {
         const paths = result.pathReplyResults;
-        line += " · RenameFile=f0:" + formatPathReplyCode(paths.filler0) +
-            ",f1:" + formatPathReplyCode(paths.filler1) +
-            ",g0:" + formatPathReplyCode(paths.guard0) +
-            ",g1:" + formatPathReplyCode(paths.guard1);
+        const parts = [];
+        if (paths.filler0 != null) parts.push("f0:" + formatPathReplyCode(paths.filler0));
+        if (paths.filler1 != null) parts.push("f1:" + formatPathReplyCode(paths.filler1));
+        parts.push("g0:" + formatPathReplyCode(paths.guard0));
+        parts.push("g1:" + formatPathReplyCode(paths.guard1));
+        line += " · RenameFile=" + parts.join(",");
     }
     if (result.renameInputDiagnostics)
         line += " · " + formatRenameInputDiagnostics(

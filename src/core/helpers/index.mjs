@@ -32,9 +32,9 @@ import {
 } from "./discovery.mjs";
 
 import {
+  inspectCandidateCacheAlias,
   installAddressHeader,
-  qualifyCacheBucketPeriod,
-  retireCandidateCache
+  qualifyCacheBucketPeriod
 } from "./cache.mjs";
 
 import {
@@ -82,9 +82,9 @@ export function createFspIdentityHelpers(options = {}) {
     hasByteDifferentFast,
     scanPointerWords,
     cleanup,
+    inspectCandidateCacheAlias,
     installAddressHeader,
     qualifyCacheBucketPeriod,
-    retireCandidateCache,
     buildPlans,
     configureProfile,
     configurePayload,

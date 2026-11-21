@@ -1,15 +1,21 @@
 import coreRuntime from "../runtime.mjs";
-import {emitVerboseStage} from "../log-stage.mjs";
+import {log, verboseLog} from "../logger.mjs";
 
 const {
+  allocPage,
+  call_rop,
   closeHandle,
+  GADGET_MEMSET,
   hex32,
   ipcCommitChecked,
   ipcDeleteDirectoryRecursivelyChecked,
   ipcDeleteFileChecked,
   ipcGetEntryTypeChecked,
   ipcFileInvalidate,
-  log
+  ipcStorageInvalidate,
+  ipcStorageGetSize,
+  ipcStorageRead,
+  openContentStorage
 } = coreRuntime;
 
 // kaiHEN's donor pair sits at the root of the game's save: /main (the RO
@@ -21,18 +27,165 @@ const {
 const DONOR_LEFTOVER_FILES = [];
 
 // ── Cleanup and retirement (S19–S21) ────────────────────────────────────────
+//
+// Safety model — two states, two recovery paths:
+//
+// State A (alias only, no IStorage::Write done):
+//   The cache entry is CLEAN from fsp-srv's perspective. The race wrote
+//   bytes into the entry's header via path normalization, but fsp-srv's
+//   internal dirty tracking was never updated.
+//   → Recovery: invalidate the full storage range, then verify the original
+//     bytes on a fresh IStorage handle before allowing retry or restart.
+//
+// State B (retained endpoint active, IStorage::Write done):
+//   The IStorage::Write calls for PID promotion went through fsp-srv's
+//   normal write path, which marks the entry as dirty internally.
+//   → Recovery: verify the retained endpoint's zero-count layout and close
+//     its candidate storage handle. Do not invalidate this dirty entry.
+//   → If endpoint retirement fails: STOP. Do NOT retry; its state is unknown.
+//
+// The retainedEndpointActive flag distinguishes the two states.
+
+// Canonical unsafe-state verdict. Every site prints the same action
+// block so the instruction is identical wherever the warning appears.
+export function formatUnsafeState(reason) {
+    const detail = String(reason || "retained endpoint may be active")
+        .replace(/[.!]+$/, "");
+    return "STATE IS UNSAFE - " + detail +
+        ". Do not close the game or reboot normally; hard reboot now " +
+        "(hold Power for 15 seconds).";
+}
+
+function readStorageHex(storageHandle, offset, helpers) {
+    try {
+        var buffer = allocPage(0x1000);
+        call_rop(GADGET_MEMSET, buffer, 0xA5n, 16n);
+        var read = ipcStorageRead(storageHandle, offset, 16, buffer);
+        if (!read || read.error !== 0) {
+            return {ok: false, error: read?.error ?? null,
+                transport: read?.transport ?? null};
+        }
+
+        return {ok: true, error: read.error, transport: read.transport,
+            hex: helpers.readHexBytes(buffer, 16)};
+    } catch (error) {
+        return {ok: false, error: null, transport: null,
+            detail: String(error?.message || error)};
+    }
+}
+
+async function verifyInvalidatedCandidateCache({
+  candidateHandle,
+  helpers,
+  addressCopy,
+  rootSession
+}) {
+    var expectedPrefix = addressCopy?.primeHex;
+    var expectedAlias = addressCopy?.aliasControlHex;
+    var aliasOffset = addressCopy?.config?.ALIAS_OFFSET;
+    var hasBaseline = typeof expectedPrefix === "string" &&
+        /^[0-9a-f]{32}$/i.test(expectedPrefix) &&
+        typeof expectedAlias === "string" &&
+        /^[0-9a-f]{32}$/i.test(expectedAlias) &&
+        expectedPrefix !== expectedAlias &&
+        Number.isSafeInteger(aliasOffset) && aliasOffset >= 0 &&
+        rootSession && typeof helpers?.inspectCandidateCacheAlias === "function";
+
+    if (!hasBaseline) {
+        return {ok: false, candidateHandle,
+            stage: "verification-baseline-unavailable"};
+    }
+
+    var candidatePrefix = readStorageHex(candidateHandle, 0, helpers);
+    if (!candidatePrefix.ok || candidatePrefix.hex !== expectedPrefix) {
+        return {ok: false, candidateHandle,
+            stage: "candidate-prefix-mismatch", candidatePrefix};
+    }
+
+    var candidateCloseResult = null;
+    try {
+        candidateCloseResult = Number(closeHandle(candidateHandle)) >>> 0;
+    } catch (error) {
+        return {ok: false, candidateHandle,
+            stage: "candidate-close-failed",
+            detail: String(error?.message || error)};
+    }
+    if (candidateCloseResult !== 0) {
+        return {ok: false, candidateHandle,
+            stage: "candidate-close-failed", candidateCloseResult};
+    }
+
+    var freshHandle = 0;
+    try {
+        freshHandle = Number(openContentStorage(rootSession)) >>> 0;
+    } catch (error) {
+        return {ok: false, candidateHandle: 0,
+            stage: "fresh-storage-open-failed",
+            detail: String(error?.message || error)};
+    }
+    if (!freshHandle) {
+        return {ok: false, candidateHandle: 0,
+            stage: "fresh-storage-open-failed"};
+    }
+
+    var freshReadback = null;
+    var freshCloseResult = null;
+    var freshCloseError = null;
+    try {
+        var freshPrefix = readStorageHex(freshHandle, 0, helpers);
+        var freshAlias = null;
+        try {
+            freshAlias = helpers.inspectCandidateCacheAlias(
+                freshHandle, addressCopy);
+        } catch (error) {
+            freshAlias = {state: "unavailable",
+                detail: String(error?.message || error)};
+        }
+
+        var readbackMatches = freshPrefix.ok &&
+            freshPrefix.hex === expectedPrefix &&
+            freshAlias?.state === "original";
+        freshReadback = readbackMatches
+            ? {ok: true, freshPrefix, freshAlias}
+            : {ok: false, stage: "fresh-storage-readback-mismatch",
+                freshPrefix, freshAlias};
+    } catch (error) {
+        freshReadback = {ok: false, stage: "fresh-storage-readback-threw",
+            detail: String(error?.message || error)};
+    } finally {
+        try {
+            freshCloseResult = Number(closeHandle(freshHandle)) >>> 0;
+        } catch (error) {
+            freshCloseError = String(error?.message || error);
+        }
+    }
+
+    if (freshCloseError || freshCloseResult !== 0) {
+        return {ok: false, candidateHandle: freshHandle,
+            stage: "fresh-storage-close-failed", freshReadback,
+            freshCloseResult, detail: freshCloseError};
+    }
+
+    if (!freshReadback.ok) {
+        return {...freshReadback, candidateHandle: 0};
+    }
+
+    return {ok: true, candidateHandle: 0, candidatePrefix,
+        freshPrefix: freshReadback.freshPrefix,
+        freshAlias: freshReadback.freshAlias};
+}
 
 export async function retireCandidateCacheAndClose({
   helpers,
   addressCopy,
   candidateCacheNeedsRetirement,
   candidateHandle,
+  rootSession,
   retireRetainedEndpoint,
   workerStateSafe,
 }) {
-    // S21: Verify the synthetic cache entry, retiring it only if needed.
+    // S21: Verify the synthetic cache entry and retire the retained endpoint.
     let candidateCacheRetired = false;
-    let candidateCacheRetirementSkipped = false;
     var candidateCloseSafe = workerStateSafe;
     var workersQuiesced = workerStateSafe === true;
     var stateSafe = workerStateSafe === true;
@@ -41,10 +194,11 @@ export async function retireCandidateCacheAndClose({
     if (addressCopy && addressCopy.retainedEndpointActive) {
         if (!candidateCloseSafe || !candidateHandle ||
             typeof retireRetainedEndpoint !== "function") {
-            await log("CACHE: retained endpoint retirement or candidate close " +
-                "skipped (restoration/handle state is unsafe)");
             addressCopy = {...addressCopy, retainedEndpointUnsafe: true,
                 workerStateSafe: false};
+            await log(formatUnsafeState(
+                "Retained endpoint cannot be retired."));
+
             return {ok: false, addressCopy, candidateCacheRetired,
                 candidateHandle, workerStateSafe: false,
                 workersQuiesced,
@@ -56,10 +210,11 @@ export async function retireCandidateCacheAndClose({
                 throw new Error("retained endpoint did not confirm retirement");
             addressCopy = retainedRetirement.addressCopy || addressCopy;
         } catch (retirementError) {
-            await log("CACHE: retained endpoint retirement failed: " +
-                retirementError.message);
             addressCopy = {...addressCopy, retainedEndpointUnsafe: true,
                 workerStateSafe: false};
+            await log(formatUnsafeState(
+                "Retained endpoint retirement failed: " +
+                retirementError.message));
             return {ok: false, addressCopy, candidateCacheRetired,
                 candidateHandle, workerStateSafe: false,
                 workersQuiesced,
@@ -69,8 +224,6 @@ export async function retireCandidateCacheAndClose({
 
         try {
             candidateCloseResult = Number(closeHandle(candidateHandle)) >>> 0;
-            await log("CACHE: retained candidate closed rc=" +
-                hex32(candidateCloseResult));
             if (candidateCloseResult !== 0) {
                 addressCopy = {...addressCopy, retainedEndpointUnsafe: true,
                     workerStateSafe: false};
@@ -85,8 +238,6 @@ export async function retireCandidateCacheAndClose({
             addressCopy = {...addressCopy, retainedEndpointActive: false,
                 retainedEndpointRetired: true, candidateCacheRetired: true};
         } catch (closeError) {
-            await log("CACHE: retained candidate close threw: " +
-                closeError.message);
             addressCopy = {...addressCopy, retainedEndpointUnsafe: true,
                 workerStateSafe: false};
             return {ok: false, addressCopy, candidateCacheRetired,
@@ -100,45 +251,79 @@ export async function retireCandidateCacheAndClose({
             candidateHandle, candidateCloseResult,
             workerStateSafe: stateSafe, workersQuiesced};
     }
+    // State A: alias installed, no IStorage::Write done through it.
+    // The entry is clean from fsp-srv's perspective, so invalidation is the
+    // only cleanup operation authorized for this state. A successful IPC
+    // result still needs the fresh-storage readback below.
     if (candidateHandle && candidateCacheNeedsRetirement && candidateCloseSafe) {
-        var retirement = await helpers.retireCandidateCache({
-            candidateHandle, candidateCacheNeedsRetirement,
-            candidateCacheRetired, addressCopy
-        });
-        workersQuiesced = retirement.addressCopy?.workerStateSafe !== false &&
-            workersQuiesced;
-        stateSafe = workersQuiesced;
-        candidateCloseSafe = retirement.ok && workersQuiesced;
-        candidateCacheRetired = retirement.candidateCacheRetired;
-        candidateCacheRetirementSkipped = retirement.retirementSkipped === true;
-        if (!retirement.ok)
-            retirementFailureReason = "candidate-cache-retirement-failed";
-        addressCopy = {...retirement.addressCopy, candidateCacheRetired};
+        var storageInvalidated = false;
+
+        var storageSize = ipcStorageGetSize(candidateHandle);
+        if (storageSize.error === 0 &&
+            Number.isSafeInteger(storageSize.size) && storageSize.size > 0) {
+            var invalidation = ipcStorageInvalidate(
+                candidateHandle, 0, storageSize.size);
+            storageInvalidated = invalidation.error === 0;
+            await verboseLog("CLEANUP: storage cache invalidate" +
+                " result=" + hex32(invalidation.error) +
+                " transport=" + hex32(invalidation.transport));
+        }
+
+        if (storageInvalidated) {
+            var verification = await verifyInvalidatedCandidateCache({
+                candidateHandle, helpers, addressCopy, rootSession
+            });
+            candidateHandle = verification.candidateHandle;
+
+            if (verification.ok) {
+                candidateCacheRetired = true;
+                addressCopy = {...addressCopy, candidateCacheRetired,
+                    candidateCacheVerification: "fresh-readback-original"};
+                await verboseLog("CLEANUP: cache readback prefix=" +
+                    verification.freshPrefix.hex + " · alias=" +
+                    verification.freshAlias.readbackHex);
+                await log("Candidate cache readback passed on a fresh " +
+                    "storage.");
+            } else {
+                candidateCloseSafe = false;
+                retirementFailureReason =
+                    "candidate-cache-verification-unconfirmed";
+                addressCopy = {...addressCopy, candidateCacheRetired: false,
+                    candidateCacheVerification: verification.stage};
+                await verboseLog("CLEANUP: cache readback=" +
+                    verification.stage +
+                    (verification.freshAlias?.state
+                        ? " · alias=" + verification.freshAlias.state : "") +
+                    (verification.detail ? " · " + verification.detail : ""));
+                await log("Candidate cache readback was not confirmed.");
+            }
+        } else {
+            candidateCloseSafe = false;
+            retirementFailureReason =
+                "candidate-cache-invalidation-unconfirmed";
+            addressCopy = {...addressCopy, candidateCacheRetired: false,
+                candidateCacheVerification: "invalidation-unconfirmed"};
+            await log("Candidate cache invalidation was not confirmed.");
+        }
     }
 
     if (candidateHandle && candidateCloseSafe) {
         try {
             candidateCloseResult = Number(closeHandle(candidateHandle)) >>> 0;
             candidateHandle = 0;
-            await log("CACHE: candidate closed rc=" + hex32(candidateCloseResult));
             if (candidateCloseResult !== 0)
                 retirementFailureReason = "candidate-close-failed";
         } catch (closeError) {
-            // Cache safety was verified before close. A failed close leaks the
-            // service handle, but does not leave an active cache alias behind.
             candidateHandle = 0;
             retirementFailureReason = "candidate-close-threw: " +
                 closeError.message;
-            await log("CACHE: candidate close threw: " + closeError.message);
         }
     } else if (candidateHandle) {
         retirementFailureReason = retirementFailureReason ||
             "candidate-close-skipped-unsafe-state";
-        await log("CACHE: candidate close skipped (worker/cache state unsafe)");
     }
 
   return {ok: true, addressCopy, candidateCacheRetired, candidateHandle,
-      candidateCacheRetirementSkipped,
       workerStateSafe: stateSafe, workersQuiesced, candidateCloseResult,
       failureReason: retirementFailureReason};
 }
@@ -163,7 +348,8 @@ export async function cleanupScratchAndHandles({
   triggerHandle,
   workerStateSafe,
   keepDomainSessionOpen = false,
-  dirtyFileSize = 0
+  dirtyFileSize = 0,
+  dirtyFilePath = ""
 }) {
     // S22: Cleanup. Report a failed or skipped cleanup as unsafe to retry.
     var cleanupAttempted = false;
@@ -177,7 +363,7 @@ export async function cleanupScratchAndHandles({
     var cleanupCloseFailures = [];
     var cleanupErrors = [];
     var cleanupAllowed = workerStateSafe && (retainedEndpointActive ||
-        !candidateCacheNeedsRetirement || candidateCacheRetired || !candidateHandle);
+        !candidateCacheNeedsRetirement || candidateCacheRetired);
     var cleanupSkipReason = workerStateSafe
         ? "candidate-cache-not-retired" : "worker-state-unsafe";
 
@@ -203,18 +389,17 @@ export async function cleanupScratchAndHandles({
         countExpectedHandle(rootSession);
         cleanupAttempted = true;
         var cacheInvalidateResult = null;
-        if (dirtyFileSize > 0 && SCRATCH_DIR) {
+        if (dirtyFileSize > 0 && dirtyFilePath) {
             try {
                 cacheInvalidateResult = ipcFileInvalidate(
-                    savedHandle, SCRATCH_DIR + "/big8", dirtyFileSize);
+                    savedHandle, dirtyFilePath, dirtyFileSize);
             } catch (error) {
                 cacheInvalidateResult = "throw:" + String(error);
             }
-            await emitVerboseStage("CLEANUP: cache invalidate " + SCRATCH_DIR +
-                "/big8 result=" + (typeof cacheInvalidateResult === "number"
+            await verboseLog("CLEANUP: cache invalidate " + dirtyFilePath +
+                " result=" + (typeof cacheInvalidateResult === "number"
                     ? hex32(cacheInvalidateResult) : cacheInvalidateResult));
         }
-        await log("CLEANUP: removing " + SCRATCH_DIR + " and committing");
         // Donor leftovers would ride the same commit: absent files are
         // skipped silently, and a present file that fails to delete is a
         // real cleanup failure. The list is empty by default because the
@@ -285,25 +470,6 @@ export async function cleanupScratchAndHandles({
             domainSession = null;
         }
         closeForCleanup(rootSession, "fsp-session");
-
-        var cleanupDeleteTxText = cleanupDeleteTransport === null
-            ? "THREW" : hex32(cleanupDeleteTransport);
-        var cleanupDeleteText = cleanupRemoveResult === null
-            ? "NA" : hex32(cleanupRemoveResult);
-        var cleanupCommitTxText = cleanupCommitTransport === null
-            ? "THREW" : hex32(cleanupCommitTransport);
-        var cleanupCommitText = cleanupCommitResult === null
-            ? "NA" : hex32(cleanupCommitResult);
-        await log("CLEANUP: " + SCRATCH_DIR +
-            " deleteTx=" + cleanupDeleteTxText + " delete=" + cleanupDeleteText +
-            " commitTx=" + cleanupCommitTxText + " commit=" + cleanupCommitText +
-            " donorWiped=" + cleanupDonorWiped +
-            " handlesClosed=" + cleanupHandlesClosed +
-            "/" + cleanupExpectedHandles +
-            " closeErrors=" + (cleanupCloseFailures.join(",") || "none") +
-            " errors=" + (cleanupErrors.join(",") || "none"));
-    } else {
-        await log("CLEANUP: skipped (" + cleanupSkipReason + ")");
     }
 
     var cleanupOk = cleanupAttempted && cleanupDeleteTransport === 0 &&

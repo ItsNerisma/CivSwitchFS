@@ -55,13 +55,6 @@ function humanRoleName(role) {
     return ROLE_NAMES[role] || role;
 }
 
-export function formatCanaryType(type) {
-    if (type === 0) return "DIR";
-    if (type === 1) return "FILE";
-    if (type === null || type === undefined) return "NA";
-    return "ERR" + Number(type);
-}
-
 function humanStopReason(control) {
     const reason = control.workflowStopReason;
     if (!reason) {
@@ -84,6 +77,9 @@ function humanStopReason(control) {
 
     match = /^profile-setup-failed-(.+)$/.exec(reason);
     if (match) return "could not configure the " + match[1] + " profile";
+
+    match = /^worker-pinning-failed-at-wave-(\d+)$/.exec(reason);
+    if (match) return "could not pin all workers before wave " + match[1];
 
     return reason.replace(/-/g, " ");
 }
@@ -332,7 +328,7 @@ const GATE_LABELS = {
     "workers-done": "not all workers completed",
     transport: "an IPC send failed",
     "workers-join": "not all workers joined",
-    "protected-10": "protected worker completion flags missing",
+    "protected": "protected worker completion flags missing",
     "release-sent": "release message was not sent",
     signal: "wave completion signal failed",
     tails: "fragment responses were unexpected",
@@ -352,7 +348,7 @@ function summarizeRejectedGates(control, timing) {
 
     for (const [key, count] of Object.entries(counts)) {
         // These keys are handled by the special-case blocks below.
-        if (key === "shape-10" || key === "margin>=300" ||
+        if (key === "shape" || key === "margin>=300" ||
             key === "pre-release" || key === "trig-span" ||
             key === "pin-window" || key === "pin-1st") continue;
 
@@ -391,7 +387,7 @@ function summarizeRejectedGates(control, timing) {
     }
 
     // Shape overlap pattern
-    if (counts["shape-10"] && !timing.messages.length)
+    if (counts["shape"] && !timing.messages.length)
         entries.push("required worker overlap pattern did not qualify");
 
     // Trigger span
@@ -461,24 +457,6 @@ const CANARY_STATE_LABELS = {
 export function formatCanaryResult(control, config) {
     if (!control) return "Canary run failed before returning a result.";
 
-    const adjustmentTotals = Object.create(null);
-    for (const adjustment of control.timingAdjustments || []) {
-        adjustmentTotals[adjustment.role] =
-            (adjustmentTotals[adjustment.role] || 0) + adjustment.deltaUs;
-    }
-    const timingAdjustments = Object.keys(adjustmentTotals).sort()
-        .filter(role => Math.abs(adjustmentTotals[role]) >= 0.5)
-        .map(role => role + ":" +
-            (adjustmentTotals[role] >= 0 ? "+" : "") +
-            adjustmentTotals[role].toFixed(0) + "us")
-        .join(",");
-    const adjustedFromControls = (control.timingAdjustments || []).some(
-        adjustment => adjustment.source === "control");
-    const timingAdjustmentSuffix = timingAdjustments
-        ? "; next-attempt timing adjustments={" + timingAdjustments + "}" +
-            (adjustedFromControls ? " from control waves" : "")
-        : "";
-
     const counts = control.profileCounts || {};
     const controls = [
         ["pin", (counts["abort-control"] || 0) > 0,
@@ -526,7 +504,7 @@ export function formatCanaryResult(control, config) {
             : "controls incomplete";
 
     if (control.canaryQualified)
-        return "CANARY FLIPPED · " + positiveSummary + timingAdjustmentSuffix;
+        return "CANARY FLIPPED · " + positiveSummary;
 
     const outcome = control.campaignState === "worker-unsafe"
         ? "Canary aborted"
@@ -539,7 +517,7 @@ export function formatCanaryResult(control, config) {
         " · " + positiveSummary +
         " · workers=" + (control.workerStateSafe ? "safe" : "unsafe") +
         " · stop=" + humanStopReason(control) +
-        issueSummary + timingAdjustmentSuffix;
+        issueSummary;
 }
 
 
@@ -550,7 +528,7 @@ export function formatCanaryResult(control, config) {
 export function formatAliasResult(alias) {
     if (alias.aliasInstalled) {
         return "Cache alias installed · " + alias.copyStepsCompleted +
-            "/7 steps · " + alias.copyWavesTotal + " waves.";
+            "/7 steps · " + alias.copyWavesTotal + " total copy waves.";
     }
 
     const reasons = Object.entries(alias.copyFailureCounts || {})
@@ -565,7 +543,7 @@ export function formatAliasResult(alias) {
         .join(",") || "none";
 
     return "Cache alias rejected · " + alias.copyStepsCompleted +
-        "/7 steps · " + alias.copyWavesTotal + " waves · workers=" +
+        "/7 steps · " + alias.copyWavesTotal + " total copy waves · workers=" +
         (alias.workerStateSafe ? "safe" : "unsafe") +
         " · main cause=" + (alias.copyFailureReason || "unknown").replace(/-/g, " ") +
         " · frequent failures=" + reasons +
@@ -708,15 +686,29 @@ export function formatCleanupResult(cleanup, workerStateSafe) {
 }
 
 export function formatRetirementResult(retired) {
+    if (retired?.failureReason ===
+        "candidate-cache-invalidation-unconfirmed") {
+        return "Candidate cache invalidation was not confirmed; " +
+            "candidate storage remains open.";
+    }
+
+    if (retired?.failureReason ===
+        "candidate-cache-verification-unconfirmed") {
+        return "Candidate cache readback was not confirmed; " +
+            "cache state remains unconfirmed.";
+    }
+
     if (!retired?.ok || retired?.failureReason) {
         return "Endpoint retirement or close failed (reason=" +
             (retired?.failureReason || "cleanup-safety-not-verified") +
             "; close=" + formatCode(retired?.candidateCloseResult) + ").";
     }
 
-    if (retired.candidateCacheRetirementSkipped)
-        return "Candidate readback matches the original data; retirement waves " +
-            "were skipped and candidate storage closed.";
+    if (retired.addressCopy?.candidateCacheVerification ===
+        "fresh-readback-original") {
+        return "Candidate cache readback passed on a fresh storage; " +
+            "candidate storage closed.";
+    }
 
     if (retired.candidateCacheRetired)
         return "Candidate cache retired and candidate storage closed.";
