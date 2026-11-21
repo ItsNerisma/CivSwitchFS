@@ -46,8 +46,6 @@ After discovery, the exploit installs a retained endpoint: cache descriptors tha
 
 Those writes go through the normal write path, so the cache manager marks the entry dirty. **From here on, invalidation is off-limits.** It could trigger a flush of corrupted data to NAND.
 
-Recovery is retirement waves: they overwrite the entry header with `0x42` bytes, so `fsp-srv` treats it as invalid and skips it on flush. If retirement fails, the payload logs a warning and stops. The dirty entry then sits in RAM until a normal shutdown flushes it. A hard reboot (hold power 15 seconds) cuts power before that happens. The entry dies in RAM and never reaches NAND.
-
 ---
 
 ### What to do

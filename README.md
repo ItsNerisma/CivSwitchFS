@@ -111,21 +111,19 @@ npm run send -- <console-ip>
 Wait for **`You just Civ Sevened your machine, congrats`** which obviously means success :tada: !
 Then, the loader automatically shows `Awaiting payload at <ip>:9026` and you are free to send payloads.
 
-### Timing calibration
+### Race timing schedule
 
-Without a valid saved timing file, the payload starts with this schedule, in nanoseconds:
+The canary campaign uses this fixed schedule, in nanoseconds:
 
 ~~~js
 var roleDelays = [0, 300000, 350000, 450000, 550000, 650000, 1000000, 1200000, 1300000, 1700000];
 var guardDelays = [150000, 300000];
 ~~~
 
-> [!NOTE]
-> If timings were adjusted during a successful run, they will be saved under `save:/civswitchfs/timings.json` and will be reused the next time the exploit is beeing executed.
+The payload reads these values from [`src/core/config.mjs`](src/core/config.mjs). It does not load or save timing schedules in save data; changing the schedule requires changing the code.
 
 ### Controls
 
-- **X**: restore the original timings (starting next attempt)
 - **B**: stops after the current wave clean up
 - **Y**: toggle between normal and verbose summaries
 
@@ -179,7 +177,7 @@ want to keep it.
 | `--force` | restage files even when their size already matches |
 | `--no-hbmenu`, `--no-programs` | skip staging those files |
 | `--no-stage` | skip the SD probe and staging entirely (files must already be on the card) |
-| `--probes`, `--dx` | also run the debug diagnostics (TS/SR/SB probes / DX experiments; default skip list is `dx,probes`) — their sends close the loader session copy the bootstrap needs |
+| `--probes`, `--dx` | also run the debug diagnostics (TS/SR/SB probes / DX experiments; default skip list is `dx,probes`). Their sends close the loader session copy the bootstrap needs. |
 | `--skip A,B` | explicit skip list, overrides the default `dx,probes` |
 
 ### When it fails
@@ -215,8 +213,6 @@ If you're having issues with a reduced success rate, etc, you should reset your 
 
 ## Notes
 
-- The auto timing calibration is not perfect yet, some freezes can happen
-- Timing configuration, retries and shit will go to a persisted config file soon enough
 - You can learn about how the exploit works [there](https://github.com/ItsNerisma/CivSwitchFS/blob/main/HOW_IT_WORKS.md)
 
 ## License

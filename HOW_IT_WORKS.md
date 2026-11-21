@@ -64,14 +64,11 @@ flowchart TD
     J --> Z[Continue with elevated session]
     R --> S{Is another attempt safe?}
     S -->|no| X[Stop]
-    S -->|yes| T{Was a timing change accepted?}
-    T -->|yes| U[Carry delays forward and extend the budget]
-    T -->|no| V[Retry with current delays]
-    U --> A
-    V --> A
+    S -->|yes| T[Retry with built-in timing schedule]
+    T --> A
 ```
 
-The outer loop starts with 10 complete attempts. Each accepted timing adjustment can add one attempt, up to **30**.
+The outer loop starts with 10 complete attempts and can add one final attempt if the last attempt needs to try the alternate candidate-allocation order. Every attempt uses the fixed schedule in [`config.mjs`](src/core/config.mjs).
 
 > [!NOTE]
 > A retry starts only after cleanup confirms that workers have stopped, temporary allocations are freed, the candidate cache is verified safe or retired, and `/hole` is gone. If cleanup cannot prove the state is safe, the exploit stops instead of carrying that state into another race.
@@ -166,7 +163,7 @@ Each worker starts after its configured delay. The delays and priorities serve d
 - W10 and W11: 150 and 300 microseconds after W9 signals that the reservation group has been freed.
 - W12: waits for the release and guard signals without an initial delay. After another 400 microseconds, it checks whether W1 has finished. If W1 is still running, W12 waits on its completion gate. It snapshots the abort flags before sending the trigger.
 
-These defaults are in [`src/core/config.mjs`](src/core/config.mjs). The canary campaign may adjust the W0 through W9 delays and both guard delays, then carry an accepted schedule into the next full attempt.
+These fixed delays are in [`src/core/config.mjs`](src/core/config.mjs). The campaign measures worker spans to qualify overlap and diagnose failures, but it does not adjust or persist the schedule.
 
 ```mermaid
 sequenceDiagram
@@ -245,13 +242,7 @@ The absent and present path profiles check that W12 receives the end of its long
 
 The campaign qualifies a canary flip only when W6 sees the canary as a directory during the positive trigger, no other path changes, and a post-wave check sees the canary as a file again.
 
-**Timing adjustments use repeated evidence:**
-
-- If positive waves ran, the campaign considers a change only when fewer than half qualify. If none ran, it needs at least two extent-present or negative control samples, with fewer than half qualifying.
-- The samples must point to one dominant timing issue. Positive-wave samples must fail on timing alone. Control samples may also fail other checks. A tie leaves the schedule unchanged.
-- The campaign applies the median correction to one start delay. It ignores changes under 75 microseconds, caps a single change at 250 microseconds, and limits total drift to 1 millisecond. Neighboring starts must stay at least 50 microseconds apart.
-
-An accepted schedule applies to the next full attempt. If the evidence does not support a change, the next safe attempt keeps the current delays.
+Timing measurements affect whether a wave qualifies and help explain rejected windows. They do not change the worker delays between attempts.
 
 > [!NOTE]
 > The controls rule out broken setup before the race is counted. W12 must honor its abort gates, find the marker at the end of the long path, and return the expected missing-path error. Only then can a canary flip count as success.
@@ -285,7 +276,7 @@ Those 16 bytes give discovery a known value to find in memory. If either baselin
 
 The `cmd 1002` path copy stops at a NUL byte. `nulWrites` builds seven prefixes, replacing earlier zero bytes with `B` so each prefix can be sent as a path.
 
-Each of the seven prefixes gets up to 90 attempts, in three batches of 30. **A prefix passes only when the wave qualifies, at least `0x2810` cache bytes remain allocated before release, and no unexpected path changes.**
+Each of the seven prefix steps gets up to 10 wave attempts, for a maximum of 70 attempts per alias installation. **A step passes only when the wave qualifies, at least `0x2810` cache bytes remain allocated before release, and no unexpected path changes.**
 
 ```mermaid
 flowchart TD
@@ -302,13 +293,17 @@ flowchart TD
     H -->|No| N
     H -->|Yes| I[Alias confirmed]
     I --> J[Read adjacent fsp-srv heap for discovery]
-    N -->|Yes| O[Close candidate without retirement waves]
-    N -->|No or uncertain| X[Retire candidate cache]
+    N -->|Yes| O[Invalidate candidate cache]
+    N -->|No or uncertain| O
+    O --> P[Read back through fresh storage]
+    P --> Q{Original bytes and inactive alias confirmed?}
+    Q -->|Yes| R[Close candidate; retry only if cleanup is safe]
+    Q -->|No| X[Keep state unknown; hard reboot]
 ```
 
 **Discovery starts with a 2 MiB read at offset `0x1400000`.** Its first bytes must match the values primed at offset `0`.
 
-**If alias installation was attempted, cleanup checks the candidate read at offset `0x1400000` before launching retirement waves.** If it returns the original bytes, cleanup verifies that the alias is inactive and closes the candidate without the extra waves. If it returns the primed alias bytes, unexpected data, or a read error, cleanup runs the retirement path; an incomplete copy still leaves the mapping uncertain.
+**If alias installation was attempted, cleanup invalidates the candidate cache and verifies it with a fresh storage read.** This cleanup path does not launch race waves. If the fresh read does not confirm the original bytes and an inactive alias, the cache state remains uncertain.
 
 > [!NOTE]
 > **The cache entry is tagged for offset 20 MiB but holds bytes primed at offset 0.** A widened read exposes the mismatch, then crosses the 16 KiB cache block into nearby `fsp-srv` memory. Discovery uses that memory window to find the objects it needs to promote.

@@ -192,7 +192,7 @@ function appendLogRows(output, document, lines, timestamp, compact,
 }
 
 export function installRunInputControls({
-    onResetTimings, onStop, onToggleVerbose
+    onStop, onToggleVerbose
 } = {}) {
     const window = globalThis.window;
     if (!window?.addEventListener) return {dispose() {}};
@@ -204,25 +204,14 @@ export function installRunInputControls({
     };
     let disposed = false;
     let inputTimer = null;
-    let lastResetRequest = 0;
-    let runCallbacks = {onResetTimings, onStop, onToggleVerbose};
+    let runCallbacks = {onStop, onToggleVerbose};
     let controllerPrevious = Object.create(null);
     let lastVerboseToggleAt = 0;
-    const engineActionActive = {reset: false, stop: false};
+    const engineActionActive = {stop: false};
 
     function consume(event) {
         event?.preventDefault?.();
         event?.stopImmediatePropagation?.();
-    }
-
-    function requestReset(event) {
-        if (typeof runCallbacks.onResetTimings !== "function") return false;
-        consume(event);
-        const now = Date.now();
-        if (now - lastResetRequest < 100) return true;
-        lastResetRequest = now;
-        runCallbacks.onResetTimings();
-        return true;
     }
 
     function requestStop(event) {
@@ -242,20 +231,14 @@ export function installRunInputControls({
     }
 
     function handleEngineAction(event, action) {
-        let callback;
-        if (action === "reset") {
-            callback = runCallbacks.onResetTimings;
-        } else {
-            callback = runCallbacks.onStop;
-        }
+        const callback = runCallbacks.onStop;
         if (typeof callback !== "function") return;
 
         const isFinished = event.detail?.status === statuses.FINISH;
         const isActive = engineActionActive[action];
         consume(event);
         if (!isActive) {
-            if (action === "reset") requestReset(event);
-            else requestStop(event);
+            requestStop(event);
         }
         engineActionActive[action] = !isFinished;
     }
@@ -293,7 +276,8 @@ export function installRunInputControls({
         }
 
         if (name === "shell-action-1") {
-            handleEngineAction(event, "reset");
+            // Keep X from reaching the game now that it has no payload action.
+            consume(event);
             return;
         }
 
@@ -341,11 +325,10 @@ export function installRunInputControls({
         }
 
         // Standard Gamepad layout: Nintendo B is south (0), Y is west (2), X is north (3).
-        for (const button of [0, 2, 3]) {
+        for (const button of [0, 2]) {
             const current = pressed(button);
             if (current && controllerPrevious[button] !== true) {
-                if (button === 3) requestReset();
-                else if (button === 2) requestToggleVerbose();
+                if (button === 2) requestToggleVerbose();
                 else requestStop();
             }
             controllerPrevious[button] = current;
@@ -358,8 +341,7 @@ export function installRunInputControls({
 
     const controls = {
         clearRunActions() {
-            runCallbacks = {onResetTimings: null, onStop: null,
-                onToggleVerbose: null};
+            runCallbacks = {onStop: null, onToggleVerbose: null};
         },
         dispose() {
             if (disposed) return;
