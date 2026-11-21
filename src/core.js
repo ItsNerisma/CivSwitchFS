@@ -811,6 +811,7 @@ async function runTrackedAttempt(canaryTimingSchedule,
         holeCleanupHandle: 0,
         holeAbsentVerified: false,
         holeCleanupVerified: false,
+        holeCleanupDeferred: false,
         primaryCleanupAttempted: false,
         primaryCommitVerified: false,
         primaryScratchCleanupVerified: false,
@@ -2116,6 +2117,23 @@ function readEntryTypeChecked(handle, path) {
 // ---------------------------------------------------------------------------
 
 async function runHoleCleanupHandler(attemptState) {
+    const cacheRetirementUnverified =
+        attemptState.candidateCacheRetirementRequired &&
+        !attemptState.cacheRetirementVerified &&
+        !attemptState.retainedEndpointActive;
+
+    if (cacheRetirementUnverified) {
+        attemptState.holeAbsentVerified = false;
+        attemptState.holeCleanupVerified = false;
+        attemptState.holeCleanupDeferred = true;
+        attemptState.safeToRetry = false;
+        await log("Candidate cache retirement is unverified. " +
+            "Skipped /hole cleanup; hard reboot required.");
+        await verboseLog("HOLE FALLBACK: skipped before filesystem IPC; " +
+            "the fallback save handle is left untouched until reboot.");
+        return false;
+    }
+
     const handle = attemptState.holeCleanupHandle;
     if (!handle) {
         attemptState.holeAbsentVerified = false;
