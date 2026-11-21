@@ -187,11 +187,11 @@ export async function run() {
         let usePreReservation = false;
         let preReservationFallbackUsed = false;
 
-        await log("CivSwitchFS (no RPC) by Nerisma\n" +
-            "Thanks to Slapah (civ port)\n" +
-            "Thanks to Pespipu (original ns2jb)\n" +
-            "Thanks to Kurumuz (ns2jb improvements)\n" +
-            "Thanks to Alula (exploit stability improvements)\n");
+        await log(
+            "==========================\n" +
+            "CivSwitchFS (no RPC) by Nerisma\n" +
+            "Thanks to Slapah, Pepsipu, Kurumuz and Alula\n" +
+            "==========================");
         await log("CivSwitchFS-kaihen payload v" + PAYLOAD_VERSION);
         await log(isVerboseLogging()
             ? "Verbose logging is on (controller Y toggles the mode)."

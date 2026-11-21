@@ -19,7 +19,7 @@ This is meant to be sharing early code. It's not cleaned properly. The branch is
 
 There will be updates, and you'll need to update manually.
 
-Beware that fs vuln can be risky to utilize and may corrupt things like your save file, or more. If you want minimal brick risk, then wait on.
+Beware that fs vuln can be risky to utilize and may corrupt things like your save file, or more. If you want minimal brick risk, then wait on. Meanwhile, see [BRICK_RISKS](./BRICK_RISKS.md).
 
 ### Tested configuration
 
