@@ -9,4 +9,4 @@
 // refuses to run against a kaiHEN release that does not list its
 // version, and prints an update notice after a successful run when
 // latest_version is newer.
-export const PAYLOAD_VERSION = 3;
+export const PAYLOAD_VERSION = 4;
