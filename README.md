@@ -1,7 +1,7 @@
 # CivSwitchFS
 
 > [!CAUTION]
-> Beware that this FS exploit is not 100% safe, it could corrupt your save, cache or worse. We had reported bricks on forks using that FS implementation as a base (BEFORE [4049cd7](https://github.com/ItsNerisma/CivSwitchFS/commit/4049cd716147bff5dd17ecb545da857f9a453a7f)). Not bricks yet reported for this repo alone, but very well could be. Read [BRICK_RISKS.md](BRICK_RISKS.md) for a full explanation.
+> Beware that this FS exploit is not 100% safe, it could corrupt your save, cache or worse. We had reported bricks on forks using that FS implementation as a base (BEFORE [4049cd7](https://github.com/ItsNerisma/CivSwitchFS/commit/4049cd716147bff5dd17ecb545da857f9a453a7f)). No bricks reported yet for this repo alone, but very well could be. Read [BRICK_RISKS.md](BRICK_RISKS.md) for a full explanation.
 
 This is payload provides **access to FS privileges** through an elevated fsp-srv handle. It runs inside the **CivSwitch Remote JS Loader**. That elevated session is exposed as `globalThis.fspSrv` for the next payloads.
 
