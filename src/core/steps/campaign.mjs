@@ -371,6 +371,14 @@ export async function runControlWaveLoop({
     const positiveAttempts = profileCounts.positive || 0;
     var controlsQualified = pinFirstWaveQualified && abortControlPassed &&
         abortHoleControlPassed && extentQualified && negativeControlPassed;
+    const timingAdjustment = controlsQualified && workerStateSafe &&
+        !canaryQualified && !stoppedByUser && positiveHealthFailures === 0
+        ? proposePositiveTimingAdjustment(positiveWindowRecords, config)
+        : null;
+    const timingSchedule = timingAdjustment ? {
+        roleDelays: timingAdjustment.roleDelays,
+        guardDelays: timingAdjustment.guardDelays
+    } : null;
     var campaignState;
     if (!workerStateSafe) {
         campaignState = "worker-unsafe";
@@ -401,7 +409,125 @@ export async function runControlWaveLoop({
       positiveWindows, positiveWindowFlips, positiveObservedRedirects,
       positiveOutsideWindowFlips, positiveQualifiedFlips,
       positiveHealthFailures, positiveGateFailures, positiveWindowRecords,
-      pinQualificationDiagnostics};
+      timingAdjustment, timingSchedule, pinQualificationDiagnostics};
+}
+
+// Retune only between complete attempts. Positive-profile waves are the sole
+// evidence source; controls and positive waves that passed the window gate are
+// excluded. A failed positive wave must have exactly one timing rejection.
+const TIMING_MIN_FAILED_WAVES = 2;
+const TIMING_NOISE_FLOOR_US = 75;
+const TIMING_MAX_STEP_US = 150;
+const TIMING_MAX_DRIFT_US = 1000;
+const TIMING_MIN_ROLE_GAP_NS = 50000;
+const RECEIVE_MARGIN_TARGET_US = 500;
+
+function median(values) {
+    if (!values.length) return null;
+    const sorted = values.slice().sort((a, b) => a - b);
+    const middle = Math.floor(sorted.length / 2);
+    return sorted.length % 2 ? sorted[middle]
+        : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+function proposePositiveTimingAdjustment(records, config) {
+    const eligible = records.filter(record => {
+        const reasons = record.rejections || [];
+        return !record.window && reasons.length === 1 &&
+            (reasons[0] === "shape" || reasons[0] === "margin>=300");
+    });
+    if (eligible.length < TIMING_MIN_FAILED_WAVES) return null;
+
+    const marginRecords = eligible.filter(record =>
+        record.rejections[0] === "margin>=300" &&
+        Number.isFinite(record.marginUs));
+    const shapeRecords = eligible.filter(record =>
+        record.rejections[0] === "shape");
+
+    let role;
+    let samples;
+    let reason;
+    if (marginRecords.length >= TIMING_MIN_FAILED_WAVES &&
+        marginRecords.length > shapeRecords.length) {
+        role = "release";
+        samples = marginRecords.map(record =>
+            record.marginUs - RECEIVE_MARGIN_TARGET_US);
+        reason = "positive-window-margin";
+    } else if (shapeRecords.length >= TIMING_MIN_FAILED_WAVES &&
+        shapeRecords.length > marginRecords.length) {
+        const corrections = Object.create(null);
+        for (const record of shapeRecords) {
+            const timings = record.roleTimings || {};
+            const trigger = timings.trigger;
+            if (!trigger) continue;
+            for (const missingRole of new Set(record.shapeMissing || [])) {
+                if (missingRole === "guard1" ||
+                    config.roleLabels.indexOf(missingRole) < 0) continue;
+                const timing = timings[missingRole];
+                if (!timing) continue;
+                let targetMidpoint;
+                if (config.throughRoles.indexOf(missingRole) >= 0) {
+                    const triggerDuration = trigger.relEndUs - trigger.relStartUs;
+                    if (timing.durationUs <= triggerDuration) continue;
+                    targetMidpoint =
+                        (trigger.relStartUs + trigger.relEndUs) / 2;
+                } else if (config.heldRoles.indexOf(missingRole) >= 0) {
+                    targetMidpoint = trigger.relStartUs;
+                } else {
+                    continue;
+                }
+                const midpoint =
+                    (timing.relStartUs + timing.relEndUs) / 2;
+                (corrections[missingRole] ||
+                    (corrections[missingRole] = [])).push(
+                        targetMidpoint - midpoint);
+            }
+        }
+        const ranked = Object.entries(corrections)
+            .filter(([, values]) => values.length >= TIMING_MIN_FAILED_WAVES)
+            .sort((a, b) => b[1].length - a[1].length);
+        if (!ranked.length || (ranked[1] &&
+            ranked[0][1].length === ranked[1][1].length)) return null;
+        role = ranked[0][0];
+        samples = ranked[0][1];
+        reason = "positive-window-shape";
+    } else {
+        return null;
+    }
+
+    const correctionUs = median(samples);
+    if (!Number.isFinite(correctionUs) ||
+        Math.abs(correctionUs) < TIMING_NOISE_FLOOR_US) return null;
+    const stepUs = Math.max(-TIMING_MAX_STEP_US,
+        Math.min(TIMING_MAX_STEP_US, correctionUs));
+    const roleIndex = config.roleLabels.indexOf(role);
+    const isGuard = role === "guard0" || role === "guard1";
+    const delayIndex = isGuard ? roleIndex - 10 : roleIndex;
+    // Build a proposal on copies: this attempt's schedule stays immutable.
+    const roleDelays = config.roleDelays.slice();
+    const guardDelays = config.guardDelays.slice();
+    const delays = isGuard ? guardDelays : roleDelays;
+    const defaults = isGuard
+        ? config.baselineGuardDelays : config.baselineRoleDelays;
+    if (delayIndex < 0 || delayIndex >= delays.length) return null;
+
+    const before = delays[delayIndex];
+    let minDelay = Math.max(0, defaults[delayIndex] - TIMING_MAX_DRIFT_US * 1000);
+    let maxDelay = defaults[delayIndex] + TIMING_MAX_DRIFT_US * 1000;
+    if (delayIndex > 0)
+        minDelay = Math.max(minDelay,
+            delays[delayIndex - 1] + TIMING_MIN_ROLE_GAP_NS);
+    if (delayIndex + 1 < delays.length)
+        maxDelay = Math.min(maxDelay,
+            delays[delayIndex + 1] - TIMING_MIN_ROLE_GAP_NS);
+    if (minDelay > maxDelay) return null;
+    const after = Math.max(minDelay, Math.min(maxDelay,
+        before + Math.round(stepUs * 1000)));
+    const actualStepUs = (after - before) / 1000;
+    if (!actualStepUs) return null;
+    delays[delayIndex] = after;
+    return {role, deltaUs: actualStepUs, reason,
+        roleDelays, guardDelays};
 }
 
 // Compact hex form of one 16-field MemoryReportInfo vector, for the
