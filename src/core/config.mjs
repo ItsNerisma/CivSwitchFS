@@ -49,6 +49,8 @@ export function createFspIdentityConfig() {
   // m_accessor_mutex), so the temporal spread is essential for the race.
   var roleDelays = [0, 300000, 350000, 450000, 550000, 650000, 1000000, 1200000, 1300000, 1700000];
   var guardDelays = [150000, 300000];
+  var baselineRoleDelays = roleDelays.slice();
+  var baselineGuardDelays = guardDelays.slice();
   // References from Slapah / Kurumuz
   //var roleDelays = [0, 300000, 350000, 450000, 550000, 650000, 1700000, 2000000, 2150000, 2800000];
   //var guardDelays = [0, 150000];
@@ -109,6 +111,8 @@ export function createFspIdentityConfig() {
     CACHE_ALIAS_PREFIX,
     roleDelays,
     guardDelays,
+    baselineRoleDelays,
+    baselineGuardDelays,
     roleLabels,
     roleShort,
     workerRoles,

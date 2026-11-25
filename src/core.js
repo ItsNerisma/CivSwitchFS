@@ -141,6 +141,10 @@ export async function run() {
         });
 
         let attemptLimit = BASE_ATTEMPTS;
+        let timingSchedule = {
+            roleDelays: defaultTimingConfig.roleDelays.slice(),
+            guardDelays: defaultTimingConfig.guardDelays.slice()
+        };
         let usePreReservation = false;
         let preReservationFallbackUsed = false;
 
@@ -163,7 +167,7 @@ export async function run() {
             if (runControl.stopRequested) return;
             runControl.currentAttempt = attempt;
             const result = await runTrackedAttempt(usePreReservation,
-                runControl);
+                runControl, timingSchedule);
             positiveAttemptsTotal += result.positiveAttempts || 0;
             positiveWindowsTotal += result.positiveWindows || 0;
             qualifiedCanaryFlipsTotal += result.qualifiedCanaryFlips || 0;
@@ -183,6 +187,22 @@ export async function run() {
 
             if (!result.safeToRetry) {
                 return;
+            }
+
+            const anotherAttemptWillRun = attempt < attemptLimit ||
+                (result.retryWithPreReservation &&
+                    !preReservationFallbackUsed &&
+                    attempt < MAX_TOTAL_ATTEMPTS);
+            if (result.nextTimingSchedule && anotherAttemptWillRun) {
+                timingSchedule = {
+                    roleDelays: result.nextTimingSchedule.roleDelays.slice(),
+                    guardDelays: result.nextTimingSchedule.guardDelays.slice()
+                };
+                const change = result.timingAdjustment;
+                await log("Canary timing retuned for the next attempt: " +
+                    change.role + " " + (change.deltaUs > 0 ? "+" : "") +
+                    change.deltaUs.toFixed(0) + " µs (" +
+                    change.reason + ").");
             }
 
             if (result.retryWithPreReservation &&
@@ -329,7 +349,7 @@ function reportAddressProgress(message) {
 // ---------------------------------------------------------------------------
 
 async function runTrackedAttempt(usePreReservation = false,
-    runControl = null) {
+    runControl = null, timingSchedule = null) {
     const attemptState = {
         usePreReservation: usePreReservation === true,
         preReservationTested: false,
@@ -362,7 +382,9 @@ async function runTrackedAttempt(usePreReservation = false,
         cacheRetirementVerified: true,
         candidateCacheRetirementRequired: false,
         retainedEndpointActive: false,
-        cleanupLogStarted: false
+        cleanupLogStarted: false,
+        timingAdjustment: null,
+        nextTimingSchedule: null
     };
 
     const tracker = beginAllocationTracking();
@@ -375,7 +397,7 @@ async function runTrackedAttempt(usePreReservation = false,
     let executionError = null;
 
     try {
-        await runPayload(attemptState, runControl);
+        await runPayload(attemptState, runControl, timingSchedule);
     } catch (error) {
         const errorName = error?.name && error.name !== "Error"
             ? error.name + ": " : "";
@@ -490,8 +512,17 @@ async function runTrackedAttempt(usePreReservation = false,
 // Main payload (single attempt)
 // ---------------------------------------------------------------------------
 
-async function runPayload(attemptState, runControl = null) {
+async function runPayload(attemptState, runControl = null,
+    timingSchedule = null) {
     const config = createFspIdentityConfig();
+    if (timingSchedule &&
+        timingSchedule.roleDelays?.length === config.roleDelays.length &&
+        timingSchedule.guardDelays?.length === config.guardDelays.length) {
+        config.roleDelays.splice(0, config.roleDelays.length,
+            ...timingSchedule.roleDelays);
+        config.guardDelays.splice(0, config.guardDelays.length,
+            ...timingSchedule.guardDelays);
+    }
     const helpers = createFspIdentityHelpers({
         optimizeRootCandidateScan: true,
         collectRootScanTiming: true
@@ -737,6 +768,10 @@ async function runPayload(attemptState, runControl = null) {
     attemptState.positiveWindows = control?.positiveWindows || 0;
     attemptState.qualifiedCanaryFlips =
         control?.positiveQualifiedFlips || 0;
+    if (control?.timingAdjustment) {
+        attemptState.timingAdjustment = control.timingAdjustment;
+        attemptState.nextTimingSchedule = control.timingSchedule;
+    }
     let canaryStageMessage;
     if (control?.stoppedByUser) {
         canaryStageMessage = "Stopped by user after the current wave; no further waves will launch.";
