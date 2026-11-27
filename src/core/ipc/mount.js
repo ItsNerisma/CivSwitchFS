@@ -1,9 +1,13 @@
 // Inspect the SDK mount table for a mounted filesystem handle.
 
-// -- Mount table access --------------------------------------------
+// ----- Mount table access -----
 
-// Walk the SDK mount table to extract session handle + domain object ID.
-// Returns { handle, objId } or null on failure.
+/*
+ * Walk the SDK mount table and pull out the session handle plus the domain object
+ * id.
+ *
+ * Returns { handle, objId }, or null on failure.
+ */
 function getMountHandle(name) {
     const nameBuf = allocRawTracked(16);
     writeStr(nameBuf, name);
@@ -11,7 +15,11 @@ function getMountHandle(name) {
     write64(accOut, 0n);
     const r = call_rop(F_FindMount, accOut, nameBuf);
     const a = read64(accOut);
-    if (r !== 0n || a === 0n) return null;
+
+    if (r !== 0n || a === 0n) {
+        return null;
+    }
+
     const impl    = read64(a + 0x28n);
     const service = read64(impl + 0x10n);
     const objId   = Number(read32(service + 0x18n)) >>> 0;

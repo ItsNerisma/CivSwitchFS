@@ -1,22 +1,30 @@
-// Render logs in one styled pre and forward them to persistence when available.
+// Render every log line in one styled <pre> block and forward it to the persistence layer when one exists.
 const MAX_VISIBLE_LOG_LINES = 100;
 let clearCurrentVisualLog = function () {};
 
+/** Clear the on-screen log panel, so the next attempt starts from an empty one. */
 export function clearVisualLog() {
     const hostWindow = globalThis.window || globalThis;
     let logger = hostWindow.log;
+
     if (typeof logger?.clear !== "function") {
         logger = globalThis.log;
     }
-    if (typeof logger?.clear === "function")
+
+    if (typeof logger?.clear === "function") {
         return Reflect.apply(logger.clear, logger, []);
+    }
 
     clearCurrentVisualLog();
 }
 
+/** Route the loader's own console output through the payload log. The patch only lands once. */
 export function installLoaderLogPatch() {
     const hostWindow = globalThis.window || globalThis;
-    if (typeof hostWindow.log?.clear === "function") return;
+
+    if (typeof hostWindow.log?.clear === "function") {
+        return;
+    }
 
     const document = globalThis.document;
     let output = null;
@@ -25,11 +33,16 @@ export function installLoaderLogPatch() {
 
     clearCurrentVisualLog = function () {
         visibleLines.length = 0;
-        if (output?.isConnected) output.textContent = "";
+
+        if (output?.isConnected) {
+            output.textContent = "";
+        }
     };
 
     function ensureOutput() {
-        if (!document?.body) return null;
+        if (!document?.body) {
+            return null;
+        }
 
         if (!output?.isConnected) {
             visibleLines.length = 0;
@@ -37,10 +50,11 @@ export function installLoaderLogPatch() {
             document.body.appendChild(output);
         }
 
-        // This patch owns the only visible log buffer.
+        // After the patch, this element is the only visible log buffer.
         for (const nativeOutput of document.querySelectorAll("pre")) {
-            if (nativeOutput !== output && nativeOutput.parentNode)
+            if (nativeOutput !== output && nativeOutput.parentNode) {
                 nativeOutput.parentNode.removeChild(nativeOutput);
+            }
         }
 
         compact = applyConsoleStyle(output, document);
@@ -54,9 +68,10 @@ export function installLoaderLogPatch() {
             .split("\n");
 
         const logOutput = ensureOutput();
+
         if (logOutput) {
             appendLogRows(logOutput, document, messageLines, timestamp,
-                compact, visibleLines);
+                          compact, visibleLines);
             logOutput.scrollTop = logOutput.scrollHeight;
         }
 
@@ -72,21 +87,28 @@ export function installLoaderLogPatch() {
 
 function forwardPersistedLog(message) {
     const forwarder = globalThis.__CIVSWITCHFS_PERSIST_LOG_FORWARDER__;
-    if (typeof forwarder !== "function") return;
+
+    if (typeof forwarder !== "function") {
+        return;
+    }
 
     try {
         Reflect.apply(forwarder, globalThis, [message]);
-    } catch (error) {}
+    } catch {}
 }
 
 function waitForDisplayFrame(hostWindow) {
     let requestFrame = hostWindow.requestAnimationFrame;
     let frameWindow = hostWindow;
+
     if (typeof requestFrame !== "function") {
         requestFrame = globalThis.requestAnimationFrame;
         frameWindow = globalThis;
     }
-    if (typeof requestFrame !== "function") return Promise.resolve();
+
+    if (typeof requestFrame !== "function") {
+        return Promise.resolve();
+    }
 
     return new Promise(resolve => requestFrame.call(frameWindow, resolve));
 }
@@ -138,7 +160,7 @@ function applyConsoleStyle(output, document) {
 }
 
 function appendLogRows(output, document, lines, timestamp, compact,
-    visibleLines) {
+                       visibleLines) {
     for (const line of lines.slice(-MAX_VISIBLE_LOG_LINES)) {
         const row = document.createElement("div");
         Object.assign(row.style, {
@@ -179,17 +201,27 @@ function appendLogRows(output, document, lines, timestamp, compact,
 
         while (visibleLines.length > MAX_VISIBLE_LOG_LINES) {
             const oldestLine = visibleLines.shift();
-            if (oldestLine?.parentNode === output)
+
+            if (oldestLine?.parentNode === output) {
                 output.removeChild(oldestLine);
+            }
         }
     }
 }
 
+/**
+ * Bind controller and engine input to the two run controls, stop and the verbose
+ * toggle. Returns the handles that run() clears in its finally, so a finished run
+ * leaves no listener behind.
+ */
 export function installRunInputControls({
     onStop, onToggleVerbose
 } = {}) {
     const window = globalThis.window;
-    if (!window?.addEventListener) return {dispose() {}};
+
+    if (!window?.addEventListener) {
+        return {dispose() {}};
+    }
 
     const statuses = window.InputActionStatuses || {
         START: 0,
@@ -201,7 +233,7 @@ export function installRunInputControls({
     let runCallbacks = {onStop, onToggleVerbose};
     let controllerPrevious = Object.create(null);
     let lastVerboseToggleAt = 0;
-    const engineActionActive = {stop: false};
+    let engineStopActive = false;
 
     function consume(event) {
         event?.preventDefault?.();
@@ -209,74 +241,103 @@ export function installRunInputControls({
     }
 
     function requestStop(event) {
-        if (typeof runCallbacks.onStop !== "function") return false;
+        if (typeof runCallbacks.onStop !== "function") {
+            return false;
+        }
+
         consume(event);
         runCallbacks.onStop();
         return true;
     }
 
     function requestToggleVerbose() {
-        if (typeof runCallbacks.onToggleVerbose !== "function") return false;
+        if (typeof runCallbacks.onToggleVerbose !== "function") {
+            return false;
+        }
+
         const now = Date.now();
-        if (now - lastVerboseToggleAt < 180) return true;
+
+        if (now - lastVerboseToggleAt < 180) {
+            return true;
+        }
+
         lastVerboseToggleAt = now;
         runCallbacks.onToggleVerbose();
         return true;
     }
 
-    function handleEngineAction(event, action) {
+    function handleEngineStop(event) {
         const callback = runCallbacks.onStop;
-        if (typeof callback !== "function") return;
+
+        if (typeof callback !== "function") {
+            return;
+        }
 
         const isFinished = event.detail?.status === statuses.FINISH;
-        const isActive = engineActionActive[action];
+        const isActive = engineStopActive;
         consume(event);
+
         if (!isActive) {
             requestStop(event);
         }
-        engineActionActive[action] = !isFinished;
+
+        engineStopActive = !isFinished;
     }
 
     function handleEngineToggle(event) {
-        if (typeof runCallbacks.onToggleVerbose !== "function") return;
+        if (typeof runCallbacks.onToggleVerbose !== "function") {
+            return;
+        }
+
         const status = event.detail?.status;
         const isStart = status === statuses.START ||
             String(status).toLowerCase() === "start";
         const isFinished = status === statuses.FINISH ||
             String(status).toLowerCase() === "finish";
-        if (!isStart && !isFinished && status != null) return;
+
+        if (!isStart && !isFinished && status != null) {
+            return;
+        }
+
         consume(event);
-        if (!isFinished) requestToggleVerbose();
+
+        if (!isFinished) {
+            requestToggleVerbose();
+        }
     }
 
     function onEngineInput(event) {
-        if (disposed) return;
+        if (disposed) {
+            return;
+        }
+
         const detail = event.detail || {};
         let name = "";
+
         if (typeof detail.name === "string") {
             name = detail.name.toLowerCase();
         }
+
         let isCancel = false;
-        // Use the game's cancel helper when available; raw action names vary.
+        // Use the game's cancel helper when it exists, since the raw action names vary.
         try {
             isCancel = typeof event.isCancelInput === "function" &&
                 event.isCancelInput() === true;
-        } catch (ignored) {}
+        } catch {}
 
         if (isCancel || name === "back" ||
             name === "cancel" || name === "ui-back") {
-            handleEngineAction(event, "stop");
+            handleEngineStop(event);
             return;
         }
 
         if (name === "shell-action-1") {
-            // Keep X from reaching the game now that it has no payload action.
+            // Swallow X so it never reaches the game: it has no payload action left.
             consume(event);
             return;
         }
 
-        if (name === "shell-action-2" || name === "shell-action-y" ||
-            name === "button-y" || name === "gamepad-y" || name === "y") {
+        if (isVerboseToggleAction(name)) {
             handleEngineToggle(event);
             return;
         }
@@ -284,31 +345,24 @@ export function installRunInputControls({
 
     function pollGamepad() {
         let navigator = globalThis.navigator;
+
         if (typeof window.navigator?.getGamepads === "function") {
             navigator = window.navigator;
         }
-        if (!navigator || typeof navigator.getGamepads !== "function") return;
+
+        if (!navigator || typeof navigator.getGamepads !== "function") {
+            return;
+        }
 
         let pads;
         try {
             pads = navigator.getGamepads();
-        } catch (ignored) {
+        } catch {
             return;
         }
 
-        let pad = null;
-        let fallbackPad = null;
-        for (let index = 0; index < pads.length; index++) {
-            const candidate = pads[index];
-            if (!candidate || candidate.connected === false) continue;
-            if (!fallbackPad && candidate.buttons?.length >= 4)
-                fallbackPad = candidate;
-            if (candidate.mapping === "standard") {
-                pad = candidate;
-                break;
-            }
-        }
-        if (!pad) pad = fallbackPad;
+        const pad = selectGamepad(pads);
+
         if (!pad) {
             controllerPrevious = Object.create(null);
             return;
@@ -318,13 +372,18 @@ export function installRunInputControls({
             return Boolean(pad.buttons[index] && pad.buttons[index].pressed);
         }
 
-        // Standard Gamepad layout: Nintendo B is south (0), Y is west (2), X is north (3).
+        // Standard Gamepad layout on Nintendo hardware: B is south (0), Y is west (2), X is north (3).
         for (const button of [0, 2]) {
             const current = pressed(button);
+
             if (current && controllerPrevious[button] !== true) {
-                if (button === 2) requestToggleVerbose();
-                else requestStop();
+                if (button === 2) {
+                    requestToggleVerbose();
+                } else {
+                    requestStop();
+                }
             }
+
             controllerPrevious[button] = current;
         }
     }
@@ -338,11 +397,43 @@ export function installRunInputControls({
             runCallbacks = {onStop: null, onToggleVerbose: null};
         },
         dispose() {
-            if (disposed) return;
+            if (disposed) {
+                return;
+            }
+
             disposed = true;
-            if (inputTimer !== null) clearInterval(inputTimer);
+
+            if (inputTimer !== null) {
+                clearInterval(inputTimer);
+            }
+
             window.removeEventListener("engine-input", onEngineInput, true);
         }
     };
     return controls;
+}
+
+function selectGamepad(pads) {
+    let fallbackPad = null;
+    for (let index = 0; index < pads.length; index++) {
+        const candidate = pads[index];
+
+        if (!candidate || candidate.connected === false) {
+            continue;
+        }
+
+        if (!fallbackPad && candidate.buttons?.length >= 4) {
+            fallbackPad = candidate;
+        }
+
+        if (candidate.mapping === "standard") {
+            return candidate;
+        }
+    }
+    return fallbackPad;
+}
+
+function isVerboseToggleAction(name) {
+    return name === "shell-action-2" || name === "shell-action-y" ||
+        name === "button-y" || name === "gamepad-y" || name === "y";
 }

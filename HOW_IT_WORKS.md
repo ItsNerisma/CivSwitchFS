@@ -64,14 +64,14 @@ flowchart TD
     J --> Z[Continue with elevated session]
     R --> S{Is another attempt safe?}
     S -->|no| X[Stop]
-    S -->|yes| T[Retry with built-in timing schedule]
+    S -->|yes| T[Retry with the next attempt schedule]
     T --> A
 ```
 
-The outer loop starts with 10 complete attempts and can add one final attempt if the last attempt needs to try the alternate candidate-allocation order. Every attempt uses the fixed schedule in [src/core/config.mjs](src/core/config.mjs).
+The retry loop allows up to 10 attempts and can add one final attempt to test opening the reservation group before candidate storage. The first attempt uses the built-in schedule in [src/core/config.mjs](src/core/config.mjs). Later safe attempts may use a bounded adjustment from the previous canary campaign.
 
 > [!NOTE]
-> A retry starts only after cleanup confirms that workers have stopped, temporary allocations are freed, the candidate cache is verified safe or retired, and `/hole` is gone. If cleanup cannot prove the state is safe, the exploit stops instead of carrying that state into another race.
+> A retry starts only after cleanup confirms that workers have stopped, tracked allocations are freed, the candidate cache is safe or retired, `/hole` is gone, all PID writes are restored, and no retained endpoint is active. If any check is uncertain, the exploit stops instead of starting another race.
 
 ## 1. Prepare and qualify the race
 
@@ -105,7 +105,7 @@ The final session also stays in domain form so later payloads can use its handle
 
 ### What happens in a wave
 
-Each wave starts 11 worker threads behind a shared gate. The worker IDs remain in 13 stable slots, but W7 and W8 are inactive. When the gate opens, each active worker waits its assigned delay and runs its IPC work. The campaign repeats waves to see whether the schedule produces the required timing pattern and filesystem result.
+Role IDs keep 13 stable slots for packet and frame indexing. Each wave starts 11 threads: W0-W6 and W9-W12. W7 and W8 remain inactive. When the gate opens, each active worker waits its assigned delay and runs its IPC work. The campaign repeats waves to see whether the schedule produces the required timing pattern and filesystem result.
 
 The trigger is W12's `GetEntryType` request with a very long path. W2 through W5 carry the path fragments used by that lookup. W1 sends a 64 KiB content-storage read through an `IStorage` handle.
 
@@ -127,7 +127,7 @@ The table lists active workers with short role names. W7 and W8 are omitted beca
 
 All 11 active workers use the same selected core. The core argument to `svcCreateThread` sets an ideal core, which still allows the scheduler to run a thread elsewhere when its affinity mask permits it. Before starting any worker, the exploit calls `svcSetThreadCoreMask` with a mask containing only that core. If any call fails, it closes the unstarted workers and abandons the wave.
 
-The worker priorities start at a value borrowed from a live game thread, then increase by each worker's index. Horizon gives smaller numbers higher priority, so W0 has the highest priority in this group and W12 the lowest. The single-core affinity makes those priority differences apply to the workers on the same scheduler. Priorities order runnable threads; they do not control the order in which `fsp-srv` processes requests.
+Priority values start from a value borrowed from a live game thread, then increase by each active worker's position in `workerRoles`. Horizon gives smaller numbers higher priority, so W0 has the highest priority and W12 the lowest. W7 and W8 are absent from that list. On the pinned core, priorities order runnable workers; they do not dictate `fsp-srv`'s request-processing order.
 
 **The requests have different overlap requirements:**
 
@@ -162,7 +162,7 @@ Each worker starts after its configured delay. The delays and priorities serve d
 - W10 and W11: 150 and 300 microseconds after W9 signals that the reservation group has been freed.
 - W12: waits for the release and guard signals without an initial delay. After another 400 microseconds, it checks whether W1 has finished. If W1 is still running, W12 waits on its completion gate. It snapshots the abort flags before sending the trigger.
 
-These fixed delays are in [`src/core/config.mjs`](src/core/config.mjs). The campaign measures worker spans to qualify overlap and diagnose failures, but it does not adjust or persist the schedule.
+These are the built-in delays in [src/core/config.mjs](src/core/config.mjs). One schedule stays in effect for each attempt. After the control profiles pass, the next safe attempt can adjust one role's delay if at least two positive waves each fail the same single timing gate and no post-wave health check fails. Each change is limited to 150 microseconds, and the delay stays within 1 millisecond of its built-in value. The adjusted schedule stays in memory and is not saved to the game save.
 
 ```mermaid
 sequenceDiagram
@@ -241,12 +241,10 @@ The absent and present path profiles check that W12 receives the end of its long
 
 The campaign qualifies a canary flip only when W6 sees the canary as a directory during the positive trigger, no other path changes, and a post-wave check sees the canary as a file again.
 
-Timing measurements affect whether a wave qualifies and help explain rejected windows. They do not change worker delays between attempts.
-
 > [!NOTE]
 > The controls rule out broken setup before the race is counted. W12 must honor its abort gates, find the marker at the end of the long path, and return the expected missing-path error. Only then can a canary flip count as success.
 
-Setup and wave scheduling live in [`setup.mjs`](src/core/steps/setup.mjs), [`campaign.mjs`](src/core/steps/campaign.mjs), and [`orchestration.js`](src/core/wave/orchestration.js).
+Setup and wave scheduling live in [setup.mjs](src/core/steps/setup.mjs), [canary.mjs](src/core/steps/canary.mjs), and [orchestration.js](src/core/wave/orchestration.js).
 
 ## 2. Create the cache alias
 
@@ -277,7 +275,7 @@ The `cmd 1002` path copy stops at a NUL byte. `nulWrites` builds seven prefixes,
 
 Each of the seven prefix steps gets up to 10 wave attempts, for a maximum of 70 attempts per alias installation. **A step passes only when the wave qualifies, at least `0x2810` cache bytes remain allocated before release, and no unexpected path changes.**
 
-For a clean candidate cache, cleanup first tries `IStorage::OperateRange` with operation 2. If invalidation is not confirmed, cleanup skips retirement waves and stops the attempt. With workers quiesced and no retained endpoint active, the payload reports `STATE IS SAFE TO RESTART`. Dirty retained endpoints still use retirement waves because invalidation could flush corrupted data.
+For a clean candidate cache, cleanup tries `IStorage::OperateRange` with operation 2. If invalidation is not confirmed, cleanup leaves the candidate handle open, skips retirement waves, and stops the attempt. Dirty retained endpoints use retirement waves because invalidation could flush corrupted data.
 
 ```mermaid
 flowchart TD
@@ -302,12 +300,10 @@ flowchart TD
 
 **Discovery starts with a 2 MiB read at offset `0x1400000`.** Its first bytes must match the values primed at offset `0`.
 
-**If alias installation was attempted, cleanup invalidates the candidate storage cache before closing it.** If invalidation is not confirmed, cleanup leaves the candidate handle open and skips retirement waves. The run reports `STATE IS SAFE TO RESTART` only when workers have stopped and no retained endpoint is active. Relaunch the game normally.
-
 > [!NOTE]
 > **The cache entry is tagged for offset 20 MiB but holds bytes primed at offset 0.** A widened read exposes the mismatch, then crosses the 16 KiB cache block into nearby `fsp-srv` memory. Discovery uses that memory window to find the objects it needs to promote.
 
-PID writes use the retained endpoint described in section 4. See [`alias.mjs`](src/core/steps/alias.mjs).
+PID writes use the retained endpoint described in section 4. See [alias.mjs](src/core/steps/alias.mjs).
 
 ## 3. Find and verify the target objects
 
@@ -363,7 +359,7 @@ From the root, discovery follows pointers to the NCA (Nintendo Content Archive) 
 > [!NOTE]
 > **The root is only the entry point.** It routes content and save work to separate backends. Updating only the root leaves those backends with the old identity, so all three PID fields must match for both paths to work.
 
-Discovery and scanning are in [`discovery.mjs`](src/core/steps/discovery.mjs) and [`scan.mjs`](src/core/helpers/scan.mjs).
+Discovery and scanning are in [discovery.mjs](src/core/steps/discovery.mjs) and [scan.mjs](src/core/helpers/scan.mjs).
 
 ## 4. Build a retained memory endpoint
 
@@ -388,7 +384,7 @@ A background cache loop could process the synthetic descriptors during a transfe
 > [!NOTE]
 > **The alias finds the objects, the endpoint changes their PID fields.** Stopping the owner loop keeps background work from processing the repurposed descriptors during a transfer.
 
-Endpoint construction and promotion live in [`promotion.mjs`](src/core/promotion.mjs).
+Endpoint construction and promotion live in [steps/promotion.mjs](src/core/steps/promotion.mjs).
 
 ## 5. Write the PID fields and prove access
 
@@ -407,7 +403,7 @@ After all three writes, reread all three objects. **Each PID must be `1`, and ev
 
 To test the promoted identity, the exploit calls `OpenContentStorageFileSystem(User=1)` (command `110`). The reply must contain exactly one filesystem object. It clones that object and lists `/`. **The open passes the `CanMountContentStorage` permission check, and listing `/` proves the returned filesystem works.** ([Switchbrew documents command 110 and its permission mapping](https://switchbrew.org/wiki/Filesystem_services#Permissions).)
 
-After both checks pass, the exploit assigns the domain session to **`globalThis.fspSrv`**. The value contains the session handle and root object ID. Later payloads share the loader's JavaScript context and use it for more `fsp-srv` commands. The temporary User filesystem handle and domain object close. The promoted session stays open. The follow-up is in [`examples/user-storage.mjs`](examples/user-storage.mjs).
+After both checks pass, the exploit assigns the domain session to **`globalThis.fspSrv`**. The value contains the session handle and root object ID. Later payloads share the loader's JavaScript context and use it for more `fsp-srv` commands. The temporary User filesystem handle and domain object close. The promoted session stays open. The follow-up is in [examples/user-storage.mjs](examples/user-storage.mjs).
 
 > [!NOTE]
 > **A PID readback proves the write landed, not that the session can use the permission.** Opening User content storage and listing `/` prove `fsp-srv` accepts the promoted identity. The exploit publishes `globalThis.fspSrv` only after both checks pass.

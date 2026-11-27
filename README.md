@@ -61,14 +61,14 @@ These controls work while the exploit is running.
 
 #### Race timing schedule
 
-The canary campaign uses this fixed schedule, in nanoseconds:
+The first attempt uses these built-in delays, in nanoseconds:
 
 - W0-W6, in role order: `0`, `300000`, `350000`, `450000`, `550000`, `650000`, `1000000`
 - W9 release: `1700000`
 - W10-W11 guards, after release: `150000`, `300000`
 - W7 and W8 filler workers are disabled. W12 is gate-driven and does not use this delay list.
 
-The payload reads these values from [src/core/config.mjs](src/core/config.mjs). It does not load or save timing schedules in save data. Change the source values to retune the schedule.
+The built-in delays are in [src/core/config.mjs](src/core/config.mjs). After the controls pass, a safe failed campaign may adjust one delay for the next attempt when positive waves repeatedly fail the same timing gate. The adjustment stays in memory and is not saved in the game save. Change the source values to retune the baseline.
 
 ---
 
@@ -76,8 +76,8 @@ The payload reads these values from [src/core/config.mjs](src/core/config.mjs). 
 
 - **`You just Civ Sevened your machine, congrats`**: the exploit succeeded and the elevated session is available as `globalThis.fspSrv` for follow-up payloads.
 - **`CANARY FLIPPED`**: the race qualification passed. The payload is still checking memory and promoting the filesystem session. Wait for the success message.
-- **`Canary did not flip.`**: this attempt did not qualify the race, so later stages were skipped. The campaign retries with the configured schedule. If the final status says `STATE IS SAFE TO RESTART`, restart the game to launch another run.
-- **`STATE IS SAFE TO RESTART`**: no dirty retained cache endpoint remains. Restart Civilization VII normally.
+- **`Canary did not flip.`**: this attempt did not qualify the race, so later stages were skipped. If the run retries, a later safe attempt may adjust one delay based on repeated positive-wave timing failures. If the final status says `STATE IS SAFE TO RESTART`, restart the game to launch another run.
+- **`STATE IS SAFE TO RESTART`**: cleanup verified that workers stopped, the candidate cache is safe or retired, `/hole` is gone, tracked allocations were released, all PID writes were restored, and no retained endpoint is active. Restart Civilization VII normally.
 - **`STATE IS UNSAFE`**: do not close the game or reboot normally. Hard reboot by holding the power button for 15 seconds. See [the hard reboot explanation](BRICK_RISKS.md#why-a-hard-reboot-is-the-safe-option-here).
 - **`STATE IS UNKNOWN`**: cleanup could not be verified. Treat it as unsafe and hard reboot as described above.
 
@@ -91,7 +91,7 @@ If failures continue across several runs with the same symptoms (no canary flip,
 
 After the main payload reports success, you can send follow-up payloads and use the `globalThis.fspSrv` handle to perform filesystem operations.
 
-An example can be found in [examples/user-storage](examples/user-storage).
+An example can be found in [examples/user-storage.mjs](examples/user-storage.mjs).
 
 ---
 

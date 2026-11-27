@@ -1,6 +1,10 @@
-// Pure parsers and candidate calculations for fsp-srv allocator/root layouts.
-// Depends on: core/analysis/bytes.js (AnalysisBytes).
-// API: RootLayout. Capture reads and IPC remain in the calling payload.
+/*
+ * Pure parsers and candidate calculations for the fsp-srv allocator and root
+ * layouts, exposed as RootLayout.
+ *
+ * The capture reads and the IPC stay in the calling payload. Uses the helpers of
+ * core/analysis/bytes.js (AnalysisBytes).
+ */
 
 var RootLayout = (function() {
     var DEFAULTS = {
@@ -22,12 +26,18 @@ var RootLayout = (function() {
     function settings(options) {
         var out = {};
         var key;
-        for (key in DEFAULTS) out[key] = DEFAULTS[key];
-        if (options) {
-            for (key in options)
-                if (Object.prototype.hasOwnProperty.call(options, key))
-                    out[key] = options[key];
+        for (key in DEFAULTS) {
+            out[key] = DEFAULTS[key];
         }
+
+        if (options) {
+            for (key in options) {
+                if (Object.prototype.hasOwnProperty.call(options, key)) {
+                    out[key] = options[key];
+                }
+            }
+        }
+
         return out;
     }
 
@@ -50,6 +60,7 @@ var RootLayout = (function() {
         var opts = settings(options);
         var poolSize = opts.poolSize;
         var alignment = opts.poolAlignment;
+
         if (!links || !links.length || !Number.isSafeInteger(seed) ||
             seed % opts.controlSize) {
             return {candidates: [], size: poolSize, alignment: alignment};
@@ -62,10 +73,17 @@ var RootLayout = (function() {
             var inside = [];
             for (var i = 0; i < links.length; i++) {
                 var link = links[i];
+
                 if (link.source >= start && link.source + opts.controlSize <=
-                    start + poolSize) inside.push(link);
+                    start + poolSize) {
+                    inside.push(link);
+                }
             }
-            if (!inside.length) continue;
+
+            if (!inside.length) {
+                continue;
+            }
+
             var allInside = true;
             for (var j = 0; j < inside.length; j++) {
                 if (inside[j].value < start ||
@@ -74,7 +92,10 @@ var RootLayout = (function() {
                     break;
                 }
             }
-            if (allInside) candidates.push(start);
+
+            if (allInside) {
+                candidates.push(start);
+            }
         }
         return {first: candidates.length ? candidates[0] : null,
             last: candidates.length ? candidates[candidates.length - 1] : null,
@@ -82,19 +103,25 @@ var RootLayout = (function() {
             observedLinks: links.length};
     }
 
+
+
     function choosePoolRefinementStart(bounds, links, captures, bias, cycle,
-        attemptIndex, options) {
+                                       attemptIndex, options) {
         var opts = settings(options);
-        if (!bounds || !bounds.candidates || !links || !captures ||
-            !Number.isSafeInteger(cycle) || cycle <= 0 ||
-            bounds.candidates.length <= opts.maxPoolCandidates)
+
+        if (hasInvalidPoolRefinementInputs(bounds, links, captures, cycle,
+                                           opts)) {
             return null;
+        }
 
         function covered(start) {
             for (var i = 0; i < captures.length; i++) {
                 var item = captures[i];
+
                 if (item.address <= start && start + cycle <=
-                    item.address + item.length) return true;
+                    item.address + item.length) {
+                    return true;
+                }
             }
             return false;
         }
@@ -109,6 +136,7 @@ var RootLayout = (function() {
         for (var li = 0; li < links.length; li++) {
             var target = links[li].value;
             var key = String(target);
+
             if (!targetSeen[key]) {
                 targetSeen[key] = true;
                 targets.push(target);
@@ -121,37 +149,52 @@ var RootLayout = (function() {
         for (var ti = 0; ti < targets.length; ti++) {
             var targetStart = bias + Math.floor((targets[ti] - bias) / cycle) *
                 cycle;
-            if (inside(targetStart) && !covered(targetStart)) return targetStart;
+
+            if (inside(targetStart) && !covered(targetStart)) {
+                return targetStart;
+            }
         }
 
         var start = bias + Math.ceil((bounds.last - bias) / cycle) * cycle;
-        for (; inside(start); start += cycle)
-            if (!covered(start)) return start;
+        for (; inside(start); start += cycle) {
+            if (!covered(start)) {
+                return start;
+            }
+        }
         return null;
     }
 
+
+
     function parseExternalLink(bytes, offset, address, options) {
         var opts = settings(options);
-        if (offset < 0 || offset + 24 > bytes.length) return null;
+
+        if (offset < 0 || offset + 24 > bytes.length) {
+            return null;
+        }
+
         var next = AnalysisBytes.readU64LE(bytes, offset);
         var previous = AnalysisBytes.readU64LE(bytes, offset + 8);
         var extent = AnalysisBytes.readU64LE(bytes, offset + 16);
         var linkAddress = BigInt(address);
         var distance = next >= linkAddress
             ? next - linkAddress : linkAddress - next;
-        if (next < opts.minimumPointer ||
-            next >= opts.maximumPointerExclusive ||
-            next % opts.linkAlignment !== 0n || next !== previous ||
-            distance <= opts.externalLinkMinimumDistance ||
-            extent < opts.minimumExtent || extent > opts.maximumExtent ||
-            extent % opts.extentAlignment !== 0n) return null;
+
+        if (isInvalidExternalLink(next, previous, distance, extent, opts)) {
+            return null;
+        }
+
         return {next: next, previous: previous, extent: extent};
     }
 
     function metadataWindowFromNext(next, options) {
         var opts = settings(options);
+
         if (next < opts.minimumPointer ||
-            next >= opts.maximumPointerExclusive) return null;
+            next >= opts.maximumPointerExclusive) {
+            return null;
+        }
+
         var blockOffset = Number(next % BigInt(opts.metadataBlockSize));
         var length = blockOffset >= opts.metadataPageSize
             ? opts.metadataPageSize : opts.metadataBlockSize;
@@ -161,19 +204,28 @@ var RootLayout = (function() {
             originalBlockOffset: blockOffset};
     }
 
-    // Layout-specific deltas are required inputs so a caller-owned root rule
-    // cannot silently become a Loader-target rule (or vice versa).
+    /*
+     * Each layout carries its own deltas, so a rule written for a caller-owned root
+     * cannot quietly turn into a Loader-target rule, and the other way round.
+     */
     function makeDomainCandidate(address, first, second, manager, options) {
         var opts = settings(options);
+
         if (!options || typeof options.domainVptrDelta !== "bigint" ||
-            typeof options.rootVptrDelta !== "bigint") return null;
-        if (second - first !== options.domainVptrDelta ||
-            first < options.rootVptrDelta ||
-            !isCanonicalPointer(first, opts) ||
-            !isCanonicalPointer(second, opts) ||
-            !isCanonicalPointer(manager, opts)) return null;
+            typeof options.rootVptrDelta !== "bigint") {
+            return null;
+        }
+
+        if (isInvalidDomainCandidate(first, second, manager, options, opts)) {
+            return null;
+        }
+
         var rootVptr = first - options.rootVptrDelta;
-        if (!isCanonicalPointer(rootVptr, opts)) return null;
+
+        if (!isCanonicalPointer(rootVptr, opts)) {
+            return null;
+        }
+
         return {address: address, first: first, second: second,
             rootVptr: Number(rootVptr), manager: Number(manager)};
     }
@@ -186,15 +238,41 @@ var RootLayout = (function() {
             var key = candidate.rootVptr.toString(16) + ":" +
                 candidate.manager.toString(16);
             var groupIndex = indexes[key];
+
             if (groupIndex === undefined) {
                 groupIndex = groups.length;
                 indexes[key] = groupIndex;
                 groups.push({rootVptr: candidate.rootVptr,
                     manager: candidate.manager, domains: []});
             }
+
             groups[groupIndex].domains.push(candidate);
         }
         return groups;
+    }
+
+    function hasInvalidPoolRefinementInputs(bounds, links, captures, cycle,
+                                            opts) {
+        return !bounds || !bounds.candidates || !links || !captures ||
+            !Number.isSafeInteger(cycle) || cycle <= 0 ||
+            bounds.candidates.length <= opts.maxPoolCandidates;
+    }
+
+    function isInvalidExternalLink(next, previous, distance, extent, opts) {
+        return next < opts.minimumPointer ||
+            next >= opts.maximumPointerExclusive ||
+            next % opts.linkAlignment !== 0n || next !== previous ||
+            distance <= opts.externalLinkMinimumDistance ||
+            extent < opts.minimumExtent || extent > opts.maximumExtent ||
+            extent % opts.extentAlignment !== 0n;
+    }
+
+    function isInvalidDomainCandidate(first, second, manager, options, opts) {
+        return second - first !== options.domainVptrDelta ||
+            first < options.rootVptrDelta ||
+            !isCanonicalPointer(first, opts) ||
+            !isCanonicalPointer(second, opts) ||
+            !isCanonicalPointer(manager, opts);
     }
 
     return {

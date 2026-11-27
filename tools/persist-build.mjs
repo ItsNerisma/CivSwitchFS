@@ -1,4 +1,4 @@
-/** Build a standalone CivSwitchFS image and its save installer. */
+/** Build a standalone CivSwitchFS image, then the save installer that ships it. */
 
 import {deflateRawSync, inflateRawSync} from "node:zlib";
 import {mkdir, readFile, writeFile} from "node:fs/promises";
@@ -16,8 +16,11 @@ const PERSIST_DIR = path.join(ROOT, "persist");
 export async function buildPersistentImage(options = {}) {
     const debugPayload = options.debugPayload === true;
     const minifyPayload = options.minifyPayload === true;
-    if (debugPayload && minifyPayload)
+
+    if (debugPayload && minifyPayload) {
         throw new Error("Choose either --debug-payload or --minify-payload");
+    }
+
     const corePath = options.corePath || path.join(PERSIST_DIR, "core.js");
     const templatePath = options.templatePath || path.join(PERSIST_DIR, "save_template.bin");
     const decoderPath = options.decoderPath || path.join(PERSIST_DIR, "compress_stage.js");
@@ -31,20 +34,29 @@ export async function buildPersistentImage(options = {}) {
         readFile(path.join(ROOT, "LICENSE"), "utf8"),
         readFile(path.join(ROOT, "package.json"), "utf8")
     ]);
+
     if (!upstreamLicense.includes("Copyright (c) 2026 Gezine") ||
-        !upstreamLicense.includes("Permission is hereby granted"))
+        !upstreamLicense.includes("Permission is hereby granted")) {
         throw new Error("CivSwitch bootstrap license not recognized");
+    }
 
     const decoderMatch = decoderSource.match(/const DECODER = `([\s\S]*?)`;/);
-    if (!decoderMatch) throw new Error("Stage decoder not found");
+
+    if (!decoderMatch) {
+        throw new Error("Stage decoder not found");
+    }
 
     const payload = await buildPayload({
         debug: debugPayload,
         minifyIdentifiers: minifyPayload
     });
     const assembled = injectPayload(core, payload.payload);
-    // Keep every outer lexical name visible to the direct eval in the payload.
-    // Whitespace-only minification keeps the bootstrap's compatibility contract.
+
+    /*
+     * Keep every outer lexical name visible to the direct eval inside the payload.
+     * Whitespace-only minification is what preserves the bootstrap's compatibility
+     * contract.
+     */
     const transformed = await esbuild.transform(assembled, {
         loader: "js",
         target: "es2020",
@@ -56,8 +68,10 @@ export async function buildPersistentImage(options = {}) {
     });
     const standalone = transformed.code.trim() + "\n";
     const compressed = deflateRawSync(Buffer.from(standalone, "ascii"), {level: 9});
-    if (inflateRawSync(compressed).toString("ascii") !== standalone)
+
+    if (inflateRawSync(compressed).toString("ascii") !== standalone) {
         throw new Error("Stage compression round-trip failed");
+    }
 
     const decoder = decoderMatch[1];
     const encoded = compressed.toString("base64");
@@ -68,9 +82,13 @@ export async function buildPersistentImage(options = {}) {
         licenseBlock("CivSwitch", upstreamLicense) +
         decoder + "\neval(" + decodeExpression + ");\n";
     const stageBytes = Buffer.from(stage, "ascii");
-    if (!/^[\x00-\x7f]*$/.test(stage) || stageBytes.length > MAX_STAGE_BYTES)
+
+    // The ASCII range check is the whole point here: the stage has to stay pure ASCII.
+    // oxlint-disable-next-line no-control-regex
+    if (!/^[\x00-\x7f]*$/.test(stage) || stageBytes.length > MAX_STAGE_BYTES) {
         throw new Error(
             "Persistent image too large or contains non-ASCII characters");
+    }
 
     const image = {
         profile: PROFILE,
@@ -82,9 +100,8 @@ export async function buildPersistentImage(options = {}) {
         debugPayload,
         minifyPayload
     };
-    const sources = await Promise.all(
-        ["save-codec", "save-fs", "installer"].map(name =>
-            readFile(path.join(PERSIST_DIR, name + ".js"), "utf8"))
+    const sources = await Promise.all(["save-codec", "save-fs", "installer"].map(name =>
+        readFile(path.join(PERSIST_DIR, name + ".js"), "utf8"))
     );
     const persistCore = `var __cfsPersistCore = {
         sdk_base:sdk_base, read32:read32, read64:read64, read8:read8,
@@ -108,23 +125,25 @@ export async function buildPersistentImage(options = {}) {
         window.__cfsPersistInstaller.offer(${JSON.stringify(image)});
         log('CivSwitchFS persistence installer ready.');
     `;
-    const bootstrap = await esbuild.transform(
-        sources.join("\n;\n") + "\n" + persistCore + "\n" + installerEntry,
-        {
-            loader: "js",
-            target: "es2020",
-            minifyWhitespace: true,
-            minifyIdentifiers: false,
-            minifySyntax: false,
-            charset: "ascii",
-            legalComments: "none"
-        }
+    const bootstrap = await esbuild.transform(sources.join("\n;\n") + "\n" + persistCore + "\n" + installerEntry,
+                                              {
+                                                  loader: "js",
+                                                  target: "es2020",
+                                                  minifyWhitespace: true,
+                                                  minifyIdentifiers: false,
+                                                  minifySyntax: false,
+                                                  charset: "ascii",
+                                                  legalComments: "none"
+                                              }
     );
     const bootstrapText = bootstrap.code.trim() + "\n";
+
+    // oxlint-disable-next-line no-control-regex
     if (!/^[\x00-\x7f]*$/.test(bootstrapText) ||
-        Buffer.byteLength(bootstrapText, "ascii") >= MAX_LOADER_BYTES)
+        Buffer.byteLength(bootstrapText, "ascii") >= MAX_LOADER_BYTES) {
         throw new Error(
             "Installer bootstrap too large or contains non-ASCII characters");
+    }
 
     const probe = decoder + "\nvar decoded = " + decodeExpression + ";\n" +
         "log('STAGE DECODE ' + (decoded.length === " + standalone.length +
@@ -150,6 +169,7 @@ export async function buildPersistentImage(options = {}) {
         writeFile(path.join(outputDir, "install-image.json"), JSON.stringify(manifest, null, 2) + "\n")
     ]);
     let payloadMode;
+
     if (image.debugPayload) {
         payloadMode = "diagnostic, not minified";
     } else if (image.minifyPayload) {
@@ -157,8 +177,8 @@ export async function buildPersistentImage(options = {}) {
     } else {
         payloadMode = "whitespace compacted, names preserved";
     }
-    console.log(
-        `Persistent image: ${image.bytes} bytes; bootstrap: ` +
+
+    console.log(`Persistent image: ${image.bytes} bytes; bootstrap: ` +
         `${Buffer.byteLength(bootstrapText)} bytes; payload: ${payload.bytes}` +
         ` bytes (${payloadMode}).`
     );
@@ -183,23 +203,27 @@ function standaloneEntry(payload) {
                     if (error && (error.lineNumber || error.columnNumber)) {
                         const lineNumber = error.lineNumber || '?';
                         const columnNumber = error.columnNumber || '?';
-                        position = ' (line=' + lineNumber +
-                            ', column=' + columnNumber + ')';
+                        position = ' (line=' + lineNumber + ', column=' + columnNumber + ')';
                     }
                     await log(
                         'Standalone CivSwitchFS: ' + error.message + position);
                     if (error && error.stack) await log(error.stack);
                 }
-                finally { if (sock_fd !== null) close(sock_fd); }
+                finally {
+                    if (sock_fd !== null) {
+                        close(sock_fd);
+                    }
+                }
             }
 `;
 }
 
 function injectPayload(core, payload) {
-    if (core.split(BOOTSTRAP_ANCHOR).length !== 2)
+    if (core.split(BOOTSTRAP_ANCHOR).length !== 2) {
         throw new Error(
-            "CivSwitch bootstrap not recognized: " +
-            "payload anchor is ambiguous");
+            "CivSwitch bootstrap not recognized: payload anchor is ambiguous");
+    }
+
     return core.replace(BOOTSTRAP_ANCHOR, standaloneEntry(payload) + BOOTSTRAP_ANCHOR);
 }
 
@@ -215,28 +239,40 @@ function readOptions(args) {
     };
     for (let index = 0; index < args.length; index++) {
         const arg = args[index];
+
         if (arg === "--show-text") {
             options.showText = true;
             continue;
         }
+
         if (arg === "--debug-payload") {
             options.debugPayload = true;
             continue;
         }
+
         if (arg === "--minify-payload") {
             options.minifyPayload = true;
             continue;
         }
+
         if (["--core", "--template", "--decoder"].includes(arg)) {
             const value = args[++index];
-            if (!value) throw new Error(`Missing value for ${arg}`);
+
+            if (!value) {
+                throw new Error(`Missing value for ${arg}`);
+            }
+
             options[arg.slice(2) + "Path"] = path.resolve(value);
             continue;
         }
+
         throw new Error(`Unknown option: ${arg}`);
     }
-    if (options.debugPayload && options.minifyPayload)
+
+    if (options.debugPayload && options.minifyPayload) {
         throw new Error("Choose either --debug-payload or --minify-payload");
+    }
+
     return options;
 }
 

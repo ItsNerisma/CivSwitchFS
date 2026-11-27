@@ -1,6 +1,10 @@
-// Pure signed-cache-header and address-plan calculations.
-// Depends on: core/analysis/bytes.js (AnalysisBytes).
-// API: CachePlan. These helpers build plans only; they perform no IPC or reads.
+/*
+ * Pure calculations for signed cache headers and address plans, exposed as
+ * CachePlan.
+ *
+ * These helpers only build plans: no IPC, no memory read. They use the helpers of
+ * core/analysis/bytes.js (AnalysisBytes).
+ */
 
 var CachePlan = (function() {
     var DEFAULTS = {
@@ -18,26 +22,46 @@ var CachePlan = (function() {
     function settings(options) {
         var out = {};
         var key;
-        for (key in DEFAULTS) out[key] = DEFAULTS[key];
-        if (options) {
-            for (key in options)
-                if (Object.prototype.hasOwnProperty.call(options, key))
-                    out[key] = options[key];
+        for (key in DEFAULTS) {
+            out[key] = DEFAULTS[key];
         }
+
+        if (options) {
+            for (key in options) {
+                if (Object.prototype.hasOwnProperty.call(options, key)) {
+                    out[key] = options[key];
+                }
+            }
+        }
+
         return out;
     }
 
+
+
+    /**
+     * Find a negative signed offset whose bytes satisfy the path and UTF-8
+     * constraints.
+     *
+     * @returns {{offset: bigint, bytes: number[]} | null} Encoded value, or null when no encoding fits.
+     */
     function encodeSignedCacheOffset(bias, bucketCount, deadline, options) {
         var opts = settings(options);
         var blockSize = opts.controlSize;
-        if (!Number.isSafeInteger(bias) || bias < 0 ||
-            bias >= opts.maximumTargetExclusive ||
-            !Number.isSafeInteger(bucketCount) || bucketCount <= 0) return null;
-        if (deadline === undefined || deadline === null)
+
+        if (hasInvalidSignedOffsetInputs(bias, bucketCount, opts)) {
+            return null;
+        }
+
+        if (deadline === undefined || deadline === null) {
             deadline = Date.now() + opts.encodingTimeoutMs;
+        }
 
         var odd = bucketCount, power = 0;
-        while (odd % 2 === 0) { odd /= 2; power++; }
+        while (odd % 2 === 0) {
+            odd /= 2;
+            power++;
+        }
         var zeroBits = (2 ** power - 1) * blockSize;
         var displacement = [];
         var word = BigInt(bias);
@@ -51,17 +75,26 @@ var CachePlan = (function() {
 
         function choose(position, leftState, rightState, carry, remainder) {
             visits++;
-            if ((visits & 4095) === 0 && Date.now() > deadline)
+
+            if ((visits & 4095) === 0 && Date.now() > deadline) {
                 throw new Error("No signed cache encoding found within " +
                     opts.encodingTimeoutMs + " ms");
-            if (position === 8)
+            }
+
+            if (position === 8) {
                 return !leftState[0] && !rightState[0] && remainder === wanted
                     ? [] : null;
+            }
 
             var key = [position, leftState.join(":"),
                 rightState.join(":"), carry, remainder].join(",");
-            if (misses[key]) return null;
+
+            if (misses[key]) {
+                return null;
+            }
+
             var first = 1;
+
             if (position === 6) {
                 first = 0xC2;
             } else if (position === 7) {
@@ -72,33 +105,62 @@ var CachePlan = (function() {
             var mask = Math.floor(zeroBits / (2 ** (position * 8))) & 0xFF;
             for (var left = first; left <= last; left++) {
                 if (left === 0 || left === 0x2F || left === 0x5C ||
-                    (left & mask)) continue;
+                    (left & mask)) {
+                    continue;
+                }
+
                 var total = left + displacement[position] + carry;
                 var right = total & 0xFF;
-                if (right === 0 || right === 0x2F || right === 0x5C) continue;
+
+                if (right === 0 || right === 0x2F || right === 0x5C) {
+                    continue;
+                }
+
                 var nextLeft = AnalysisBytes.utf8Step(leftState, left);
                 var nextRight = AnalysisBytes.utf8Step(rightState, right);
-                if (!nextLeft || !nextRight) continue;
+
+                if (!nextLeft || !nextRight) {
+                    continue;
+                }
 
                 var contribution = 0;
-                if (position === 1) contribution = left >> 6;
-                else if (position >= 2)
+
+                if (position === 1) {
+                    contribution = left >> 6;
+                } else if (position >= 2) {
                     contribution = left *
                         ((2 ** (position * 8 - 14)) % odd);
+                }
+
                 var suffix = choose(position + 1, nextLeft, nextRight,
-                    total >> 8, (remainder + contribution) % odd);
-                if (suffix) return [left].concat(suffix);
+                                    total >> 8, (remainder + contribution) % odd);
+
+                if (suffix) {
+                    return [left].concat(suffix);
+                }
             }
             misses[key] = true;
             return null;
         }
 
         var encoded = choose(0, [0, 0, 0], [0, 0, 0], 0, 0);
-        if (!encoded) return null;
+
+        if (!encoded) {
+            return null;
+        }
+
         var raw = AnalysisBytes.readU64LE(encoded, 0);
         return {offset: BigInt.asIntN(64, raw), bytes: encoded};
     }
 
+
+
+    /**
+     * Build the cache-header bytes that map an IStorage read onto `target`, then
+     * validate them.
+     *
+     * @returns {object} Validated mapping plan, including the encoded cache-header bytes.
+     */
     function buildSignedCachePlan(target, storageSize, cycle, options) {
         var opts = settings(options);
         var block = opts.controlSize;
@@ -106,42 +168,56 @@ var CachePlan = (function() {
         cycle = cycle || opts.supportedCycles[0];
 
         if (!Number.isSafeInteger(target) || target < opts.minimumTarget ||
-            target >= opts.maximumTargetExclusive)
+            target >= opts.maximumTargetExclusive) {
             throw new Error("Target is outside the configured address width");
-        if (!Number.isSafeInteger(storageSize) || storageSize < block)
+        }
+
+        if (!Number.isSafeInteger(storageSize) || storageSize < block) {
             throw new Error("IStorage size is invalid");
-        if (opts.supportedCycles.indexOf(cycle) < 0 || cycle % block !== 0)
+        }
+
+        if (opts.supportedCycles.indexOf(cycle) < 0 || cycle % block !== 0) {
             throw new Error("Unsupported cache bucket period");
+        }
 
         var bucketCount = cycle / block;
         for (var start = 0; start + block <= storageSize; start += cycle) {
             for (var wi = 0; wi < opts.withinOffsets.length; wi++) {
                 var readOffset = start + opts.withinOffsets[wi];
-                if (readOffset + block > storageSize) continue;
+
+                if (readOffset + block > storageSize) {
+                    continue;
+                }
+
                 var addressBias = target - readOffset;
                 var encoded = encodeSignedCacheOffset(addressBias,
-                    bucketCount, deadline, opts);
-                if (!encoded) continue;
+                                                      bucketCount, deadline, opts);
+
+                if (!encoded) {
+                    continue;
+                }
 
                 var bytes = new Array(0x28);
-                for (var bi = 0; bi < bytes.length; bi++) bytes[bi] = 0x41;
-                for (var oi = 0; oi < 8; oi++) bytes[oi] = encoded.bytes[oi];
+                for (var bi = 0; bi < bytes.length; bi++) {
+                    bytes[bi] = 0x41;
+                }
+                for (var oi = 0; oi < 8; oi++) {
+                    bytes[oi] = encoded.bytes[oi];
+                }
                 AnalysisBytes.writeU64LE(bytes, 8, opts.range);
-                for (var fi = 0x10; fi < 0x14; fi++) bytes[fi] = 1;
+                for (var fi = 0x10; fi < 0x14; fi++) {
+                    bytes[fi] = 1;
+                }
                 var base = BigInt.asUintN(64,
-                    encoded.offset + BigInt(addressBias));
+                                          encoded.offset + BigInt(addressBias));
                 AnalysisBytes.writeU64LE(bytes, 0x20, base);
 
                 var offset = encoded.offset;
                 var bucketRemainder = (offset >> 14n) % BigInt(bucketCount);
-                if (bytes.length !== 0x28 || offset >= 0n ||
-                    bucketRemainder !== 0n ||
-                    Math.floor(readOffset / block) % bucketCount !== 0 ||
-                    readOffset + block > storageSize ||
-                    BigInt(readOffset + block) > offset + opts.range ||
-                    offset + opts.range >= (1n << 63n) ||
-                    BigInt.asUintN(64, base + BigInt(readOffset) - offset) !==
-                        BigInt(target)) {
+
+                if (hasInvalidSignedCachePlan(bytes, offset, bucketRemainder,
+                                              readOffset, block, bucketCount, storageSize, opts,
+                                              base, target)) {
                     throw new Error("Signed cache plan failed arithmetic checks");
                 }
 
@@ -153,15 +229,27 @@ var CachePlan = (function() {
         throw new Error("No signed cache encoding fits measured IStorage");
     }
 
+    /**
+     * Extend a verified target mapping downward by a prefix aligned on the cache
+     * cycle.
+     *
+     * The lower window comes back as a proposal, and callers verify it before they
+     * rely on it.
+     */
     function buildLowerWindowPlan(target, storageSize, cycle, pointers,
-        options) {
+                                  options) {
         var opts = settings(options);
         var block = opts.controlSize;
         cycle = cycle || opts.supportedCycles[0];
-        if (!Number.isSafeInteger(cycle) || cycle <= 0 || cycle % block !== 0)
+
+        if (!Number.isSafeInteger(cycle) || cycle <= 0 || cycle % block !== 0) {
             throw new Error("Unsupported cache bucket period");
-        if (!pointers || pointers.length === 0)
+        }
+
+        if (!pointers || pointers.length === 0) {
             throw new Error("Lower-window plan needs an observed pointer");
+        }
+
         for (var i = 0; i < pointers.length; i++) {
             if (!Number.isSafeInteger(pointers[i]) ||
                 pointers[i] < opts.minimumTarget ||
@@ -173,14 +261,16 @@ var CachePlan = (function() {
 
         var low = Math.min.apply(null, pointers);
         var maximumPrefix = Math.min(opts.lowerWindowMaxPrefix,
-            storageSize - opts.lowerWindowStorageReserve,
-            target - opts.minimumTarget);
+                                     storageSize - opts.lowerWindowStorageReserve,
+                                     target - opts.minimumTarget);
         var prefix = Math.floor(maximumPrefix / cycle) * cycle;
-        if (prefix <= 0)
+
+        if (prefix <= 0) {
             throw new Error("No lower-window prefix fits measured IStorage");
+        }
 
         var plan = buildSignedCachePlan(target - prefix, storageSize,
-            cycle, opts);
+                                        cycle, opts);
         plan.target = target;
         plan.readOffset += prefix;
         plan.lowerWindow = {
@@ -197,7 +287,26 @@ var CachePlan = (function() {
                 plan.offset) !== BigInt(target)) {
             throw new Error("Lower-window plan failed arithmetic checks");
         }
+
         return plan;
+    }
+
+    function hasInvalidSignedOffsetInputs(bias, bucketCount, opts) {
+        return !Number.isSafeInteger(bias) || bias < 0 ||
+            bias >= opts.maximumTargetExclusive ||
+            !Number.isSafeInteger(bucketCount) || bucketCount <= 0;
+    }
+
+    function hasInvalidSignedCachePlan(bytes, offset, bucketRemainder,
+                                       readOffset, block, bucketCount, storageSize, opts, base, target) {
+        return bytes.length !== 0x28 || offset >= 0n ||
+            bucketRemainder !== 0n ||
+            Math.floor(readOffset / block) % bucketCount !== 0 ||
+            readOffset + block > storageSize ||
+            BigInt(readOffset + block) > offset + opts.range ||
+            offset + opts.range >= (1n << 63n) ||
+            BigInt.asUintN(64, base + BigInt(readOffset) - offset) !==
+                BigInt(target);
     }
 
     return {

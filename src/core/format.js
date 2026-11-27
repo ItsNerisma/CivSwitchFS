@@ -1,4 +1,4 @@
-// Formatting and byte-writing helpers.
+// Byte-writing and formatting helpers.
 
 function hex32(value) {
     return "0x" + (Number(value) >>> 0).toString(16).padStart(8, "0");

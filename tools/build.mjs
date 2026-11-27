@@ -19,7 +19,11 @@ const digest = crypto.createHash("sha256")
 
 console.log(`built ${path.relative(ROOT, outFile)} (${result.bytes} bytes)`);
 console.log(`sha256 ${digest}`);
-if (result.identifiersMinified)
+
+if (result.identifiersMinified) {
     console.log("note: ESM local identifiers minified; core/API names preserved");
-if (result.minified)
+}
+
+if (result.minified) {
     console.log("note: ESM syntax minified further to fit the 500 KB loader limit");
+}

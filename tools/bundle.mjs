@@ -1,17 +1,18 @@
-// Build the loader payload: concatenate the classic core helpers, bundle the
-// ESM payload entry, and expose the core bindings through the loader API.
-//
-// The remote loader evaluates one classic script. The core files in src/core
-// are written as classic scripts so they can share the loader's global scope;
-// the payload entry and its modules are ESM and are bundled by esbuild.
+/*
+ * Build the loader payload: concatenate the classic core helpers, bundle the ESM
+ * payload entry, then expose the core bindings through the loader API.
+ *
+ * The remote loader evaluates a single classic script. Every file in src/core is
+ * written as a classic script so they can share the loader's global scope, while the
+ * payload entry and its modules stay ESM and get bundled by esbuild.
+ */
 
 import fs from "node:fs";
 import path from "node:path";
 import {fileURLToPath} from "node:url";
 import esbuild from "esbuild";
 
-export const ROOT = path.resolve(
-    path.dirname(fileURLToPath(import.meta.url)), "..");
+export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const SRC_DIR = path.join(ROOT, "src");
 export const CORE_DIR = path.join(SRC_DIR, "core");
 export const DEFAULT_ENTRY = path.join(SRC_DIR, "core.js");
@@ -23,8 +24,10 @@ export const CORE_GLOBALS = [
     "write8", "write32", "write64", "call_rop"
 ];
 
-// Dependency order matters: constants and low-level helpers must be declared
-// before the modules that reference them.
+/*
+ * Order matters here: constants and low-level helpers have to be declared before
+ * the modules that reference them.
+ */
 export const CORE_FILES = [
     "offsets.js",
     "memory.js",
@@ -80,23 +83,28 @@ export async function buildPayload({
 
     let result = await build(minify);
     let payload = makePayload(result.outputFiles[0].text, apiEntries);
-    if (!debug) payload = await minifyWhitespace(payload);
+
+    if (!debug) {
+        payload = await minifyWhitespace(payload);
+    }
+
     let bundleMinified = minify && !debug;
 
     if (!debug && !bundleMinified &&
         Buffer.byteLength(payload, "utf8") > MAX_PAYLOAD_BYTES) {
         result = await build(true);
-        payload = await minifyWhitespace(
-            makePayload(result.outputFiles[0].text, apiEntries)
+        payload = await minifyWhitespace(makePayload(result.outputFiles[0].text, apiEntries)
         );
         bundleMinified = true;
     }
 
     const bytes = Buffer.byteLength(payload, "utf8");
-    if (bytes > MAX_PAYLOAD_BYTES)
+
+    if (bytes > MAX_PAYLOAD_BYTES) {
         throw new Error(debug
             ? "unminified debug payload exceeds the 500 KB loader limit"
             : "bundled payload exceeds the 500 KB loader limit");
+    }
 
     const modules = Object.keys(result.metafile.inputs)
         .filter(file => !file.includes("node_modules"))
@@ -114,8 +122,11 @@ export async function buildPayload({
 }
 
 async function minifyWhitespace(source) {
-    // Compact the complete loader program without changing its syntax or
-    // identifiers. Identifier minification is confined to the ESM bundle.
+
+    /*
+     * Compact the whole loader program without touching its syntax or its
+     * identifiers. Identifier minification stays confined to the ESM bundle.
+     */
     const result = await esbuild.transform(source, {
         loader: "js",
         minifyWhitespace: true,
@@ -136,12 +147,16 @@ export function coreBindingNames() {
     const names = new Set();
     for (const file of CORE_FILES) {
         const source = fs.readFileSync(path.join(CORE_DIR, file), "utf8");
-        // Core files use simple top-level declarations so their bindings can
-        // be exposed to the ESM bundle without changing those legacy modules.
+
+        /*
+         * Core files keep simple top-level declarations, so their bindings can be
+         * exposed to the ESM bundle without editing those legacy modules.
+         */
         const declaration =
             /^(?:async\s+)?function\s+([A-Za-z_$][\w$]*)|^(?:var|let|const)\s+([A-Za-z_$][\w$]*)/gm;
-        for (const match of source.matchAll(declaration))
+        for (const match of source.matchAll(declaration)) {
             names.add(match[1] || match[2]);
+        }
     }
     return [...names];
 }

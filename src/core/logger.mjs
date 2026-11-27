@@ -15,7 +15,9 @@ export function log(message) {
 }
 
 export async function verboseLog(message) {
-    if (!verboseLogging || !message) return;
+    if (!verboseLogging || !message) {
+        return;
+    }
 
     await log(message);
 }
